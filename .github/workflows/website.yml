@@ -1,0 +1,107 @@
+# Runs the model in GitHub's cloud and publishes the password-protected
+# website to GitHub Pages -- no laptop needed.
+#
+# One-time setup (see README "Website without your laptop"):
+#   1. Settings -> Secrets and variables -> Actions -> New repository secret
+#        Name: UMUSHROOM_PASSWORD   Value: the team password (12+ characters)
+#   2. Settings -> Pages -> Build and deployment -> Source: GitHub Actions
+#   3. Actions -> Website -> Run workflow   (first run)
+
+name: Website
+
+on:
+  schedule:
+    # Weekdays 06:20 UTC = 07:20 London in summer, 06:20 in winter
+    - cron: "20 6 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      validate:
+        description: "Also run the validation suite (slower)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: website
+  cancel-in-progress: false
+
+env:
+  TZ: Europe/London          # run times on the site in UK time
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    outputs:
+      run_ok: ${{ steps.site.outputs.run_ok }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[site]"
+
+      - name: Restore past runs and the price cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            site
+            .cache
+          key: umushroom-data-${{ github.run_id }}
+          restore-keys: umushroom-data-
+
+      - name: Run the model and build the encrypted site
+        id: site
+        env:
+          UMUSHROOM_PASSWORD: ${{ secrets.UMUSHROOM_PASSWORD }}
+        run: |
+          set +e
+          python -m umushroom.static_site --run --out public \
+            ${{ inputs.validate && '--validate' || '' }} \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/workflows/website.yml"
+          code=$?
+          if [ "$code" = "2" ]; then exit 2; fi        # setup error: nothing to publish
+          echo "run_ok=$([ "$code" = "0" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Save past runs and the price cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            site
+            .cache
+          key: umushroom-data-${{ github.run_id }}
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+      # The site is published either way (showing the last good run); this
+      # marks the workflow red so GitHub emails you that today's run failed.
+      - name: Report a failed model run
+        if: needs.build.outputs.run_ok != 'true'
+        run: |
+          echo "::error::The model run failed - the site shows the last good run. Open the build job's log."
+          exit 1

@@ -1,0 +1,58 @@
+[project]
+name = "umushroom-strategy"
+version = "4.17.0"
+description = "Factor-model portfolio engine for the UMushroom investment contest"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.1",
+    "numpy>=1.24",
+    "yfinance>=0.2.40",
+    "scikit-learn>=1.3",
+    "scipy>=1.10",
+    "pyyaml>=6.0",
+    "joblib>=1.3",
+    "pyarrow>=14.0",
+]
+
+[project.optional-dependencies]
+site = ["cryptography>=42"]
+dev = [
+    "cryptography>=42",
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.4",
+    "mypy>=1.8",
+]
+
+[project.scripts]
+umushroom = "umushroom.cli:main"
+umushroom-check-tickers = "umushroom.check_tickers:main"
+umushroom-web = "umushroom.web:main"
+umushroom-static-site = "umushroom.static_site:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --cov=umushroom --cov-report=term-missing"
+
+[tool.ruff]
+line-length = 90
+target-version = "py310"
+
+[tool.ruff.lint.per-file-ignores]
+# the website runs on the user's own clock (daily runs, run timestamps)
+"umushroom/web.py" = ["DTZ"]
+"tests/test_web.py" = ["DTZ"]
+"umushroom/tracker.py" = ["DTZ"]
+"umushroom/macro.py" = ["DTZ"]
+"umushroom/static_site.py" = ["DTZ"]
+"tests/test_macro.py" = ["DTZ"]
+"tests/test_tracker.py" = ["DTZ"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+disallow_untyped_defs = false
