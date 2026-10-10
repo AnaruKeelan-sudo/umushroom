@@ -61,6 +61,7 @@ from umushroom.features import (
 )
 from umushroom.logging_config import get_logger
 from umushroom.model import RankingModel
+from umushroom.selection import capped_top
 
 logger = get_logger("purged_backtest")
 
@@ -241,6 +242,8 @@ def run_purged_walk_forward(
     entry_delay_days: int = 0,
     shuffle_seed: int | None = None,
     record_cross_sections: bool = False,
+    sectors: dict[str, str] | None = None,
+    max_per_sector: int | None = None,
 ) -> PurgedWalkForwardResult:
     """Walk-forward evaluation.
 
@@ -350,7 +353,7 @@ def run_purged_walk_forward(
             if len(preds) < top_n:
                 continue
             ranked = preds.sort_values(ascending=False)
-            picks = ranked.head(top_n).index
+            picks = capped_top(ranked.index, top_n, sectors, max_per_sector)
 
             period_strat = float(realized[picks].mean())
             period_bench = float(realized.mean())

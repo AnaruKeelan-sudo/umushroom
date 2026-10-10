@@ -47,6 +47,8 @@ class SleeveConfig:
     # v4.4 (equity sleeve): rank within sector, and use volume factors
     neutralize_by_sector: bool = False
     use_volume_features: bool = False
+    # v4.18 (equity sleeve): at most this many picks per sector (None = off)
+    max_per_sector: int | None = None
     # per-sleeve forecast horizon; None = the global forward_return_days
     forward_return_days: int | None = None
 
@@ -85,6 +87,7 @@ class StrategyConfig:
     sector_file: Path | None = None        # CSV with columns yahoo, sector
     use_volume_features: bool = False      # equity: add volume factors
     ragged_history: bool = False           # keep tickers with partial history
+    max_per_sector: int | None = None      # v4.18 equity: cap picks per sector
     # v4.7: fetch a ticker's prices from a DIFFERENT Yahoo symbol (e.g. a
     # company whose London line was delisted on Yahoo but which UMushroom
     # still prices from its US listing). Orders keep the UMushroom ticker.
@@ -104,7 +107,8 @@ class StrategyConfig:
             top_n=self.top_n_holdings, fractional=False,
             neutralize_by_exchange=self.neutralize_by_exchange,
             neutralize_by_sector=self.neutralize_by_sector,
-            use_volume_features=self.use_volume_features)
+            use_volume_features=self.use_volume_features,
+            max_per_sector=self.max_per_sector)
         return [equity, *self.sleeves]
 
     @property
@@ -169,6 +173,11 @@ def _validate(cfg: StrategyConfig) -> None:
         errors.append("max_single_exchange_fraction must be in (0, 1]")
     if cfg.fama_french_region not in FRENCH_REGIONS:
         errors.append(f"fama_french_region must be one of {FRENCH_REGIONS}")
+    if cfg.max_per_sector is not None:
+        if cfg.max_per_sector < 1:
+            errors.append("max_per_sector must be >= 1 (or left out to switch it off)")
+        if cfg.sector_file is None or not Path(cfg.sector_file).exists():
+            errors.append("max_per_sector needs a sector_file that exists")
     if cfg.neutralize_by_sector:
         if cfg.sector_file is None:
             errors.append("neutralize_by_sector needs sector_file")
@@ -339,6 +348,8 @@ def load_config(path: str | Path = "config.yaml") -> StrategyConfig:
                          else (path.parent / str(raw["sector_file"]))),
             use_volume_features=_to_bool(raw.get("use_volume_features", False)),
             ragged_history=_to_bool(raw.get("ragged_history", False)),
+            max_per_sector=(None if raw.get("max_per_sector") in (None, "", 0)
+                            else int(raw["max_per_sector"])),
             yahoo_symbols={str(k): str(v) for k, v in
                            (raw.get("yahoo_symbols") or {}).items()},
         )

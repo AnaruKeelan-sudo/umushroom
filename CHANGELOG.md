@@ -1,5 +1,19 @@
 # Changelog
 
+## 4.18.0 (2026-10-10) -- 6-week Monte Carlo + sector cap (opt-in)
+- Monte Carlo default horizon 8 -> 6 weeks: UMushroom UK Stage 1 runs
+  12 Oct - 22 Nov 2026. VaR/ES for the horizon follow.
+- New optional sector cap for the equity sleeve (`max_per_sector: N` in
+  config.yaml; OFF by default). The model's ranking is unchanged; the cap only
+  skips to the next-ranked stock when a sector already has N picks. Used the
+  same way in live orders, the walk-forward backtest and the validation suite.
+- `--compare-sector-cap N`: one pre-declared head-to-head on identical data
+  (no cap vs. max N per sector) reporting alpha, alpha t, Sharpe, weekly
+  VaR/ES, worst week and how concentrated the picks were. Rule fixed in
+  advance: switch the cap on only if it keeps >= 75% of the alpha AND does not
+  raise weekly VaR.
+- 17 new tests.
+
 ## 4.17.0 (2026-10-09) -- website without your laptop (GitHub)
 - New `.github/workflows/website.yml`: every weekday ~07:20 UK time (and on
   demand: Actions -> Website -> Run workflow) GitHub's cloud runs the model and

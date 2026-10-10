@@ -384,3 +384,51 @@ def test_cli_report_writes_dashboard_with_monte_carlo(tmp_path, monkeypatch, cap
     assert len(data["mc"]["weeks"]) == 7                  # week 0..6
     assert {s["name"] for s in data["sleeves"]} == {"equity", "crypto"}
     assert data["deciles"] and data["top"]
+
+
+def test_cli_compare_sector_cap_prints_verdict(tmp_path, monkeypatch, capsys):
+    stocks = ([f"B{i}.L" for i in range(8)] + [f"T{i}" for i in range(4)]
+              + [f"M{i}.SW" for i in range(4)])
+    (tmp_path / "sectors.csv").write_text(
+        "yahoo,sector\n" + "\n".join(
+            f"{t},{'banks' if t[0] == 'B' else 'tech' if t[0] == 'T' else 'industry'}"
+            for t in stocks))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(textwrap.dedent(f"""\
+        tickers: {stocks}
+        starting_balance: 100000
+        top_n_holdings: 6
+        lookback_period: "10y"
+        forward_return_days: 5
+        rebalance_days: 5
+        min_history_days: 300
+        model_alpha: 1.0
+        random_seed: 42
+        cache_dir: "{tmp_path / '.cache'}"
+        cache_max_age_hours: 12
+        log_level: "WARNING"
+        purged_test_window_days: 21
+        purged_purge_days: 5
+        purged_embargo_days: 5
+        purged_min_train_days: 504
+        prediction_log_path: "{tmp_path / 'pred.csv'}"
+        sector_file: "sectors.csv"
+    """))
+    real = data_mod.get_market_data
+    monkeypatch.setattr(data_mod, "get_market_data",
+                        lambda **kw: real(**kw, fetcher=_fake_fetcher_7day))
+    rc = cli.main(["--config", str(cfg), "--output", str(tmp_path / "a.csv"),
+                   "--skip-backtest", "--compare-sector-cap", "2"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "Sector cap: head-to-head" in out and "VERDICT:" in out
+    assert "no cap" in out and "max 2 per sector" in out
+
+
+def test_cli_mc_default_is_six_weeks():
+    p = cli.build_parser() if hasattr(cli, "build_parser") else None
+    if p is None:
+        import inspect
+        assert "default=6" in inspect.getsource(cli)
+    else:
+        assert p.parse_args([]).mc_weeks == 6

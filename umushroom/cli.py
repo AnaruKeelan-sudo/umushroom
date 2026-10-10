@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any, cast
 
+import numpy as np
 import pandas as pd
 
 from umushroom import data as data_mod
@@ -42,7 +43,15 @@ from umushroom.montecarlo import combine_sleeves, simulate
 from umushroom.prediction_log import evaluate_latest_predictions, log_predictions
 from umushroom.purged_backtest import PurgedWalkForwardResult, run_purged_walk_forward
 from umushroom.report import SleeveReport, build_payload, stock_snapshot, write_report
+from umushroom.risk import var_es
 from umushroom.robustness import bootstrap_sharpe
+from umushroom.selection import (
+    ALPHA_RETENTION,
+    CapVerdict,
+    capped_top,
+    decide_cap,
+    top_sector_share,
+)
 from umushroom.universe import check_concentration
 from umushroom.validation import ValidationReport, decile_returns, run_validation
 
@@ -84,6 +93,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "(downloads factor data from Ken French's library).",
     )
     parser.add_argument(
+        "--compare-sector-cap", type=int, metavar="N", default=None,
+        help="v4.18: head-to-head backtest of the equity sleeve with at most N "
+             "picks per sector vs. no cap, with a pre-declared decision rule")
+    parser.add_argument(
         "--compare-baseline", action="store_true",
         help="Also run the v4.3 equity setup on the same data and print a "
              "head-to-head table (one pre-declared comparison).",
@@ -105,8 +118,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "(default umushroom_report.html).",
     )
     parser.add_argument(
-        "--mc-weeks", type=int, default=8,
-        help="Contest length in weeks for the Monte Carlo simulation (default 8).",
+        "--mc-weeks", type=int, default=6,
+        help="Contest length in weeks for the Monte Carlo simulation "
+             "(default 6 = UMushroom UK Stage 1).",
     )
     parser.add_argument(
         "--mc-sims", type=int, default=5000,
@@ -335,9 +349,14 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
             else None)
     if sleeve.use_volume_features and dvol is None:
         print("NOTE: no volume data available; volume factors skipped.")
+    sectors = (load_sectors(cfg.sector_file)
+               if cfg.sector_file is not None and Path(cfg.sector_file).exists()
+               else None)
     if sleeve.name == EQUITY_SLEEVE:
         for w in check_concentration(listings, cfg.max_single_exchange_fraction):
             print(f"WARNING: {w}")
+        if sleeve.max_per_sector:
+            print(f"Sector cap ON: at most {sleeve.max_per_sector} picks per sector")
     print(f"Instruments: {len(cols)}")
 
     log_path = _sleeve_log_path(cfg, sleeve)
@@ -379,7 +398,7 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
     if collect is not None:
         collect[sleeve.name] = info
     if not args.skip_purged_backtest:
-        pwf = _report_out_of_sample(cfg, args, sleeve, prices, groups, dvol)
+        pwf = _report_out_of_sample(cfg, args, sleeve, prices, groups, dvol, sectors)
         if pwf is not None:
             info.backtest = pwf
             try:
@@ -390,6 +409,12 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
                 pass
         if args.compare_baseline and sleeve.name == EQUITY_SLEEVE:
             _compare_with_baseline(cfg, sleeve, prices, listings, groups, dvol)
+        if args.compare_sector_cap and sleeve.name == EQUITY_SLEEVE:
+            if sectors is None:
+                print("\nSector-cap comparison skipped: no sector_file in config.")
+            else:
+                compare_sector_cap(cfg, sleeve, prices, groups, dvol, sectors,
+                                   args.compare_sector_cap)
     if args.validate and sleeve.selection == "model":
         vr = _run_validation(cfg, args, sleeve, prices, listings, groups, dvol)
         info.validation = [(c.name, c.status, c.detail) for c in vr.checks]
@@ -415,6 +440,7 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
         min_local_price=0.0 if sleeve.fractional else MIN_LOCAL_PRICE,
         dollar_volume=dvol,
         # model-picked sleeves never trade on an old price (it would also be
+        sectors=sectors, max_per_sector=sleeve.max_per_sector,
         # an old SIGNAL); hold-all sleeves just warn -- a day-old price only
         # shifts the share count slightly, it doesn't change what is held
         exclude=(frozenset() if hold_all
@@ -459,6 +485,10 @@ def _run_validation(cfg: StrategyConfig, args: argparse.Namespace,
         "min_train_days": cfg.purged_min_train_days,
         "model_alpha": cfg.model_alpha, "random_seed": cfg.random_seed,
         "target": cfg.target, "groups": groups, "dollar_volume": dvol,
+        # the live selection rule is what gets validated
+        "sectors": (load_sectors(cfg.sector_file)
+                    if sleeve.max_per_sector and cfg.sector_file is not None else None),
+        "max_per_sector": sleeve.max_per_sector,
     }
     exchanges = {t: lst.exchange for t, lst in listings.items()}
     multi_market = len(set(exchanges.values())) > 1
@@ -519,10 +549,64 @@ def _compare_with_baseline(cfg: StrategyConfig, sleeve: SleeveConfig,
           "t and alpha t are higher. Do not try further variants on this data.")
 
 
+def compare_sector_cap(cfg: StrategyConfig, sleeve: SleeveConfig,
+                       prices: pd.DataFrame, groups: dict[str, str] | None,
+                       dvol: pd.DataFrame | None, sectors: dict[str, str],
+                       cap: int) -> CapVerdict:
+    """v4.18: ONE pre-declared head-to-head on identical data -- the equity
+    sleeve with no sector cap vs. at most `cap` picks per sector."""
+    print("\n=== Sector cap: head-to-head on identical data ===")
+    print(f"Rule (decided BEFORE the results): switch the cap on only if it keeps "
+          f"at least {ALPHA_RETENTION:.0%} of the uncapped alpha AND does not raise "
+          f"the weekly 95% VaR.")
+    kw: dict[str, Any] = {
+        "test_window_days": cfg.purged_test_window_days,
+        "purge_days": cfg.purged_purge_days, "embargo_days": cfg.purged_embargo_days,
+        "rebalance_days": cfg.rebalance_days,
+        "forward_return_days": sleeve_horizon(cfg, sleeve), "top_n": sleeve.top_n,
+        "min_train_days": cfg.purged_min_train_days, "model_alpha": cfg.model_alpha,
+        "random_seed": cfg.random_seed, "target": cfg.target, "groups": groups,
+        "dollar_volume": dvol, "record_cross_sections": True, "sectors": sectors}
+    ppy = 252 / cfg.rebalance_days
+    rows = {}
+    for label, mps in (("no cap", None), (f"max {cap} per sector", cap)):
+        r = run_purged_walk_forward(prices, max_per_sector=mps, **kw)
+        try:
+            a = benchmark_alpha(r.period_returns, r.benchmark_period_returns, ppy)
+            alpha, alpha_t = a.alpha_annualized, a.alpha_tstat
+        except ValueError:
+            alpha, alpha_t = float("nan"), float("nan")
+        shares = [top_sector_share(capped_top(p.sort_values(ascending=False).index,
+                                              sleeve.top_n, sectors, mps), sectors)
+                  for _d, p, _r in r.cross_sections]
+        var95, es95 = var_es(r.period_returns, 0.95)
+        rows[label] = {"alpha": alpha, "alpha_t": alpha_t, "sharpe": r.overall_sharpe,
+                       "var": var95, "es": es95, "worst": float(-r.period_returns.min()),
+                       "share": float(np.mean(shares)) if shares else float("nan"),
+                       "half": float(np.mean([x >= 0.5 for x in shares])) if shares
+                       else float("nan")}
+    print(f"{'':<22}{'alpha/yr':>10}{'alpha t':>9}{'Sharpe':>8}{'VaR95/wk':>10}"
+          f"{'ES95/wk':>9}{'worst wk':>10}{'top sector':>12}{'wks >=50%':>11}")
+    for label, m in rows.items():
+        print(f"{label:<22}{m['alpha']:>+10.2%}{m['alpha_t']:>+9.2f}{m['sharpe']:>8.2f}"
+              f"{m['var']:>10.2%}{m['es']:>9.2%}{m['worst']:>10.2%}{m['share']:>12.0%}"
+              f"{m['half']:>11.0%}")
+    u, c = rows["no cap"], rows[f"max {cap} per sector"]
+    verdict = decide_cap(u["alpha"], c["alpha"], u["var"], c["var"])
+    print(f"\nVERDICT: {'SWITCH THE CAP ON' if verdict.adopt else 'KEEP NO CAP'} "
+          f"-- {verdict.reason}.")
+    if verdict.adopt:
+        print(f"To switch it on, add this line to config.yaml:  max_per_sector: {cap}")
+    print("(top sector = average share of the picks in the single biggest sector; "
+          "wks >=50% = how often one sector was half the picks or more)")
+    return verdict
+
+
 def _report_out_of_sample(cfg: StrategyConfig, args: argparse.Namespace,
                           sleeve: SleeveConfig, prices: pd.DataFrame,
                           groups: dict[str, str] | None,
-                          dvol: pd.DataFrame | None = None
+                          dvol: pd.DataFrame | None = None,
+                          sectors: dict[str, str] | None = None
                           ) -> PurgedWalkForwardResult | None:
     try:
         pwf = run_purged_walk_forward(
@@ -533,7 +617,8 @@ def _report_out_of_sample(cfg: StrategyConfig, args: argparse.Namespace,
             min_train_days=cfg.purged_min_train_days, model_alpha=cfg.model_alpha,
             random_seed=cfg.random_seed, target=cfg.target, groups=groups,
             dollar_volume=dvol,
-            record_cross_sections=bool(getattr(args, "report", None)))
+            record_cross_sections=bool(getattr(args, "report", None)),
+            sectors=sectors, max_per_sector=sleeve.max_per_sector)
     except InsufficientHistoryError as e:
         print(f"\n--- Purged & Embargoed Walk-Forward Backtest ---\nSkipped: {e}")
         return None

@@ -22,6 +22,7 @@ from umushroom.features import build_features_at_index
 from umushroom.logging_config import get_logger
 from umushroom.model import RankingModel
 from umushroom.portfolio_construction import equal_weight, hrp_weight
+from umushroom.selection import capped_top, top_sector_share
 
 logger = get_logger("allocation")
 
@@ -95,6 +96,8 @@ def generate_allocation(
     hold_all: bool = False,
     max_weight_multiple: float = 2.0,
     exclude: frozenset[str] = frozenset(),
+    sectors: dict[str, str] | None = None,
+    max_per_sector: int | None = None,
 ) -> Allocation:
     """Rank today's universe and size integer-share orders.
 
@@ -153,8 +156,13 @@ def generate_allocation(
             f"cannot select top_n={top_n}."
         )
 
-    picks = preds.sort_values(ascending=False).head(top_n)
-    picked_tickers = picks.index.tolist()
+    cap = None if hold_all else max_per_sector     # hold-all sleeves hold everything
+    ranked_all = preds.sort_values(ascending=False).index.tolist()
+    picked_tickers = capped_top(ranked_all, top_n, sectors, cap)
+    if cap and sectors:
+        logger.info(f"Sector cap: at most {cap} per sector "
+                    f"(largest sector now {top_sector_share(picked_tickers, sectors):.0%} "
+                    f"of picks)")
 
     def size(selected: list[str]) -> tuple[pd.Series, dict[str, dict[str, object]]]:
         picked_tickers = selected
@@ -221,16 +229,15 @@ def generate_allocation(
         unaffordable += zero
         selected = [t for t in selected if t not in zero]
         if not hold_all:
-            for t in ranked:
-                if len(selected) >= top_n:
-                    break
-                if t not in selected and t not in unaffordable:
-                    selected.append(t)
+            # refill by rank, still respecting the sector cap where possible
+            pool = [t for t in ranked if t not in unaffordable]
+            selected = capped_top([t for t in pool if t in selected]
+                                  + [t for t in pool if t not in selected],
+                                  top_n, sectors, cap)
     if unaffordable:
         logger.warning(f"Not buying {unaffordable}: one unit costs more than its share "
                        f"of the budget; the money was spread over the other holdings.")
     rows = {t: r for t, r in rows.items() if float(cast(float, r["shares"])) > 0}
-    picks = preds.reindex(list(rows))
     picked_tickers = list(rows)
 
     if not rows:

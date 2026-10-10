@@ -241,6 +241,7 @@ One-time setup, in Terminal (needs Homebrew):
 brew install gh
 gh auth login
 cd ~/Downloads/umushroom_pkg\ 4
+mv website.yml .github/workflows/website.yml
 git init -b main
 git add .
 git commit -m "UMushroom pipeline"
@@ -262,3 +263,15 @@ site's "Run now" link goes there). After you change the code:
 `git add . && git commit -m "update" && git push`.
 
 Change the password: `gh secret set UMUSHROOM_PASSWORD`, then run the workflow.
+
+
+## Sector cap (optional)
+
+Test it first (one head-to-head, decision rule fixed in advance):
+
+```
+python -m umushroom.cli --config config.yaml --compare-sector-cap 3
+```
+
+Only if it prints `VERDICT: SWITCH THE CAP ON`, add `max_per_sector: 3` to
+config.yaml.

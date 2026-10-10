@@ -1,6 +1,6 @@
 [project]
 name = "umushroom-strategy"
-version = "4.17.0"
+version = "4.18.0"
 description = "Factor-model portfolio engine for the UMushroom investment contest"
 requires-python = ">=3.10"
 dependencies = [
