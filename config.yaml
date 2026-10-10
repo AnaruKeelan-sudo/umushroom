@@ -646,7 +646,7 @@ yahoo_symbols:
 # --- Sleeves (v4.2) ---
 # Each sleeve has its OWN model, backtest and skill verdict, and a fixed
 # share of the balance. The main `tickers` list above is the "equity"
-# sleeve and gets whatever weight is left (here 70%, top_n_holdings picks).
+# sleeve and gets whatever weight is left (here 80%, top_n_holdings picks).
 # Every instrument below was confirmed on UMushroom on 2026-10-08.
 sleeves:
   etf:
@@ -672,20 +672,24 @@ sleeves:
       - "PHAG.L"     # WisdomTree Physical Silver (USD)
       - "BRNT.L"     # WisdomTree Brent Crude Oil (USD)
       - "INRG.L"     # iShares Global Clean Energy (GBp)
-  crypto:
-    weight: 0.10
-    top_n: 4
-    # v4.9: crypto model FAILED the validation suite (2026-10-08): placebo
-    # p=0.48 (11/20), deciles not ordered (lowest-ranked did best), edge gone
-    # with a 1-day delay, BTC picked 87% of weeks. Same rule as ETFs: hold all
-    # 18 at equal weight; the model is still reported each run.
-    selection: "all"
-    weighting: "equal"
-    fractional: true   # buys fractions of a coin -- CHECK UMushroom allows this
-    forward_return_days: 5   # crypto's skill was measured at 5 days
-    tickers: ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD", "ADA-USD",
-              "DOGE-USD", "AVAX-USD", "LINK-USD", "DOT-USD", "LTC-USD", "BCH-USD",
-              "XLM-USD", "TRX-USD", "ATOM-USD", "ETC-USD", "HBAR-USD", "FIL-USD"]
+  # v4.18 (2026-10-10): crypto sleeve switched OFF -- the model showed no
+  # skill there and holding all 18 coins only added volatility. Its 10% went
+  # to the equity sleeve. To turn it back on, remove the '# ' from the lines
+  # below.
+#   crypto:
+#     weight: 0.10
+#     top_n: 4
+#     # v4.9: crypto model FAILED the validation suite (2026-10-08): placebo
+#     # p=0.48 (11/20), deciles not ordered (lowest-ranked did best), edge gone
+#     # with a 1-day delay, BTC picked 87% of weeks. Same rule as ETFs: hold all
+#     # 18 at equal weight; the model is still reported each run.
+#     selection: "all"
+#     weighting: "equal"
+#     fractional: true   # buys fractions of a coin -- CHECK UMushroom allows this
+#     forward_return_days: 5   # crypto's skill was measured at 5 days
+#     tickers: ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD", "ADA-USD",
+#               "DOGE-USD", "AVAX-USD", "LINK-USD", "DOT-USD", "LTC-USD", "BCH-USD",
+#               "XLM-USD", "TRX-USD", "ATOM-USD", "ETC-USD", "HBAR-USD", "FIL-USD"]
 
 starting_balance: 100000        # contest virtual capital (in base_currency)
 top_n_holdings: 10              # v4.5: back to 10 -- won the 10-year
@@ -718,6 +722,10 @@ neutralize_by_sector: false   # v4.5: lost the head-to-head; kept off
 sector_file: "umushroom_universe_mapped.csv"
 # v4.4: add trading-volume factors (abnormal volume, Amihud illiquidity)
 use_volume_features: false    # v4.5: lost the head-to-head; kept off
+# v4.18: at most N equity picks per sector (off until it wins its head-to-head:
+#   python -m umushroom.cli --config config.yaml --compare-sector-cap 3
+# then add e.g.  max_per_sector: 3  only if the verdict says SWITCH THE CAP ON)
+# max_per_sector: 3
 # v4.4: keep stocks with partial history; each joins once it has a year
 ragged_history: true
 # Warn if more than this fraction of the universe is on one exchange.

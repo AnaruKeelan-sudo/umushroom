@@ -266,11 +266,12 @@ def test_sleeve_weights_must_leave_room_for_equity(tmp_path):
 def test_shipped_config_sleeves_are_valid():
     cfg = load_config(REPO_CONFIG)
     names = {s.name: s for s in cfg.all_sleeves}
-    assert set(names) == {"equity", "etf", "crypto"}
+    # v4.18: crypto sleeve switched off (no skill; only added volatility);
+    # its 10% went to the equity sleeve
+    assert set(names) == {"equity", "etf"}
     assert sum(s.weight for s in cfg.all_sleeves) == pytest.approx(1.0)
-    assert names["crypto"].fractional
-    # v4.9: crypto failed validation -> holds all coins equally
-    assert names["crypto"].selection == "all" and names["crypto"].weighting == "equal"
+    assert names["equity"].weight == pytest.approx(0.80)
+    assert names["etf"].selection == "all" and names["etf"].weighting == "equal"
 
 
 def test_sleeve_selection_all_and_weighting_parse(tmp_path):
@@ -325,8 +326,6 @@ def test_shipped_config_v45_settings():
     assert not eq.neutralize_by_sector and not eq.use_volume_features
     assert sleeve_horizon(cfg, eq) == 5 and eq.top_n == 10
     assert cfg.ragged_history and cfg.lookback_period == "10y"
-    crypto = next(s for s in cfg.all_sleeves if s.name == "crypto")
-    assert sleeve_horizon(cfg, crypto) == 5
     sectors = load_sectors(cfg.sector_file)
     covered = sum(t in sectors for t in cfg.tickers) / len(cfg.tickers)
     assert covered > 0.99

@@ -1,6 +1,9 @@
 # Changelog
 
-## 4.18.0 (2026-10-10) -- 6-week Monte Carlo + sector cap (opt-in)
+## 4.18.0 (2026-10-10) -- 6-week Monte Carlo + sector cap (opt-in), no crypto
+- Crypto sleeve switched OFF in config.yaml (model showed no skill; holding
+  all 18 coins only added volatility). Equity 80%, ETFs 20%. The crypto
+  section is kept, commented out, to switch back on later.
 - Monte Carlo default horizon 8 -> 6 weeks: UMushroom UK Stage 1 runs
   12 Oct - 22 Nov 2026. VaR/ES for the horizon follow.
 - New optional sector cap for the equity sleeve (`max_per_sector: N` in
