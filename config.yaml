@@ -749,3 +749,4 @@ purged_min_train_days: 504      # ~2 years of history before the first test fold
 
 # --- Prediction accuracy tracking ---
 prediction_log_path: ".cache/prediction_log.csv"
+max_per_sector: 3
