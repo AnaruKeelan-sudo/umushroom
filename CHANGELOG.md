@@ -40,6 +40,11 @@
 - 60 new tests (window, universe mapping, catalogue scraper, ETF features
   incl. planted-signal recovery, config, snapshot replay, ETF sleeve
   end-to-end, website tabs).
+- CI fix: `pytest` (the bare entry point GitHub Actions runs) did not put
+  the repo root on `sys.path`, so the 6 tests that share helpers via
+  `from tests.test_web import ...` failed with `No module named 'tests'`
+  on every CI run since 4.18 (`python -m pytest`, used locally, hid it).
+  `pythonpath = ["."]` in the pytest config makes both entry points agree.
 
 ## 4.18.0 (2026-10-10) -- 6-week Monte Carlo + sector cap (opt-in), no crypto
 - Crypto sleeve switched OFF in config.yaml (model showed no skill; holding
