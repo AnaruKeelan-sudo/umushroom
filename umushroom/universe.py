@@ -56,6 +56,10 @@ SUFFIX_MAP: dict[str, tuple[str, str]] = {
     "T": ("Tokyo", "JPY"),
     "HK": ("Hong Kong", "HKD"),
     "AX": ("ASX", "AUD"),
+    # v4.19 (ETF universe): more European ETF venues Yahoo lists
+    "MU": ("Munich", "EUR"),
+    "LU": ("Luxembourg", "EUR"),
+    "IL": ("LSE IOB", "USD"),
 }
 
 SUPPORTED_BASE_CURRENCIES = {"GBP", "USD", "EUR", "CHF"}

@@ -271,7 +271,7 @@ def test_shipped_config_sleeves_are_valid():
     assert set(names) == {"equity", "etf"}
     assert sum(s.weight for s in cfg.all_sleeves) == pytest.approx(1.0)
     assert names["equity"].weight == pytest.approx(0.80)
-    assert names["etf"].selection == "all" and names["etf"].weighting == "equal"
+    assert names["etf"].selection == "auto" and names["etf"].weighting == "equal"
 
 
 def test_sleeve_selection_all_and_weighting_parse(tmp_path):
@@ -292,9 +292,16 @@ def test_invalid_sleeve_selection_or_weighting_raises(tmp_path, field, value):
         StrategyConfig(**kwargs)
 
 
-def test_shipped_config_etf_sleeve_holds_all_equal_weight():
+def test_shipped_config_etf_sleeve_is_a_model_sleeve_over_the_universe():
+    """v4.19: the ETF sleeve ranks the whole UMushroom ETF universe with the
+    ETF feature set and falls back to the 13 core ETFs under `auto`."""
     etf = next(s for s in load_config(REPO_CONFIG).all_sleeves if s.name == "etf")
-    assert etf.selection == "all" and etf.weighting == "equal"
+    assert etf.selection == "auto" and etf.weighting == "equal"
+    assert etf.feature_set == "etf" and etf.group_by == "asset_class"
+    assert len(etf.core_tickers) == 13 and set(etf.core_tickers) <= set(etf.tickers)
+    assert len(etf.tickers) > 1000 and not etf.universe_missing
+    assert etf.forward_return_days is not None and etf.forward_return_days <= 30
+    assert set(etf.groups.values()) >= {"equity", "bond", "commodity"}
 
 
 def test_shipped_config_iglt_quoted_in_pounds():
@@ -341,10 +348,20 @@ def test_shipped_config_has_no_usd_quoted_london_gdrs():
     assert not gdrs & set(cfg.tickers)
 
 
-def test_sleeve_horizon_cannot_exceed_purge(tmp_path):
+def test_sleeve_horizon_may_exceed_purge_but_not_the_contest_window(tmp_path):
+    """v4.19: the walk-forward lifts the purge to the horizon itself, so a
+    21-day ETF horizon with a 5-day purge is fine; a 31-day horizon is not
+    (the contest is 30 trading days)."""
     kwargs = _base_kwargs(tmp_path)
-    kwargs["sleeves"] = [_sleeve(forward_return_days=30)]   # purge is 5
-    with pytest.raises(ConfigError):
+    kwargs["sleeves"] = [_sleeve(forward_return_days=21)]   # purge is 5
+    StrategyConfig(**kwargs)
+    kwargs["sleeves"] = [_sleeve(forward_return_days=31)]
+    with pytest.raises(ConfigError, match="contest window"):
+        StrategyConfig(**kwargs)
+    kwargs["sleeves"] = []
+    kwargs["forward_return_days"] = 40
+    kwargs["purged_purge_days"] = 40
+    with pytest.raises(ConfigError, match="contest window"):
         StrategyConfig(**kwargs)
 
 
@@ -370,3 +387,93 @@ def test_yahoo_symbols_for_unknown_ticker_raises(tmp_path):
     kwargs["yahoo_symbols"] = {"NOPE.L": "NOPE"}
     with pytest.raises(ConfigError):
         StrategyConfig(**kwargs)
+
+
+# ---------------------------------------------------------------- v4.19 ETF universe
+
+UNIVERSE_CSV = textwrap.dedent("""\
+    yahoo,isin,name,umushroom_symbol,umushroom_currency,yahoo_currency,yahoo_exchange,yahoo_name,asset_class,style,manager,url_name,umushroom_price,price_date,history_days,first_date,last_date,name_similarity,via,status,note
+    IWDA.L,IE00B4L5Y983,iShares Core MSCI World,IWDA,USD,USD,LSE,iShares Core MSCI World,equity,,BlackRock,iwda,147.5,2026-10-12,2500,2016-10-12,2026-10-12,1.0,search,ok,
+    IGLT.L,IE00B1FZSB30,iShares Core UK Gilts,IGLT,GBP,GBp,LSE,iShares Core UK Gilts,bond,,BlackRock,iglt,9.5,2026-10-12,2500,2016-10-12,2026-10-12,1.0,search,ok,
+    XESC.DE,LU0380865021,Xtrackers Euro Stoxx 50,XESC,EUR,EUR,GER,Xtrackers Euro Stoxx 50,equity,,DWS,xesc,110.0,2026-10-12,2500,2016-10-12,2026-10-12,1.0,search,ok,
+    DEAD.L,XX0000000001,Dead ETF,DEAD,USD,,,,equity,,,dead,1.0,2026-10-12,0,,,,,no_yahoo_data,no data
+""")
+
+
+def _universe_yaml(extra: str = "") -> str:
+    return VALID_YAML + textwrap.dedent(f"""\
+        sleeves:
+          etf:
+            weight: 0.2
+            top_n: 2
+            feature_set: etf
+            group_by: asset_class
+            max_per_group: 1
+            selection: auto
+            universe_file: "universe.csv"
+            core_tickers: ["IWDA.L", "SGLD.L"]
+            {extra}
+        currency_overrides: {{"SGLD.L": "USD"}}
+    """)
+
+
+def test_universe_file_fills_tickers_groups_meta_and_overrides(tmp_path):
+    (tmp_path / "universe.csv").write_text(UNIVERSE_CSV)
+    cfg = load_config(_write(tmp_path, _universe_yaml()))
+    etf = cfg.sleeves[0]
+    # core first, then the universe's ok rows (no duplicates, dead row left out)
+    assert etf.tickers == ["IWDA.L", "SGLD.L", "IGLT.L", "XESC.DE"]
+    assert etf.groups == {"IWDA.L": "equity", "IGLT.L": "bond", "XESC.DE": "equity"}
+    assert etf.meta["IGLT.L"]["umushroom_symbol"] == "IGLT"
+    assert etf.universe_status == {"ok": 3, "no_yahoo_data": 1}
+    assert not etf.universe_missing
+    # USD line on London from the file, plus the explicit override from the YAML
+    assert cfg.currency_overrides == {"IWDA.L": "USD", "SGLD.L": "USD"}
+    assert cfg.contest_window_days == 30
+
+
+def test_missing_universe_file_degrades_to_core_tickers(tmp_path):
+    cfg = load_config(_write(tmp_path, _universe_yaml()))
+    etf = cfg.sleeves[0]
+    assert etf.tickers == ["IWDA.L", "SGLD.L"] and etf.universe_missing
+    assert etf.groups == {}
+
+
+def test_explicit_override_wins_over_universe_file(tmp_path):
+    (tmp_path / "universe.csv").write_text(UNIVERSE_CSV)
+    yaml_text = _universe_yaml().replace('currency_overrides: {"SGLD.L": "USD"}',
+                                         'currency_overrides: {"IWDA.L": "GBP", "SGLD.L": "USD"}')
+    cfg = load_config(_write(tmp_path, yaml_text))
+    assert cfg.currency_overrides["IWDA.L"] == "GBP"
+
+
+@pytest.mark.parametrize("extra", [
+    "feature_set: bonds",
+    "group_by: sector",
+    "max_per_group: -1",
+])
+def test_invalid_etf_sleeve_fields_raise(tmp_path, extra):
+    (tmp_path / "universe.csv").write_text(UNIVERSE_CSV)
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, _universe_yaml(extra)))
+
+
+def test_auto_selection_needs_core_tickers(tmp_path):
+    (tmp_path / "universe.csv").write_text(UNIVERSE_CSV)
+    yaml_text = _universe_yaml().replace('core_tickers: ["IWDA.L", "SGLD.L"]', "")
+    with pytest.raises(ConfigError, match="core_tickers"):
+        load_config(_write(tmp_path, yaml_text))
+
+
+def test_asset_class_grouping_needs_a_universe(tmp_path):
+    # no universe file -> no asset classes -> group_by: asset_class is an error
+    yaml_text = _universe_yaml().replace('universe_file: "universe.csv"', "")
+    with pytest.raises(ConfigError, match="asset_class"):
+        load_config(_write(tmp_path, yaml_text))
+
+
+def test_contest_window_days_from_yaml(tmp_path):
+    cfg = load_config(_write(tmp_path, VALID_YAML + "contest_window_days: 20\n"))
+    assert cfg.contest_window_days == 20
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, VALID_YAML + "contest_window_days: 0\n"))

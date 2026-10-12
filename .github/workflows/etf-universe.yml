@@ -1,0 +1,85 @@
+# Rebuilds the ETF universe where Yahoo Finance is reachable (GitHub's
+# cloud) and commits the result, so the daily Website run always has a
+# current, audited list of UMushroom ETFs it can price.
+#
+# Run it by hand: Actions -> ETF universe -> Run workflow. Tick "scrape" to
+# refresh the UMushroom catalogue first (a one-off read of the public ETF
+# sitemap + one API call per ETF; keep it occasional -- see catalogue.py).
+# Without "scrape" the committed catalogue snapshot is reused and only the
+# Yahoo mapping is redone (new listings, dead lines, currency changes).
+
+name: ETF universe
+
+on:
+  workflow_dispatch:
+    inputs:
+      scrape:
+        description: "Refresh umushroom_etf_catalogue.json from umushroom.com first"
+        type: boolean
+        default: false
+      extra_slugs:
+        description: "Extra UMushroom page slugs to add (space-separated)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: etf-universe
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Refresh the UMushroom catalogue (optional)
+        if: ${{ inputs.scrape }}
+        run: |
+          python -m umushroom.catalogue --out umushroom_etf_catalogue.json \
+            --extra ishares-core-msci-world-ucits-etf-usd-acc \
+                    xtrackers-euro-stoxx-50-ucits-etf-1c \
+                    vanguard-s-p-500-ucits-etf-usd-accumulation \
+                    ${{ inputs.extra_slugs }}
+
+      - name: Map every ETF to a Yahoo Finance line and verify its prices
+        run: |
+          python -m umushroom.etf_universe \
+            --catalogue umushroom_etf_catalogue.json \
+            --out umushroom_etf_universe.csv \
+            --config config.yaml
+
+      - name: Check the pipeline still loads the config
+        run: python -c "from umushroom.config import load_config; c = load_config('config.yaml'); print([(s.name, len(s.tickers)) for s in c.all_sleeves])"
+
+      - name: Commit the universe
+        run: |
+          git config user.name "umushroom-bot"
+          git config user.email "umushroom-bot@users.noreply.github.com"
+          git add umushroom_etf_universe.csv umushroom_etf_catalogue.json
+          if git diff --cached --quiet; then
+            echo "Universe unchanged"
+          else
+            git commit -m "ETF universe rebuilt $(date -u +%Y-%m-%d)"
+            git push
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: etf-universe
+          path: |
+            umushroom_etf_universe.csv
+            umushroom_etf_catalogue.json

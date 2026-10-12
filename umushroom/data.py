@@ -17,7 +17,10 @@ pandas.DataFrame and is fully testable with synthetic data.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
+import json
+import os
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -37,6 +40,9 @@ RETRY_BACKOFF_SECONDS = 2.0
 MIN_TICKER_COVERAGE = 0.9   # a ticker must have prices on >=90% of days
                             # or it is dropped (see _validate_prices)
 LOCAL_TZ = ZoneInfo("Europe/London")
+# v4.19: point this at a price snapshot (see snapshot_fetcher) to run the
+# whole pipeline offline on a fixed, reproducible set of prices.
+SNAPSHOT_ENV = "UMUSHROOM_PRICE_SNAPSHOT"
 SPIKE_THRESHOLD = 0.95      # |daily return| above this = presumed data error
 
 
@@ -236,6 +242,75 @@ class MarketData:
     stale_last: frozenset[str] = frozenset()
 
 
+class SnapshotFetcher:
+    """Replays prices from a JSON(.gz) snapshot instead of calling Yahoo.
+
+    Snapshot shape: {"fetched_at": ISO timestamp, "meta": {symbol: {...}},
+    "series": {symbol: {"d": [days since 1970-01-01], "c": [adjusted
+    closes], "v": [volumes]}}}. Symbols missing from the snapshot come back
+    as all-NaN columns, exactly as yfinance returns an unknown ticker, so
+    every downstream validation behaves the same way as in a live run.
+    Why: GitHub and the team's laptops can reach Yahoo, research sandboxes
+    often cannot; a snapshot makes any run reproducible to the last price.
+    """
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        opener = gzip.open if self.path.suffix == ".gz" else open
+        with opener(self.path, "rt", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        self._series = raw.get("series") or {}
+        self.meta = raw.get("meta") or {}
+        stamp = str(raw.get("fetched_at") or "")
+        self.as_of: date | None = None
+        if stamp:
+            try:
+                self.as_of = datetime.fromisoformat(stamp.replace("Z", "+00:00")).date()
+            except ValueError:
+                self.as_of = None
+        logger.info(f"Price snapshot {self.path} ({len(self._series)} symbols, "
+                    f"fetched {stamp or 'unknown'})")
+
+    def __call__(self, symbols: list[str], period: str
+                 ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+        closes: dict[str, pd.Series] = {}
+        volumes: dict[str, pd.Series] = {}
+        for sym in symbols:
+            s = self._series.get(sym)
+            if not s or not s.get("c"):
+                continue
+            idx = pd.to_datetime(pd.Index(s["d"], dtype="int64"), unit="D")
+            close = pd.Series(s["c"], index=idx, dtype=float)
+            # Yahoo can repeat a day (the live quote beside the daily bar):
+            # the later entry is the completed one
+            close = close[~close.index.duplicated(keep="last")]
+            closes[sym] = close
+            vol = s.get("v")
+            if vol is not None:
+                v_ser = pd.Series([float("nan") if v is None else float(v) for v in vol],
+                                  index=idx, dtype=float)
+                volumes[sym] = v_ser[~v_ser.index.duplicated(keep="last")]
+        if not closes:
+            raise DataError(f"Price snapshot {self.path} has none of the requested symbols")
+        close_df = pd.DataFrame(closes).sort_index()
+        close_df = close_df[~close_df.index.duplicated(keep="last")]
+        close_df = close_df.reindex(columns=symbols)        # unknown -> all NaN
+        vol_df = pd.DataFrame(volumes).sort_index().reindex(index=close_df.index,
+                                                            columns=symbols)
+        return close_df, vol_df
+
+
+def snapshot_fetcher(path: str | Path | None = None) -> SnapshotFetcher | None:
+    """The configured snapshot fetcher, if UMUSHROOM_PRICE_SNAPSHOT (or
+    `path`) names an existing file; otherwise None (= live Yahoo)."""
+    p = path or os.environ.get(SNAPSHOT_ENV)
+    if not p:
+        return None
+    if not Path(p).exists():
+        raise DataError(f"{SNAPSHOT_ENV} points to a missing file: {p}")
+    return SnapshotFetcher(p)
+
+
 def drop_incomplete_last_bar(data: pd.DataFrame, today: date) -> pd.DataFrame:
     """Drop any bar dated `today` or later.
 
@@ -341,6 +416,12 @@ def get_market_data(
     sym_map = {t: (yahoo_symbols or {}).get(t, t) for t in tickers}
     back = {v: k for k, v in sym_map.items()}
     all_symbols = [sym_map[t] for t in tickers] + fx_tickers
+    if fetcher is None:
+        snapshot = snapshot_fetcher()
+        if snapshot is not None:
+            fetcher = snapshot
+            # the snapshot's own date decides which bar is "today's" partial one
+            today = today or snapshot.as_of
     fetch = fetcher or _fetch_with_retries
 
     cache_path = _cache_path(cache_dir, all_symbols, period)

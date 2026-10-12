@@ -80,8 +80,8 @@ def test_build_runs_and_writes_every_page_encrypted(tmp_path):
                run_timeout=60, iterations=FAST)
     assert rc == 0
     names = {p.name for p in out.iterdir()}
-    for f in ("index.html", "stocks.html", "sell.html", "tracker.html", "graphs.html",
-              "montecarlo.html", "risk.html", "macro.html", "checks.html",
+    for f in ("index.html", "stocks.html", "etfs.html", "sell.html", "tracker.html",
+              "graphs.html", "montecarlo.html", "risk.html", "macro.html", "checks.html",
               "history.html", ".nojekyll", "robots.txt"):
         assert f in names
     assert len(list((out / "reports").iterdir())) == 1

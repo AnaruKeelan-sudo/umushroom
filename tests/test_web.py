@@ -175,6 +175,7 @@ def _run_once(runner, base):
 @pytest.mark.parametrize("path,expect,absent", [
     ("/", "Invested today", "Today's orders"),
     ("/stocks", "Today's orders", "Monte Carlo: what"),
+    ("/etfs", "ETF", "Monte Carlo: what"),
     ("/graphs", "Out-of-sample performance", "Today's orders"),
     ("/montecarlo", "Monte Carlo", "Today's orders"),
     ("/checks", "Validation checks", "Today's orders"),
@@ -186,7 +187,7 @@ def test_each_section_has_its_own_page(site, path, expect, absent):
     _, body = _get(base + path)
     assert expect in body and absent not in body
     assert 'aria-current="page"' in body
-    for label in ("Overview", "Stocks", "When to sell", "Tracker", "Graphs",
+    for label in ("Overview", "Stocks", "ETFs", "When to sell", "Tracker", "Graphs",
                   "Monte Carlo", "Risk (VaR)", "Macro", "Checks", "History"):
         assert f">{label}</a>" in body
 
