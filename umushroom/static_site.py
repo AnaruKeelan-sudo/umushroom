@@ -57,6 +57,7 @@ KEEP_RUNS = 40
 
 PAGES: list[tuple[str, str, str]] = [        # (key, label, file)
     ("overview", "Overview", "index.html"), ("stocks", "Stocks", "stocks.html"),
+    ("etfs", "ETFs", "etfs.html"),
     ("sell", "When to sell", "sell.html"), ("tracker", "Tracker", "tracker.html"),
     ("graphs", "Graphs", "graphs.html"), ("montecarlo", "Monte Carlo", "montecarlo.html"),
     ("risk", "Risk (VaR)", "risk.html"), ("macro", "Macro", "macro.html"),

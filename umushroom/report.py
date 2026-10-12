@@ -27,6 +27,7 @@ from umushroom.montecarlo import MonteCarloResult, bootstrap_annual_alpha, combi
 from umushroom.purged_backtest import PurgedWalkForwardResult
 from umushroom.rebalance import DEFAULT_REBALANCE_DAYS, next_review
 from umushroom.risk import MIN_OBS, backtest_var, var_es
+from umushroom.window import WindowResult
 
 W, H = 760, 280
 M_L, M_R, M_T, M_B = 64, 104, 16, 32          # right margin holds end labels
@@ -38,11 +39,25 @@ M_L, M_R, M_T, M_B = 64, 104, 16, 32          # right margin holds end labels
 class SleeveReport:
     name: str
     weight: float
-    selection: str
+    selection: str                      # configured rule: model | all | auto
     backtest: PurgedWalkForwardResult | None = None
     alpha_annual: float | None = None
     alpha_t: float | None = None
     validation: list[tuple[str, str, str]] = field(default_factory=list)
+    # ---- v4.19 ----
+    selection_used: str | None = None   # what this run actually did: model | all | core
+    decision: str = ""                  # why (the pre-declared rule, spelled out)
+    window: WindowResult | None = None  # contest-window evaluation
+    feature_set: str = "equity"
+    horizon_days: int | None = None
+    n_instruments: int = 0              # usable after data validation
+    n_core: int = 0
+    universe_status: dict[str, int] = field(default_factory=dict)
+    universe_missing: bool = False
+    contest_window_days: int | None = None
+    # today's model scores over the WHOLE sleeve universe (even when the
+    # sleeve ends up holding the core basket), for the ranking tables
+    scores: pd.Series | None = None
 
 
 def _clean(v: Any) -> Any:
@@ -109,11 +124,46 @@ def _hist(values: np.ndarray, bins: int = 40, trim: bool = True) -> dict:
             "hidden_low": float((v < lo).sum() / n), "hidden_high": float((v > hi).sum() / n)}
 
 
+def _uses_model(s: SleeveReport) -> bool:
+    """Did this run trade the model's picks? (v4.19: `auto` decides per run.)"""
+    if s.selection_used is not None:
+        return s.selection_used == "model"
+    return s.selection == "model"
+
+
+def _window_payload(w: WindowResult | None) -> dict | None:
+    if w is None or w.n_windows == 0:
+        return None
+    return {
+        "periods": w.window_periods, "days": w.window_days,
+        "n_windows": w.n_windows, "n_independent": w.n_independent,
+        "win_rate": _clean(w.win_rate), "positive_rate": _clean(w.positive_rate),
+        "mean_active": _clean(w.mean_active),
+        "median_strategy": _clean(w.median_strategy),
+        "median_benchmark": _clean(w.median_benchmark),
+        "worst": _clean(w.worst_strategy), "best": _clean(w.best_strategy),
+        "active_t": _clean(w.active_tstat), "verdict": w.verdict,
+        "dates": [d.strftime("%Y-%m-%d") for d in w.rolling_strategy.index],
+        "strategy": _floats(w.rolling_strategy),
+        "benchmark": _floats(w.rolling_benchmark),
+        "active_hist": _hist(w.rolling_active.to_numpy(dtype=float), bins=30),
+    }
+
+
 def _sleeve_payload(s: SleeveReport, periods_per_year: float) -> dict:
     out: dict[str, Any] = {"name": s.name, "weight": s.weight, "selection": s.selection,
                            "alpha": _clean(s.alpha_annual), "alpha_t": _clean(s.alpha_t),
                            "validation": [{"name": n, "status": st, "detail": d}
-                                          for n, st, d in s.validation]}
+                                          for n, st, d in s.validation],
+                           "selection_used": s.selection_used or (
+                               "model" if s.selection == "model" else "all"),
+                           "decision": s.decision, "feature_set": s.feature_set,
+                           "horizon_days": s.horizon_days,
+                           "n_instruments": s.n_instruments, "n_core": s.n_core,
+                           "universe_status": dict(s.universe_status),
+                           "universe_missing": s.universe_missing,
+                           "contest_window_days": s.contest_window_days,
+                           "window": _window_payload(s.window)}
     r = s.backtest
     if r is None or len(r.period_returns) == 0:
         return out
@@ -124,7 +174,7 @@ def _sleeve_payload(s: SleeveReport, periods_per_year: float) -> dict:
     active = r.active_returns.reindex(r.period_returns.index).fillna(0.0)
     # a hold-all sleeve EARNS the equal-weight basket; the model's picks are
     # only shown for reference, clearly labelled as not used
-    strat = model_curve if s.selection == "model" else bench
+    strat = model_curve if _uses_model(s) else bench
     out.update({
         "ic": _clean(r.mean_information_coefficient), "ic_t": _clean(r.ic_tstat),
         "ic_hit": _clean(r.ic_hit_rate), "years": _clean(r.years),
@@ -155,7 +205,7 @@ def _held_returns(s: SleeveReport) -> pd.Series | None:
     r = s.backtest
     if r is None or len(r.period_returns) == 0:
         return None
-    held = (r.period_returns if s.selection == "model"
+    held = (r.period_returns if _uses_model(s)
             else r.benchmark_period_returns.reindex(r.period_returns.index))
     return held.dropna()
 
@@ -208,7 +258,8 @@ def build_payload(meta: dict, sleeves: list[SleeveReport], orders: pd.DataFrame,
                   top_ranked: pd.DataFrame | None = None,
                   deciles: pd.Series | None = None,
                   mc: MonteCarloResult | None = None, mc_note: str = "",
-                  periods_per_year: float = 252 / 5) -> dict:
+                  periods_per_year: float = 252 / 5,
+                  top_etfs: dict[str, pd.DataFrame] | None = None) -> dict:
     payload: dict[str, Any] = {
         "meta": {k: _clean(v) for k, v in meta.items()},
         "orders": _records(orders),
@@ -217,6 +268,8 @@ def build_payload(meta: dict, sleeves: list[SleeveReport], orders: pd.DataFrame,
         "deciles": _floats(deciles.tolist()) if deciles is not None else [],
         "mc": None,
         "mc_note": mc_note,
+        # v4.19: per-sleeve ETF ranking tables, keyed by sleeve name
+        "top_etfs": {k: _records(v) for k, v in (top_etfs or {}).items()},
     }
     if mc is not None:
         bands = mc.percentile_bands()
@@ -619,12 +672,26 @@ def _sleeve_checks(s: dict) -> str:
             f'<ul class="checks">{items}</ul></div>')
 
 
+def _how_held(s: dict) -> str:
+    used = s.get("selection_used") or ("model" if s["selection"] == "model" else "all")
+    if used == "model":
+        return "model picks"
+    if used == "core":
+        return f"holds the {s.get('n_core') or ''} core ETFs, equal weight".replace("  ", " ")
+    return "holds everything, equal weight"
+
+
+def _model_used(s: dict) -> bool:
+    used = s.get("selection_used") or ("model" if s["selection"] == "model" else "all")
+    return used == "model"
+
+
 def _sleeve_section(s: dict) -> str:
     out = []
     nm = _label(s["name"])
-    how = "model picks" if s["selection"] == "model" else "holds everything, equal weight"
+    how = _how_held(s)
     stats = []
-    if s["selection"] == "model":
+    if _model_used(s):
         if s.get("alpha") is not None:
             stats.append(f"alpha {s['alpha']:+.1%}/yr (t = {s['alpha_t']:+.2f})")
         if s.get("ic") is not None:
@@ -635,7 +702,7 @@ def _sleeve_section(s: dict) -> str:
                f'{_esc(how)}{"; " + _esc(", ".join(stats)) if stats else ""}</span></h3>')
     c = s.get("curves")
     if c:
-        if s["selection"] == "model":
+        if _model_used(s):
             out.append(line_chart(
                 f"{nm}: out-of-sample performance",
                 "Growth of 1 when every week was traded by a model trained only on "
@@ -651,7 +718,7 @@ def _sleeve_section(s: dict) -> str:
                 [("What we hold: all, equal weight", c["strategy"], "--series-1"),
                  ("Model's picks (not used)", c.get("model", c["strategy"]),
                   "--series-2")], "x"))
-        if s["selection"] == "model":
+        if _model_used(s):
             out.append(line_chart(
                 f"{nm}: cumulative alpha",
                 "How far the picks have pulled ahead of (or behind) simply holding the "
@@ -668,7 +735,7 @@ def _sleeve_section(s: dict) -> str:
                     [("Rolling 1-year alpha", c["rolling_alpha"], "--series-1")], "pct",
                     zero_line=True))
     boot = s.get("alpha_boot")
-    if boot and s["selection"] == "model":
+    if boot and _model_used(s):
         out.append(histogram(
             f"{nm}: how sure are we about the alpha?",
             f"5,000 block-bootstrap resamples of the out-of-sample weeks. "
@@ -680,8 +747,181 @@ def _sleeve_section(s: dict) -> str:
 
 
 SECTIONS: list[tuple[str, str]] = [
-    ("overview", "Overview"), ("stocks", "Stocks"), ("graphs", "Graphs"),
+    ("overview", "Overview"), ("stocks", "Stocks"), ("etfs", "ETFs"), ("graphs", "Graphs"),
     ("montecarlo", "Monte Carlo"), ("risk", "Risk (VaR)"), ("checks", "Checks")]
+
+
+def _etf_orders_table(orders: list[dict], ccy: str) -> str:
+    head = ["Ticker", "UMushroom", "Name", "Asset class", "Shares", "Price (local)",
+            "Value " + ccy, "Portfolio %", "1M", "3M", "12M", "Volatility"]
+    rows = []
+    for o in orders:
+        lp = o.get("local_price")
+        price = ("n/a" if lp is None else
+                 f"{_price(lp)} {o.get('listing_currency') or ''}".strip())
+        shares = o.get("shares")
+        um = o.get("umushroom_symbol") or ""
+        if o.get("umushroom_currency"):
+            um = f"{um} ({o['umushroom_currency']})".strip()
+        rows.append([o["ticker"], um, o.get("name") or "", o.get("sector") or "",
+                     "" if shares is None else f"{shares:g}", price,
+                     _num(o.get("allocated_value"), 0),
+                     "n/a" if o.get("portfolio_weight") is None
+                     else f"{o['portfolio_weight']:.1%}",
+                     _pct(o.get("ret_1m")), _pct(o.get("ret_3m")), _pct(o.get("ret_12m")),
+                     "n/a" if o.get("vol_60d") is None else f"{o['vol_60d']:.0%}"])
+    return _plain_table(head, rows)
+
+
+def _etf_top_table(top: list[dict]) -> str:
+    head = ["Rank", "Ticker", "UMushroom", "Name", "Asset class", "Currency",
+            "Better than", "In portfolio", "1M", "3M", "12M", "Volatility"]
+    rows = [[str(t.get("rank", "")), t["ticker"], t.get("umushroom_symbol") or "",
+             t.get("name") or "", t.get("asset_class") or "", t.get("currency") or "",
+             "n/a" if t.get("rank_pct") is None else f"{t['rank_pct']:.0%} of universe",
+             "yes" if t.get("held") else "", _pct(t.get("ret_1m")), _pct(t.get("ret_3m")),
+             _pct(t.get("ret_12m")),
+             "n/a" if t.get("vol_60d") is None else f"{t['vol_60d']:.0%}"] for t in top]
+    return _plain_table(head, rows)
+
+
+def _window_cards(s: dict) -> str:
+    """Contest-window evidence for one sleeve: tiles, the per-window chart
+    and the spread of active returns."""
+    w = s.get("window")
+    nm = _label(s["name"])
+    days = s.get("contest_window_days") or (w or {}).get("days") or ""
+    if not w:
+        return (f'<p class="note">{_esc(nm)}: no contest-window evaluation in this run '
+                f"(it needs the purged walk-forward backtest).</p>")
+    verdict = str(w.get("verdict", ""))
+    badge_cls = {"PASS": "pass", "WARN": "warn", "FAIL": "fail"}.get(verdict, "")
+    tiles = [
+        _tile(f"Beat the benchmark over {days} days",
+              f"{w['win_rate']:.0%}" if w.get("win_rate") is not None else "n/a",
+              f"of {w['n_windows']} rolling windows"),
+        _tile("Median window return",
+              _fmt(w.get("median_strategy"), "pct"),
+              f"benchmark {_fmt(w.get('median_benchmark'), 'pct')}"),
+        _tile("Active return per window", _fmt(w.get("mean_active"), "pct"),
+              f"t = {w['active_t']:+.2f} on {w['n_independent']} non-overlapping windows"
+              if w.get("active_t") is not None else "t = n/a"),
+        _tile("Worst window", _fmt(w.get("worst"), "pct"),
+              f"best {_fmt(w.get('best'), 'pct')}"),
+    ]
+    out = [(f'<h3 class="sec">{_esc(nm)}: does the edge arrive inside the contest? '
+            f'<span class="badge {badge_cls}">{_esc(verdict)}</span></h3>'),
+           f'<section class="tiles">{"".join(tiles)}</section>']
+    out.append(line_chart(
+        f"{nm}: every {days}-day window, out of sample",
+        f"Compounded return of the model's picks against the equal-weight universe over "
+        f"each stretch the length of Stage 1 ({w['periods']} rebalances), starting on "
+        f"every rebalance date the backtest covers.",
+        w["dates"],
+        [("Model's picks", w["strategy"], "--series-1"),
+         ("Equal-weight universe", w["benchmark"], "--series-2")], "pct", zero_line=True))
+    out.append(histogram(
+        f"{nm}: active return per {days}-day window",
+        f"Picks minus benchmark across all {w['n_windows']} windows; the verdict needs "
+        f"more than half of them above zero AND t >= 2 on the independent windows.",
+        w["active_hist"], "pct", 0.0, "no edge",
+        [["beat benchmark", f"{w['win_rate']:.0%}" if w.get("win_rate") is not None
+          else "n/a"],
+         ["finished up", f"{w['positive_rate']:.0%}" if w.get("positive_rate") is not None
+          else "n/a"]]))
+    return "".join(out)
+
+
+def _etf_section(payload: dict) -> str:
+    """The ETFs tab (v4.19): what the ETF sleeve holds today and why."""
+    ccy = payload["meta"].get("base_currency", "")
+    etf_sleeves = [s for s in payload["sleeves"] if s.get("feature_set") == "etf"
+                   or s["name"] == "etf"]
+    if not etf_sleeves:
+        return ('<h2>ETFs</h2><p class="note">No ETF sleeve in this run. Add an '
+                "<b>etf</b> entry under <b>sleeves</b> in config.yaml.</p>")
+    out: list[str] = []
+    for s in etf_sleeves:
+        nm = _label(s["name"])
+        used = s.get("selection_used") or "all"
+        status = s.get("universe_status") or {}
+        n_ok = int(status.get("ok", 0))
+        n_cat = int(sum(status.values())) if status else 0
+        tiles = [
+            _tile("ETF universe",
+                  f"{s.get('n_instruments') or 0:,} priced today",
+                  (f"{n_ok:,} of {n_cat:,} UMushroom ETFs map to Yahoo; "
+                   f"{s.get('n_core') or 0} core") if n_cat else
+                  f"{s.get('n_core') or 0} core ETFs"),
+            _tile("Holding today",
+                  {"model": "model picks", "core": "core basket",
+                   "all": "everything"}.get(used, used),
+                  f"{s['weight']:.0%} of capital, rule: {s.get('selection')}"),
+            _tile("Forecast horizon",
+                  f"{s.get('horizon_days') or '?'} trading days",
+                  f"inside the {s.get('contest_window_days') or '?'}-day contest window"),
+        ]
+        if s.get("ic") is not None:
+            tiles.append(_tile("Ranking skill (out of sample)",
+                               f"IC {s['ic']:+.3f}", f"t = {s['ic_t']:+.2f}"
+                               + (f" over {s['years']:.1f} years" if s.get("years") else "")))
+        if s.get("alpha") is not None:
+            tiles.append(_tile("Alpha vs equal-weight ETFs", f"{s['alpha']:+.1%} a year",
+                               f"t = {s['alpha_t']:+.2f}"))
+        out.append(f"<h2>{_esc(nm)} sleeve</h2>")
+        out.append(f'<section class="tiles">{"".join(tiles)}</section>')
+        if s.get("decision"):
+            out.append(f'<p class="note"><b>Selection rule this run:</b> '
+                       f'{_esc(s["decision"])}</p>')
+        if s.get("universe_missing"):
+            out.append('<p class="note"><b>Universe file missing:</b> only the core ETFs '
+                       "were available. Build it with "
+                       "<code>python -m umushroom.etf_universe</code> and commit the "
+                       "CSV.</p>")
+        orders = [o for o in payload["orders"] if o.get("sleeve") == s["name"]]
+        out.append("<h3 class=\"sec\">Today's ETF orders</h3>")
+        out.append('<p class="note">Enter these on UMushroom. "UMushroom" is the ticker '
+                   "and pricing currency shown on the platform; check each local price "
+                   "against UMushroom's before buying.</p>")
+        out.append(_etf_orders_table(orders, ccy) if orders else
+                   '<p class="note">No ETF orders this run.</p>')
+        top = (payload.get("top_etfs") or {}).get(s["name"]) or []
+        if top:
+            out.append('<h3 class="sec">Top-ranked ETFs</h3>')
+            out.append('<p class="note">The ETF model\'s 25 highest-ranked ETFs today, '
+                       'ranked within their asset class. "Better than" is the share of '
+                       "the universe ranked below.</p>")
+            out.append(_etf_top_table(top))
+        out.append(_window_cards(s))
+        c = s.get("curves")
+        if c:
+            out.append(line_chart(
+                f"{nm}: out-of-sample performance",
+                "Growth of 1 when every week was traded by a model trained only on earlier "
+                "data (purged walk-forward), against holding every ETF equally.",
+                c["dates"],
+                [("Model's picks", c.get("model", c["strategy"]), "--series-1"),
+                 ("Equal-weight universe", c["benchmark"], "--series-2")], "x"))
+        if status:
+            rows = [[k, str(v)] for k, v in sorted(status.items(),
+                                                   key=lambda kv: -kv[1])]
+            out.append('<h3 class="sec">Universe build</h3>')
+            out.append('<p class="note">Every ETF on UMushroom\'s public catalogue, and '
+                       "whether Yahoo Finance can price it. Only <b>ok</b> rows are "
+                       "traded; the rest are listed in umushroom_etf_universe.csv with "
+                       "the reason.</p>")
+            out.append(_plain_table(["Status", "ETFs"], rows))
+    out.append('<h3 class="sec">How to read this</h3><ul class="notes">'
+               "<li>The ETF model ranks ETFs within their asset class on trend factors "
+               "(1-, 3-, 6- and 12-month momentum, 200-day trend, drawdown, volatility, "
+               "beta), the same way the stock model ranks stocks.</li>"
+               "<li>Every return it is trained to capture is shorter than the contest, "
+               "and the contest-window verdict above checks that the picks actually beat "
+               "the benchmark over stretches as long as Stage 1.</li>"
+               "<li>Under <b>selection: auto</b> the picks are only traded while both the "
+               "ranking skill and the window verdict hold; otherwise the sleeve holds the "
+               "core basket, equal weight, and this page says so.</li></ul>")
+    return "".join(out)
 
 _READ_FIRST = ('<h2>Read this first</h2><ul class="notes">'
                "<li>Backtests use today's listed companies, so firms that failed since "
@@ -709,6 +949,16 @@ def _tiles(payload: dict) -> str:
         tiles.append(_tile("Chance the stock alpha is real",
                            f"{eq['alpha_boot']['prob_positive']:.0%}",
                            "share of bootstrap resamples above zero"))
+    etf = next((s for s in payload["sleeves"] if s["name"] == "etf"), None)
+    if etf is not None:
+        used = etf.get("selection_used") or "all"
+        w = etf.get("window") or {}
+        tiles.append(_tile("ETF sleeve",
+                           {"model": "model picks", "core": "core basket",
+                            "all": "all, equal weight"}.get(used, used),
+                           (f"{etf.get('n_instruments') or 0:,} ETFs ranked; window "
+                            f"verdict {w.get('verdict')}") if w else
+                           f"{etf.get('n_instruments') or 0:,} ETFs"))
     as_of = str(payload["meta"].get("as_of") or "")
     if as_of:
         try:
@@ -881,6 +1131,7 @@ def section_bodies(payload: dict) -> dict[str, str]:
         "the website with --validate) to include them.</p>"))
 
     return {"overview": _tiles(payload) + _READ_FIRST, "stocks": "".join(stocks),
+            "etfs": _etf_section(payload),
             "graphs": "".join(graphs), "montecarlo": "".join(mcs),
             "risk": _risk_section(payload), "checks": checks}
 
@@ -903,8 +1154,8 @@ def render_html(payload: dict) -> str:
     """The whole report on one page."""
     b = section_bodies(payload)
     tiles, _, _ = b["overview"].partition("<h2>Read this first</h2>")
-    return render_page(payload, tiles + b["stocks"] + b["graphs"] + b["montecarlo"]
-                       + b["risk"] + b["checks"] + _READ_FIRST)
+    return render_page(payload, tiles + b["stocks"] + b["etfs"] + b["graphs"]
+                       + b["montecarlo"] + b["risk"] + b["checks"] + _READ_FIRST)
 
 
 def write_report(path: str | Path, payload: dict) -> Path:

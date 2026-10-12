@@ -1,5 +1,46 @@
 # Changelog
 
+## 4.19.0 (2026-10-12) -- ETF model over the whole UMushroom ETF universe
+- ETF sleeve is now a model sleeve: `feature_set: etf` (13 trend /
+  asset-class momentum factors), ranked within UMushroom's asset classes,
+  at most 3 picks per class, over every ETF UMushroom lists that Yahoo can
+  price (2,047 of 2,261; leveraged/inverse and crypto ETPs excluded). The 13
+  ETFs traded so far stay in as `core_tickers`.
+- New `umushroom/catalogue.py`: scrapes UMushroom's public ETF sitemap +
+  per-ETF API record into `umushroom_etf_catalogue.json` (2,261 ETFs; three
+  core ETFs the sitemap omits are fetched by slug).
+- New `umushroom/etf_universe.py`: maps each ISIN to a Yahoo Finance line
+  (venue preference for a GBP account, already-traded lines kept, ticker
+  guesses only with a matching fund name, every line verified for currency,
+  history and freshness) and writes `umushroom_etf_universe.csv` with a
+  status and reason per ETF. `--config` keeps the config's own lines.
+- New `umushroom/window.py` + `contest_window_days: 30`: every sleeve's
+  horizon must fit inside Stage 1, and every sleeve is judged on rolling
+  30-day out-of-sample windows (win rate vs. benchmark, active t on
+  non-overlapping windows, PASS/WARN/FAIL). The evaluation runs on test
+  folds exactly one contest window long so windows never straddle a
+  purge/embargo gap.
+- `selection: auto`: trade the model only while IC t >= 2 AND the window
+  verdict is not FAIL; else hold the core basket. The decision and its
+  reason are printed and shown on the website.
+- `--compare-horizon SLEEVE:5,10,21`: pre-declared horizon head-to-head
+  judged by the contest-window rule. Result 2026-10-12 (ETFs): 5d IC t
+  +3.33 / 6-week win 57%; 10d IC t +4.06 / 49% (winner, adopted); 21d no
+  skill. Under `auto` the sleeve therefore holds the core basket today.
+- Website: new **ETFs** tab (orders with UMushroom ticker and currency,
+  top-25 ETF ranking with asset class, universe build status, the
+  contest-window evidence with verdict badge, the selection rule in force);
+  ETF tile on Overview.
+- `UMUSHROOM_PRICE_SNAPSHOT`: replay a saved price snapshot instead of
+  Yahoo for reproducible offline runs (`data.SnapshotFetcher`).
+- New workflow `.github/workflows/etf-universe.yml` rebuilds and commits
+  the universe on demand.
+- Data: `.MU`, `.LU`, `.IL` suffixes recognised. Per-sleeve horizons may
+  exceed `purged_purge_days` (the purge is lifted to the horizon).
+- 60 new tests (window, universe mapping, catalogue scraper, ETF features
+  incl. planted-signal recovery, config, snapshot replay, ETF sleeve
+  end-to-end, website tabs).
+
 ## 4.18.0 (2026-10-10) -- 6-week Monte Carlo + sector cap (opt-in), no crypto
 - Crypto sleeve switched OFF in config.yaml (model showed no skill; holding
   all 18 coins only added volatility). Equity 80%, ETFs 20%. The crypto

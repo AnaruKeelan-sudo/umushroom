@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from datetime import date
+
 import numpy as np
 import pandas as pd
 import pytest
 
+from umushroom import data as data_mod
 from umushroom.data import _validate_prices
 from umushroom.exceptions import DataError, InsufficientHistoryError
 
@@ -52,8 +55,6 @@ def test_validate_forward_fills_short_gaps(synthetic_prices):
 
 
 # ---------------------------------------------------------------- v4 tests
-from datetime import date
-
 from umushroom.data import (
     convert_to_base_currency,
     drop_incomplete_last_bar,
@@ -244,3 +245,57 @@ def test_yahoo_symbols_fetch_under_other_symbol_but_keep_ticker(tmp_path):
     assert "CRH" in seen["symbols"] and "CRH.L" not in seen["symbols"]
     assert "CRH.L" in md.prices.columns
     assert md.listings["CRH.L"].currency == "USD"
+
+
+# ------------------------------------------------------------ v4.19 snapshot replay
+
+def _write_snapshot(path, gz=True):
+    import gzip
+    import json
+    days = list(range(19000, 19000 + 400))        # 400 consecutive days from 2022-01-08
+    payload = {"fetched_at": "2023-02-15T17:00:00Z",
+               "meta": {"AAA.L": {"cur": "GBp", "n": 400}, "USDGBP=X": {"cur": "GBP"},
+                        "BBB": {"cur": "USD", "n": 400}},
+               "series": {"AAA.L": {"d": days, "c": [5000.0 + i for i in range(400)],
+                                    "v": [1000] * 400},
+                          "BBB": {"d": days + [days[-1]],          # a repeated last day
+                                  "c": [100.0 + i * 0.1 for i in range(400)] + [140.5],
+                                  "v": [None] * 401},
+                          "USDGBP=X": {"d": days, "c": [0.8] * 400, "v": [None] * 400}}}
+    text = json.dumps(payload)
+    if gz:
+        with gzip.open(path, "wt", encoding="utf-8") as fh:
+            fh.write(text)
+    else:
+        path.write_text(text)
+    return path
+
+
+def test_snapshot_fetcher_replays_prices_and_dedupes_days(tmp_path):
+    snap = data_mod.SnapshotFetcher(_write_snapshot(tmp_path / "snap.json.gz"))
+    assert snap.as_of == date(2023, 2, 15)
+    closes, volumes = snap(["AAA.L", "BBB", "ZZZ", "USDGBP=X"], "10y")
+    assert list(closes.columns) == ["AAA.L", "BBB", "ZZZ", "USDGBP=X"]
+    assert closes["ZZZ"].isna().all()                 # unknown symbol -> NaN, like Yahoo
+    assert not closes.index.duplicated().any()
+    assert closes["BBB"].iloc[-1] == 140.5            # the later entry of a repeated day wins
+    assert volumes is not None and volumes["AAA.L"].iloc[0] == 1000
+    assert volumes["BBB"].isna().all()
+
+
+def test_snapshot_env_var_drives_get_market_data(tmp_path, monkeypatch):
+    _write_snapshot(tmp_path / "snap.json", gz=False)
+    monkeypatch.setenv(data_mod.SNAPSHOT_ENV, str(tmp_path / "snap.json"))
+    md = data_mod.get_market_data(
+        tickers=["AAA.L", "BBB"], period="10y", cache_dir=tmp_path / ".cache",
+        cache_max_age_hours=12, min_history_days=100, base_currency="GBP")
+    # London pence converted to pounds, USD converted at the snapshot's FX
+    assert md.prices["AAA.L"].iloc[0] == pytest.approx(50.0)
+    assert md.prices["BBB"].iloc[0] == pytest.approx(80.0)
+    # the snapshot's own date decides the partial bar: nothing dated >= 2023-02-15 survives
+    assert md.prices.index.max() < pd.Timestamp("2023-02-15")
+    monkeypatch.setenv(data_mod.SNAPSHOT_ENV, str(tmp_path / "missing.json"))
+    with pytest.raises(DataError):
+        data_mod.get_market_data(
+            tickers=["AAA.L"], period="10y", cache_dir=tmp_path / ".cache",
+            cache_max_age_hours=12, min_history_days=100, base_currency="GBP")

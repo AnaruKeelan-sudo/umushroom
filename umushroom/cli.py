@@ -54,6 +54,7 @@ from umushroom.selection import (
 )
 from umushroom.universe import check_concentration
 from umushroom.validation import ValidationReport, decile_returns, run_validation
+from umushroom.window import FAIL, WindowResult, contest_windows, window_periods_for
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -96,6 +97,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--compare-sector-cap", type=int, metavar="N", default=None,
         help="v4.18: head-to-head backtest of the equity sleeve with at most N "
              "picks per sector vs. no cap, with a pre-declared decision rule")
+    parser.add_argument(
+        "--compare-horizon", metavar="SLEEVE:DAYS,DAYS,...", default=None,
+        help="v4.19: head-to-head of forecast horizons for one sleeve on identical "
+             "data, e.g. etf:5,10,21, judged by the contest-window rule declared in "
+             "window.py. Every horizon must fit inside contest_window_days.")
     parser.add_argument(
         "--compare-baseline", action="store_true",
         help="Also run the v4.3 equity setup on the same data and print a "
@@ -253,11 +259,23 @@ def _write_report(cfg: StrategyConfig, args: argparse.Namespace,
     def meta(t: str, key: str) -> str:
         return meta_rows.get(t, {}).get(key, "")
 
+    etf_meta: dict[str, dict[str, str]] = {}
+    for sl in cfg.sleeves:
+        etf_meta.update(sl.meta)
+
+    def imeta(t: str, key: str) -> str:
+        return etf_meta.get(t, {}).get(key, "") or meta(t, key)
+
     orders = combined.copy()
     snap = stock_snapshot(market.prices, list(orders.index))
     orders = orders.join(snap)
-    orders["name"] = [meta(t, "name") for t in orders.index]
-    orders["sector"] = [meta(t, "sector").replace("-", " ") for t in orders.index]
+    orders["name"] = [imeta(t, "name") for t in orders.index]
+    orders["sector"] = [(etf_meta.get(t, {}).get("asset_class") or meta(t, "sector"))
+                        .replace("-", " ") for t in orders.index]
+    orders["umushroom_symbol"] = [etf_meta.get(t, {}).get("umushroom_symbol", "")
+                                 for t in orders.index]
+    orders["umushroom_currency"] = [etf_meta.get(t, {}).get("umushroom_currency", "")
+                                   for t in orders.index]
     orders["portfolio_weight"] = orders["allocated_value"] / cfg.starting_balance
 
     top = pd.DataFrame()
@@ -274,6 +292,26 @@ def _write_report(cfg: StrategyConfig, args: argparse.Namespace,
         top["held"] = [1 if t in eq_alloc.orders.index else 0 for t in top.index]
         top = top.join(stock_snapshot(market.prices, list(top.index)))
 
+    # v4.19: the ETF sleeve's own ranking table (top 25), with asset class
+    top_etfs: dict[str, pd.DataFrame] = {}
+    for sl, al in allocations:
+        if sl.name == EQUITY_SLEEVE or sl.feature_set != "etf":
+            continue
+        info_s = collected.get(sl.name)
+        full = info_s.scores if info_s is not None and info_s.scores is not None else None
+        scores = (full if full is not None else al.all_scores).sort_values(ascending=False)
+        rank_pct = scores.rank(pct=True)
+        best = scores.head(25)
+        tb = pd.DataFrame({"rank": range(1, len(best) + 1),
+                           "rank_pct": rank_pct[best.index]}, index=best.index)
+        tb["name"] = [imeta(t, "name") for t in tb.index]
+        tb["asset_class"] = [etf_meta.get(t, {}).get("asset_class", "") for t in tb.index]
+        tb["umushroom_symbol"] = [etf_meta.get(t, {}).get("umushroom_symbol", "")
+                                 for t in tb.index]
+        tb["currency"] = [market.listings[t].currency for t in tb.index]
+        tb["held"] = [1 if t in al.orders.index else 0 for t in tb.index]
+        top_etfs[sl.name] = tb.join(stock_snapshot(market.prices, list(tb.index)))
+
     deciles = None
     eq_info = collected.get(EQUITY_SLEEVE)
     if eq_info is not None and eq_info.backtest is not None:
@@ -289,7 +327,8 @@ def _write_report(cfg: StrategyConfig, args: argparse.Namespace,
             r = i.backtest
             # model sleeves earn the model's picks; hold-all sleeves earn the
             # equal-weight basket, which is exactly the benchmark series
-            strat_parts.append((s.weight, r.period_returns if s.selection == "model"
+            strat_parts.append((s.weight, r.period_returns
+                                if i.selection_used == "model"
                                 else r.benchmark_period_returns))
             bench_parts.append((s.weight, r.benchmark_period_returns))
         try:
@@ -311,9 +350,10 @@ def _write_report(cfg: StrategyConfig, args: argparse.Namespace,
         meta={"as_of": str(market.prices.index[-1].date()),
               "generated": datetime.now(data_mod.LOCAL_TZ).strftime("%Y-%m-%d %H:%M"),
               "base_currency": cfg.base_currency, "version": __version__,
-              "rebalance_days": cfg.rebalance_days},
+              "rebalance_days": cfg.rebalance_days,
+              "contest_window_days": cfg.contest_window_days},
         sleeves=sleeves, orders=orders, top_ranked=top, deciles=deciles,
-        mc=mc, mc_note=mc_note)
+        mc=mc, mc_note=mc_note, top_etfs=top_etfs)
     return write_report(args.report, payload)
 
 
@@ -352,12 +392,29 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
     sectors = (load_sectors(cfg.sector_file)
                if cfg.sector_file is not None and Path(cfg.sector_file).exists()
                else None)
+    # v4.19: a per-group cap (e.g. at most 3 bond ETFs) reuses the sector-cap
+    # machinery with the sleeve's own groups
+    cap_groups, cap_n = sectors, sleeve.max_per_sector
+    if sleeve.max_per_group and sleeve.groups:
+        cap_groups = {t: sleeve.groups[t] for t in cols if t in sleeve.groups}
+        cap_n = sleeve.max_per_group
     if sleeve.name == EQUITY_SLEEVE:
         for w in check_concentration(listings, cfg.max_single_exchange_fraction):
             print(f"WARNING: {w}")
         if sleeve.max_per_sector:
             print(f"Sector cap ON: at most {sleeve.max_per_sector} picks per sector")
-    print(f"Instruments: {len(cols)}")
+    elif cap_n and cap_groups:
+        print(f"Group cap ON: at most {cap_n} picks per {sleeve.group_by or 'group'}")
+    core_cols = [t for t in sleeve.core_tickers if t in cols]
+    print(f"Instruments: {len(cols)}" + (f" ({len(core_cols)} core)" if core_cols else "")
+          + f"; feature set: {sleeve.feature_set}")
+    if sleeve.universe_missing:
+        print(f"WARNING: universe file {sleeve.universe_file} not found -- running on "
+              f"the {len(cols)} listed instruments only. Build it with "
+              f"`python -m umushroom.etf_universe`.")
+    if sleeve.groups:
+        mix = pd.Series([sleeve.groups.get(t, "other") for t in cols]).value_counts()
+        print("By group: " + ", ".join(f"{k} {v}" for k, v in mix.items()))
 
     log_path = _sleeve_log_path(cfg, sleeve)
     if not args.skip_prediction_check:
@@ -368,11 +425,11 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
 
     horizon = sleeve_horizon(cfg, sleeve)
     print(f"Forecast horizon: {horizon} trading days (rebalanced every "
-          f"{cfg.rebalance_days})")
+          f"{cfg.rebalance_days}; contest window {cfg.contest_window_days})")
     X, y = features_mod.build_training_set(
         prices, forward_return_days=horizon, step=cfg.rebalance_days,
         min_history_days=cfg.min_history_days, target=cfg.target, groups=groups,
-        dollar_volume=dvol)
+        dollar_volume=dvol, feature_set=sleeve.feature_set)
     model = RankingModel(alpha=cfg.model_alpha, random_seed=cfg.random_seed)
     cv_stats = model.cross_validate(
         X, y, purge_dates=math.ceil(horizon / cfg.rebalance_days))
@@ -390,15 +447,22 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
         bt = run_backtest(prices, model, top_n=sleeve.top_n,
                           rebalance_days=cfg.rebalance_days,
                           min_history_days=cfg.min_history_days, groups=groups,
-                          dollar_volume=dvol)
+                          dollar_volume=dvol, feature_set=sleeve.feature_set)
         print("\n--- Quick Sanity-Check Backtest (IN-SAMPLE -- see warning) ---")
         print(bt.summary())
 
-    info = SleeveReport(sleeve.name, sleeve.weight, sleeve.selection)
+    info = SleeveReport(sleeve.name, sleeve.weight, sleeve.selection,
+                        feature_set=sleeve.feature_set, horizon_days=horizon,
+                        n_instruments=len(cols), n_core=len(core_cols),
+                        universe_status=dict(sleeve.universe_status),
+                        universe_missing=sleeve.universe_missing,
+                        contest_window_days=cfg.contest_window_days)
     if collect is not None:
         collect[sleeve.name] = info
+    pwf: PurgedWalkForwardResult | None = None
     if not args.skip_purged_backtest:
-        pwf = _report_out_of_sample(cfg, args, sleeve, prices, groups, dvol, sectors)
+        pwf = _report_out_of_sample(cfg, args, sleeve, prices, groups, dvol, cap_groups,
+                                    cap_n)
         if pwf is not None:
             info.backtest = pwf
             try:
@@ -407,6 +471,8 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
                 info.alpha_annual, info.alpha_t = a.alpha_annualized, a.alpha_tstat
             except ValueError:
                 pass
+            info.window = _report_contest_window(cfg, pwf, sleeve, prices, groups, dvol,
+                                                 cap_groups, cap_n)
         if args.compare_baseline and sleeve.name == EQUITY_SLEEVE:
             _compare_with_baseline(cfg, sleeve, prices, listings, groups, dvol)
         if args.compare_sector_cap and sleeve.name == EQUITY_SLEEVE:
@@ -415,49 +481,234 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
             else:
                 compare_sector_cap(cfg, sleeve, prices, groups, dvol, sectors,
                                    args.compare_sector_cap)
-    if args.validate and sleeve.selection == "model":
-        vr = _run_validation(cfg, args, sleeve, prices, listings, groups, dvol)
+        if args.compare_horizon:
+            name, _, days = str(args.compare_horizon).partition(":")
+            if name == sleeve.name:
+                compare_horizons(cfg, sleeve, prices, groups, dvol, cap_groups, cap_n,
+                                 [int(d) for d in days.split(",") if d.strip()])
+    if args.validate and sleeve.selection in ("model", "auto"):
+        vr = _run_validation(cfg, args, sleeve, prices, listings, groups, dvol,
+                             cap_groups, cap_n)
         info.validation = [(c.name, c.status, c.detail) for c in vr.checks]
 
-    hold_all = sleeve.selection == "all"
+    # v4.19 "auto": trade the model's picks only while the out-of-sample
+    # evidence holds up; otherwise hold the core basket, equal weight.
+    use_model, reason = decide_selection(sleeve, pwf, info.window)
+    info.selection_used = ("model" if use_model else
+                           "core" if sleeve.selection == "auto" else "all")
+    info.decision = reason
+    if sleeve.selection == "auto":
+        print(f"\nSelection rule (auto): {reason}")
+    hold_all = not use_model
+    alloc_prices, alloc_cols = prices, cols
+    if hold_all and sleeve.selection == "auto":
+        if not core_cols:
+            raise DataError(f"sleeve '{sleeve.name}': auto fallback needs core "
+                            f"instruments with data; none usable today")
+        alloc_prices, alloc_cols = prices[core_cols], core_cols
     weighting = cast(WeightingScheme, sleeve.weighting or args.weighting)
-    stale_here = sorted(market.stale_last & set(cols))
+    stale_here = sorted(market.stale_last & set(alloc_cols))
     if hold_all and stale_here:
         print(f"NOTE: no fresh close yet for {stale_here}; sizing them on the "
               f"previous close. Check their prices on UMushroom when entering.")
     if hold_all:
-        print(f"\nSelection: holding ALL {len(cols)} instruments ({weighting} weight); "
-              f"the model above is reported but does not pick.")
+        print(f"\nSelection: holding ALL {len(alloc_cols)} "
+              f"{'core ' if sleeve.selection == 'auto' else ''}instruments "
+              f"({weighting} weight); the model above is reported but does not pick.")
     alloc = generate_allocation(
-        prices, model, top_n=sleeve.top_n, hold_all=hold_all,
+        alloc_prices, model, top_n=sleeve.top_n, hold_all=hold_all,
         balance=cfg.starting_balance * sleeve.weight,
         weighting=weighting, groups=groups,
-        local_prices=market.local_prices[cols],
-        currencies={t: lst.currency for t, lst in listings.items()},
+        local_prices=market.local_prices[alloc_cols],
+        currencies={t: listings[t].currency for t in alloc_cols},
         fractional=sleeve.fractional,
         # crypto can legitimately trade at fractions of a cent; stocks and
         # ETFs below 0.10 in their own currency are treated as data errors
         min_local_price=0.0 if sleeve.fractional else MIN_LOCAL_PRICE,
         dollar_volume=dvol,
         # model-picked sleeves never trade on an old price (it would also be
-        sectors=sectors, max_per_sector=sleeve.max_per_sector,
+        sectors=cap_groups, max_per_sector=cap_n,
         # an old SIGNAL); hold-all sleeves just warn -- a day-old price only
         # shifts the share count slightly, it doesn't change what is held
         exclude=(frozenset() if hold_all
-                 else frozenset(market.stale_last & set(cols))),
+                 else frozenset(market.stale_last & set(alloc_cols))),
+        feature_set=sleeve.feature_set,
     )
     log_predictions(log_path=log_path, run_date=prices.index[-1],
                     all_scores=alloc.all_scores, prices=prices.iloc[-1],
                     picked_tickers=set(alloc.orders.index))
+    info.scores = alloc.all_scores
+    if alloc_cols is not cols:
+        # held the core basket: still rank the whole universe for the report
+        try:
+            feats_all = features_mod.build_features_at_index(
+                prices, len(prices) - 1, groups=groups, dollar_volume=dvol,
+                feature_set=sleeve.feature_set).dropna()
+            if not feats_all.empty:
+                info.scores = model.predict(feats_all)
+        except (InsufficientHistoryError, ValueError) as e:
+            get_logger("cli").warning(
+                f"Could not rank the full {sleeve.name} universe today: {e}")
     return alloc
+
+
+def decide_selection(sleeve: SleeveConfig, pwf: PurgedWalkForwardResult | None,
+                     window: WindowResult | None) -> tuple[bool, str]:
+    """The pre-declared rule behind `selection: auto`.
+
+    Use the model's picks only if BOTH hold out of sample:
+      1. ranking skill: walk-forward IC t-stat >= SKILL_T_THRESHOLD, and
+      2. contest-window verdict is not FAIL (window.py).
+    Otherwise hold the core basket. "model"/"all" bypass the rule.
+    Returns (use_model, reason)."""
+    if sleeve.selection == "model":
+        return True, "selection: model (configured; no rule applied)"
+    if sleeve.selection == "all":
+        return False, "selection: all (configured; no rule applied)"
+    if pwf is None:
+        return False, ("no purged walk-forward result this run, so the model's "
+                       "picks are not trusted: holding the core basket")
+    if not pwf.has_evidence_of_skill:
+        return False, (f"walk-forward IC t = {pwf.ic_tstat:+.2f} (needs >= 2): no "
+                       f"reliable ranking skill, holding the core basket")
+    if window is None:
+        return False, "no contest-window evaluation possible: holding the core basket"
+    if window.verdict == FAIL:
+        return False, (f"IC t = {pwf.ic_tstat:+.2f} but the picks did not beat the "
+                       f"benchmark inside contest-length windows (win rate "
+                       f"{window.win_rate:.0%}, t = {window.active_tstat:+.2f}): "
+                       f"holding the core basket")
+    return True, (f"IC t = {pwf.ic_tstat:+.2f} and contest-window verdict "
+                  f"{window.verdict} (win rate {window.win_rate:.0%}, "
+                  f"t = {window.active_tstat:+.2f}): trading the model's top "
+                  f"{sleeve.top_n}")
+
+
+def _window_test_days(cfg: StrategyConfig) -> int:
+    """Test-fold length for the contest-window evaluation: a window needs
+    `window_periods` CONSECUTIVE rebalance periods inside one test fold
+    (folds are separated by purge + embargo gaps), so the fold must be at
+    least one contest window long."""
+    periods = window_periods_for(cfg.contest_window_days, cfg.rebalance_days)
+    return max(cfg.purged_test_window_days, periods * cfg.rebalance_days)
+
+
+def _report_contest_window(cfg: StrategyConfig, pwf: PurgedWalkForwardResult,
+                           sleeve: SleeveConfig, prices: pd.DataFrame,
+                           groups: dict[str, str] | None, dvol: pd.DataFrame | None,
+                           cap_groups: dict[str, str] | None, cap_n: int | None,
+                           ) -> WindowResult | None:
+    periods = window_periods_for(cfg.contest_window_days, cfg.rebalance_days)
+    test_days = _window_test_days(cfg)
+    source = pwf
+    note = ""
+    if test_days > cfg.purged_test_window_days:
+        # re-run the walk-forward with folds exactly one contest window long
+        horizon = sleeve_horizon(cfg, sleeve)
+        try:
+            source = run_purged_walk_forward(
+                prices, test_window_days=test_days,
+                purge_days=max(cfg.purged_purge_days, horizon),
+                embargo_days=cfg.purged_embargo_days, rebalance_days=cfg.rebalance_days,
+                forward_return_days=horizon, top_n=sleeve.top_n,
+                min_train_days=cfg.purged_min_train_days, model_alpha=cfg.model_alpha,
+                random_seed=cfg.random_seed, target=cfg.target, groups=groups,
+                dollar_volume=dvol, sectors=cap_groups, max_per_sector=cap_n,
+                feature_set=sleeve.feature_set)
+        except InsufficientHistoryError as e:
+            print(f"\nContest-window evaluation skipped: {e}")
+            return None
+        note = (f" (separate walk-forward with {test_days}-day test folds, one contest "
+                f"window each; {len(source.folds)} folds, IC t = {source.ic_tstat:+.2f})")
+    try:
+        w = contest_windows(source.period_returns, source.benchmark_period_returns,
+                            source.period_end_dates, periods, cfg.rebalance_days)
+    except ValueError as e:
+        print(f"\nContest-window evaluation skipped: {e}")
+        return None
+    print(f"\n--- Contest-Window Evaluation ({cfg.contest_window_days} trading days, "
+          f"out of sample){note} ---")
+    print(w.summary())
+    return w
+
+
+def compare_horizons(cfg: StrategyConfig, sleeve: SleeveConfig, prices: pd.DataFrame,
+                     groups: dict[str, str] | None, dvol: pd.DataFrame | None,
+                     cap_groups: dict[str, str] | None, cap_n: int | None,
+                     horizons: list[int]) -> int | None:
+    """v4.19: ONE pre-declared head-to-head of forecast horizons on identical
+    data. Rule (fixed before looking): keep the horizon with the highest
+    contest-window active-return t-statistic among those whose walk-forward
+    IC t is at least 2; ties go to the SHORTER horizon. Horizons longer than
+    the contest window are refused -- their payoff could not arrive in time."""
+    too_long = [h for h in horizons if h > cfg.contest_window_days or h < 1]
+    if too_long:
+        print(f"\nHorizon comparison refused: {too_long} do not fit inside the "
+              f"{cfg.contest_window_days}-day contest window.")
+        return None
+    print(f"\n=== Forecast horizon: head-to-head on identical data "
+          f"(sleeve {sleeve.name}) ===")
+    print("Rule (decided BEFORE the results): among horizons with IC t >= 2, keep the "
+          "one with the highest contest-window active t; ties -> shorter horizon.")
+    periods = window_periods_for(cfg.contest_window_days, cfg.rebalance_days)
+    test_days = _window_test_days(cfg)
+    print(f"(test folds of {test_days} days so each holds one contest window)")
+    rows: dict[int, dict[str, float]] = {}
+    for h in sorted(set(horizons)):
+        try:
+            r = run_purged_walk_forward(
+                prices, test_window_days=test_days,
+                purge_days=max(cfg.purged_purge_days, h),
+                embargo_days=cfg.purged_embargo_days, rebalance_days=cfg.rebalance_days,
+                forward_return_days=h, top_n=sleeve.top_n,
+                min_train_days=cfg.purged_min_train_days, model_alpha=cfg.model_alpha,
+                random_seed=cfg.random_seed, target=cfg.target, groups=groups,
+                dollar_volume=dvol, sectors=cap_groups, max_per_sector=cap_n,
+                feature_set=sleeve.feature_set)
+            w = contest_windows(r.period_returns, r.benchmark_period_returns,
+                                r.period_end_dates, periods, cfg.rebalance_days)
+        except (InsufficientHistoryError, ValueError) as e:
+            print(f"  horizon {h}: skipped ({e})")
+            continue
+        rows[h] = {"ic": r.mean_information_coefficient, "ic_t": r.ic_tstat,
+                   "active": float(r.active_returns.mean()), "active_t": r.active_tstat,
+                   "win": w.win_rate, "w_active": w.mean_active, "w_t": w.active_tstat,
+                   "sharpe": r.overall_sharpe}
+    if not rows:
+        print("No horizon produced a result.")
+        return None
+    print(f"{'horizon':<10}{'IC':>8}{'IC t':>7}{'active/wk':>11}{'act t':>7}"
+          f"{'win(6w)':>9}{'active/6w':>11}{'6w t':>7}{'Sharpe':>8}")
+    for h, m in rows.items():
+        print(f"{h:<10}{m['ic']:>+8.4f}{m['ic_t']:>+7.2f}{m['active']:>+11.3%}"
+              f"{m['active_t']:>+7.2f}{m['win']:>9.0%}{m['w_active']:>+11.2%}"
+              f"{m['w_t']:>+7.2f}{m['sharpe']:>8.2f}")
+    eligible = {h: m for h, m in rows.items()
+                if np.isfinite(m["ic_t"]) and m["ic_t"] >= 2.0 and np.isfinite(m["w_t"])}
+    if not eligible:
+        print("\nVERDICT: no horizon shows reliable ranking skill (IC t < 2 for all); "
+              "keep the current setting and do not trade on these results.")
+        return None
+    best = min(eligible.items(), key=lambda kv: (-kv[1]["w_t"], kv[0]))[0]
+    current = sleeve_horizon(cfg, sleeve)
+    print(f"\nVERDICT: horizon {best} days wins (contest-window active t = "
+          f"{eligible[best]['w_t']:+.2f})" + (" -- already the configured horizon."
+          if best == current else f". To adopt it, set forward_return_days: {best} "
+          f"under sleeves.{sleeve.name} in config.yaml."))
+    return best
 
 
 def _sleeve_groups(cfg: StrategyConfig, sleeve: SleeveConfig,
                    listings: dict) -> dict[str, str] | None:
     """Ranking groups: sector-within-exchange -> sector -> pooled (v4.4),
-    or exchange only (v4), or one global group."""
+    or exchange only (v4), or one global group. v4.19: `group_by:
+    asset_class` ranks ETFs within their asset class (bond vs. bond)."""
     tickers = list(listings)
     exchange = {t: lst.exchange for t, lst in listings.items()}
+    if sleeve.group_by == "asset_class":
+        return {t: sleeve.groups.get(t, "other") for t in tickers}
+    if sleeve.group_by == "exchange":
+        return exchange
     if sleeve.neutralize_by_sector and cfg.sector_file is not None:
         sector = load_sectors(cfg.sector_file)
         levels = []
@@ -474,10 +725,14 @@ def _sleeve_groups(cfg: StrategyConfig, sleeve: SleeveConfig,
 def _run_validation(cfg: StrategyConfig, args: argparse.Namespace,
                     sleeve: SleeveConfig, prices: pd.DataFrame, listings: dict,
                     groups: dict[str, str] | None,
-                    dvol: pd.DataFrame | None) -> ValidationReport:
+                    dvol: pd.DataFrame | None,
+                    cap_groups: dict[str, str] | None = None,
+                    cap_n: int | None = None) -> ValidationReport:
+    if cap_groups is None and sleeve.max_per_sector and cfg.sector_file is not None:
+        cap_groups, cap_n = load_sectors(cfg.sector_file), sleeve.max_per_sector
     kwargs: dict[str, Any] = {
         "test_window_days": cfg.purged_test_window_days,
-        "purge_days": cfg.purged_purge_days,
+        "purge_days": max(cfg.purged_purge_days, sleeve_horizon(cfg, sleeve)),
         "embargo_days": cfg.purged_embargo_days,
         "rebalance_days": cfg.rebalance_days,
         "forward_return_days": sleeve_horizon(cfg, sleeve),
@@ -486,9 +741,9 @@ def _run_validation(cfg: StrategyConfig, args: argparse.Namespace,
         "model_alpha": cfg.model_alpha, "random_seed": cfg.random_seed,
         "target": cfg.target, "groups": groups, "dollar_volume": dvol,
         # the live selection rule is what gets validated
-        "sectors": (load_sectors(cfg.sector_file)
-                    if sleeve.max_per_sector and cfg.sector_file is not None else None),
-        "max_per_sector": sleeve.max_per_sector,
+        "sectors": cap_groups if cap_n else None,
+        "max_per_sector": cap_n,
+        "feature_set": sleeve.feature_set,
     }
     exchanges = {t: lst.exchange for t, lst in listings.items()}
     multi_market = len(set(exchanges.values())) > 1
@@ -606,19 +861,24 @@ def _report_out_of_sample(cfg: StrategyConfig, args: argparse.Namespace,
                           sleeve: SleeveConfig, prices: pd.DataFrame,
                           groups: dict[str, str] | None,
                           dvol: pd.DataFrame | None = None,
-                          sectors: dict[str, str] | None = None
+                          sectors: dict[str, str] | None = None,
+                          cap_n: int | None = None,
                           ) -> PurgedWalkForwardResult | None:
+    if cap_n is None:
+        cap_n = sleeve.max_per_sector
+    horizon = sleeve_horizon(cfg, sleeve)
     try:
         pwf = run_purged_walk_forward(
             prices, test_window_days=cfg.purged_test_window_days,
-            purge_days=cfg.purged_purge_days, embargo_days=cfg.purged_embargo_days,
+            purge_days=max(cfg.purged_purge_days, horizon),
+            embargo_days=cfg.purged_embargo_days,
             rebalance_days=cfg.rebalance_days,
-            forward_return_days=sleeve_horizon(cfg, sleeve), top_n=sleeve.top_n,
+            forward_return_days=horizon, top_n=sleeve.top_n,
             min_train_days=cfg.purged_min_train_days, model_alpha=cfg.model_alpha,
             random_seed=cfg.random_seed, target=cfg.target, groups=groups,
             dollar_volume=dvol,
             record_cross_sections=bool(getattr(args, "report", None)),
-            sectors=sectors, max_per_sector=sleeve.max_per_sector)
+            sectors=sectors, max_per_sector=cap_n, feature_set=sleeve.feature_set)
     except InsufficientHistoryError as e:
         print(f"\n--- Purged & Embargoed Walk-Forward Backtest ---\nSkipped: {e}")
         return None

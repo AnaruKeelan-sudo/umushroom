@@ -79,13 +79,44 @@ and verdict, configured under `sleeves:` in `config.yaml`:
 
 | Sleeve | Weight | Picks | Universe |
 |---|---|---|---|
-| equity | 70% | top 25 | 608 UMushroom-listed London, Swiss and US stocks; ranked within sector, 21-day horizon, price + volume factors |
-| etf | 20% | all 13, equal weight | 13 ETFs: world, S&P 500, Nasdaq, EM, Euro Stoxx, FTSE 100, gilts, Treasuries, gold, silver, oil, clean energy |
-| crypto | 10% | top 4 | 18 large coins (fractional units) |
+| equity | 80% | top 10, max 3 per sector | 587 UMushroom-listed London, Swiss and US stocks; ranked within exchange, 5-day horizon, 9 price factors |
+| etf | 20% | `auto`: top 8 (max 3 per asset class) when the evidence holds, else the 13 core ETFs equal weight | every ETF UMushroom lists that Yahoo can price (2,047 on 2026-10-12; leveraged/inverse and crypto ETPs excluded), ranked within asset class on 13 trend factors, 10-day horizon |
+| crypto | off | -- | 18 large coins (kept in config, commented out) |
 
 Assets are only ever ranked against their own sleeve, so crypto's much
 higher volatility never distorts stock rankings. A sleeve whose VERDICT
 shows no skill can be cut by lowering its weight.
+
+### The ETF sleeve (v4.19)
+
+The ETF sleeve is the stock model's twin for ETFs:
+
+- **Universe.** `umushroom_etf_catalogue.json` is UMushroom's own ETF
+  catalogue (2,261 ETFs: its public ETF sitemap plus three core ETFs the
+  sitemap omits), scraped once by `python -m umushroom.catalogue`.
+  `umushroom_etf_universe.csv` maps every ISIN to a Yahoo Finance line and
+  records WHY each one is or isn't tradeable (`status`, `via`, name match,
+  history length). Rebuild it with `python -m umushroom.etf_universe
+  --config config.yaml`, or from GitHub: Actions -> ETF universe.
+- **Model.** `feature_set: etf` -- 1/3/6/12-month time-series momentum,
+  200-day trend, 50/200 cross, 52-week high, 3-month drawdown, 1-week
+  reversal, volatility, volatility regime, beta, RSI -- ranked within
+  UMushroom's asset classes (`group_by: asset_class`) so bond ETFs compete
+  with bond ETFs. Leveraged/inverse ETPs and crypto ETPs are excluded.
+- **Contest window.** `contest_window_days: 30` (Stage 1 = 12 Oct - 22 Nov).
+  No sleeve may target a longer horizon, and every sleeve is also judged on
+  rolling 30-day windows out of sample (`window.py`): did the picks beat
+  holding everything over stretches as long as the contest?
+- **`selection: auto`.** The model's picks are traded only while BOTH the
+  walk-forward IC is significant (t >= 2) AND the contest-window verdict
+  is not FAIL; otherwise the sleeve holds the 13 core ETFs equal weight.
+  The website's **ETFs** tab shows which applied, and why, on every run.
+- **Horizon.** `--compare-horizon etf:5,10,21` is the one pre-declared
+  head-to-head (highest contest-window active t among horizons with IC
+  t >= 2; ties to the shorter). On 2026-10-12 it chose 10 days.
+
+Offline, reproducible runs: `UMUSHROOM_PRICE_SNAPSHOT=prices.json.gz`
+replays a saved price snapshot instead of calling Yahoo (`data.py`).
 
 ### HTML report
 
@@ -151,6 +182,9 @@ umushroom/
   exceptions.py   # Typed exception hierarchy
   logging_config.py
   universe.py     # Exchange/currency per ticker, FX symbols, concentration check
+  catalogue.py    # v4.19: scrape UMushroom's public ETF catalogue (sitemap + API)
+  etf_universe.py # v4.19: ISIN -> Yahoo line mapping, audited universe CSV
+  window.py       # v4.19: contest-window (30-day) evaluation + verdict
   data.py         # Fetch w/ retry+backoff, validate, FX-convert, parquet cache
   features.py     # Pure functions: prices -> cross-sectionally ranked factors
   model.py        # RankingModel: fit/predict/save/load, purged date-CV with IC

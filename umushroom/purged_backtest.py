@@ -244,6 +244,7 @@ def run_purged_walk_forward(
     record_cross_sections: bool = False,
     sectors: dict[str, str] | None = None,
     max_per_sector: int | None = None,
+    feature_set: str = "equity",
 ) -> PurgedWalkForwardResult:
     """Walk-forward evaluation.
 
@@ -284,7 +285,8 @@ def run_purged_walk_forward(
     # recomputing it inside every fold -- just ~50x faster. Labels are
     # NOT causal; which labels each fold may use is controlled strictly
     # by last_label_idx below.
-    panel = build_feature_panel(data, groups, dollar_volume=dollar_volume)
+    panel = build_feature_panel(data, groups, dollar_volume=dollar_volume,
+                                feature_set=feature_set)
     if shuffle_seed is not None:
         panel = _shuffle_within_dates(panel, shuffle_seed)
     # return earned from entry (signal day + delay) until the next rebalance
@@ -323,6 +325,7 @@ def run_purged_walk_forward(
                 panel=panel,
                 last_label_idx=last_label_idx,
                 dollar_volume=dollar_volume,
+                feature_set=feature_set,
             )
         except InsufficientHistoryError:
             logger.debug(f"Skipping fold ending at train_end={train_end}: "

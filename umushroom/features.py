@@ -66,6 +66,34 @@ FEATURE_NAMES: list[str] = [
     "reversal_21d", "reversal_5d", "vol_60d", "beta_252", "rsi_14",
 ]
 
+# v4.19 ETF feature set ("feature_set: etf"). ETFs are baskets, so the
+# single-stock anomalies above (idiosyncratic momentum, 52-week high of one
+# company) carry little signal; what IS documented across whole asset
+# classes is TREND:
+#   tsmom_21/63/126      time-series momentum over 1, 3 and 6 months
+#                        (Moskowitz, Ooi & Pedersen 2012)
+#   mom_12_1             12-1 month momentum, which works "everywhere"
+#                        (Asness, Moskowitz & Pedersen 2013)
+#   trend_200            price vs. its 200-day average (Faber 2007 tactical
+#                        asset allocation); trend_50_200 = the 50/200 cross
+#   high_52w_ratio       distance from the 52-week high
+#   drawdown_63          distance from the 3-month high (crash risk)
+#   reversal_5d          last week's return, negated (short-term reversal)
+#   vol_60d              60-day realised volatility (low-vol)
+#   vol_ratio_20_120     volatility regime: 1-month vs. 6-month volatility
+#   beta_252             1-year beta to the equal-weight ETF universe
+#   rsi_14               short-horizon overbought/oversold
+# Every one is a trailing window of at most 252 returns, so MIN_BARS_REQUIRED
+# is unchanged and the no-lookahead test covers both sets.
+ETF_FEATURE_NAMES: list[str] = [
+    "tsmom_21", "tsmom_63", "tsmom_126", "mom_12_1", "trend_200",
+    "trend_50_200", "high_52w_ratio", "drawdown_63", "reversal_5d",
+    "vol_60d", "vol_ratio_20_120", "beta_252", "rsi_14",
+]
+
+FEATURE_SETS: dict[str, list[str]] = {"equity": FEATURE_NAMES, "etf": ETF_FEATURE_NAMES}
+DEFAULT_FEATURE_SET = "equity"
+
 # v4.4 volume-based factors (equity sleeve, when volume data is available):
 #   abn_volume_21_252  log(avg traded value last month / last year):
 #                      "high-volume return premium" (Gervais, Kaniel &
@@ -75,8 +103,18 @@ FEATURE_NAMES: list[str] = [
 VOLUME_FEATURE_NAMES: list[str] = ["abn_volume_21_252", "amihud_illiq_63"]
 
 
-def feature_names(with_volume: bool) -> list[str]:
-    return FEATURE_NAMES + (VOLUME_FEATURE_NAMES if with_volume else [])
+def price_feature_names(feature_set: str = DEFAULT_FEATURE_SET) -> list[str]:
+    """The price-based factor names of one feature set (no volume factors)."""
+    if feature_set not in FEATURE_SETS:
+        raise ValueError(f"feature_set must be one of {sorted(FEATURE_SETS)}, "
+                         f"got {feature_set!r}")
+    return list(FEATURE_SETS[feature_set])
+
+
+def feature_names(with_volume: bool, feature_set: str = DEFAULT_FEATURE_SET
+                  ) -> list[str]:
+    return price_feature_names(feature_set) + (
+        VOLUME_FEATURE_NAMES if with_volume else [])
 
 
 TargetType = Literal["rank", "excess", "raw"]
@@ -170,13 +208,19 @@ def grouped_demean(df: pd.DataFrame, groups: dict[str, str]) -> pd.DataFrame:
 
 # ------------------------------------------------------------- raw factors
 
-def compute_raw_factors(data: pd.DataFrame,
-                        dollar_volume: pd.DataFrame | None = None
-                        ) -> dict[str, pd.DataFrame]:
-    """All factors as (date x ticker) frames. Purely trailing windows.
-    Tickers may have leading NaN (not yet listed): every rolling window
-    requires a full window of real data, so a ticker's factors switch on
-    only once it has enough history."""
+def _rolling_beta(rets: pd.DataFrame, mkt: pd.Series
+                  ) -> tuple[pd.DataFrame, pd.Series]:
+    """Rolling 1-year beta of every column to `mkt`, plus the market's
+    rolling variance (reused by residual momentum)."""
+    mean_r = rets.rolling(YEAR).mean()
+    mean_m = mkt.rolling(YEAR).mean()
+    mean_rm = rets.mul(mkt, axis=0).rolling(YEAR).mean()
+    var_m = mkt.rolling(YEAR).var(ddof=0)
+    cov_rm = mean_rm.sub(mean_r.mul(mean_m, axis=0))
+    return cov_rm.div(var_m.where(var_m > 0), axis=0), var_m
+
+
+def _equity_raw_factors(data: pd.DataFrame) -> dict[str, pd.DataFrame]:
     rets = data.pct_change(fill_method=None)
     mkt = rets.mean(axis=1)                       # equal-weight universe return
 
@@ -188,12 +232,7 @@ def compute_raw_factors(data: pd.DataFrame,
     vol_60 = rets.rolling(60).std()
 
     # Rolling 1-year beta to the equal-weight universe.
-    mean_r = rets.rolling(YEAR).mean()
-    mean_m = mkt.rolling(YEAR).mean()
-    mean_rm = rets.mul(mkt, axis=0).rolling(YEAR).mean()
-    var_m = mkt.rolling(YEAR).var(ddof=0)
-    cov_rm = mean_rm.sub(mean_r.mul(mean_m, axis=0))
-    beta = cov_rm.div(var_m.where(var_m > 0), axis=0)
+    beta, var_m = _rolling_beta(rets, mkt)
 
     # Residual (idiosyncratic) 12-1 momentum, volatility-scaled:
     #   sum of (r - beta*m) over [t-251, t-21] / (resid_sd * sqrt(231))
@@ -205,7 +244,7 @@ def compute_raw_factors(data: pd.DataFrame,
     resid_var = (var_r - beta.pow(2).mul(var_m, axis=0)).clip(lower=1e-12)
     resid_mom = resid_sum / np.sqrt(resid_var * window)
 
-    factors = {
+    return {
         "mom_12_1": mom_12_1,
         "mom_6_1": mom_6_1,
         "resid_mom_12_1": resid_mom,
@@ -216,8 +255,51 @@ def compute_raw_factors(data: pd.DataFrame,
         "beta_252": beta,
         "rsi_14": compute_rsi(data),
     }
-    assert list(factors) == FEATURE_NAMES, "factor order drifted from FEATURE_NAMES"
+
+
+def _etf_raw_factors(data: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Trend / asset-class momentum factors (see ETF_FEATURE_NAMES)."""
+    rets = data.pct_change(fill_method=None)
+    mkt = rets.mean(axis=1)
+    beta, _ = _rolling_beta(rets, mkt)
+    sma_50 = data.rolling(50).mean()
+    sma_200 = data.rolling(200).mean()
+    vol_20 = rets.rolling(20).std()
+    vol_120 = rets.rolling(120).std()
+    return {
+        "tsmom_21": data / data.shift(SKIP_MONTH) - 1,
+        "tsmom_63": data / data.shift(63) - 1,
+        "tsmom_126": data / data.shift(126) - 1,
+        "mom_12_1": data.shift(SKIP_MONTH) / data.shift(YEAR) - 1,
+        "trend_200": data / sma_200 - 1,
+        "trend_50_200": sma_50 / sma_200 - 1,
+        "high_52w_ratio": data / data.rolling(YEAR).max(),
+        "drawdown_63": data / data.rolling(63).max() - 1,
+        "reversal_5d": -(data / data.shift(5) - 1),
+        "vol_60d": rets.rolling(60).std(),
+        "vol_ratio_20_120": vol_20 / vol_120.where(vol_120 > 0),
+        "beta_252": beta,
+        "rsi_14": compute_rsi(data),
+    }
+
+
+_RAW_FACTOR_FNS = {"equity": _equity_raw_factors, "etf": _etf_raw_factors}
+
+
+def compute_raw_factors(data: pd.DataFrame,
+                        dollar_volume: pd.DataFrame | None = None,
+                        feature_set: str = DEFAULT_FEATURE_SET,
+                        ) -> dict[str, pd.DataFrame]:
+    """All factors as (date x ticker) frames. Purely trailing windows.
+    Tickers may have leading NaN (not yet listed): every rolling window
+    requires a full window of real data, so a ticker's factors switch on
+    only once it has enough history."""
+    names = price_feature_names(feature_set)
+    factors = _RAW_FACTOR_FNS[feature_set](data)
+    assert list(factors) == names, (
+        f"factor order drifted from the {feature_set!r} feature-name list")
     if dollar_volume is not None:
+        rets = data.pct_change(fill_method=None)
         dv = dollar_volume.reindex(index=data.index, columns=data.columns)
         avg_21 = dv.rolling(21, min_periods=15).mean()
         avg_252 = dv.rolling(YEAR, min_periods=200).mean()
@@ -244,16 +326,17 @@ def build_feature_panel(
     groups: dict[str, str] | None = None,
     normalize: bool = True,
     dollar_volume: pd.DataFrame | None = None,
+    feature_set: str = DEFAULT_FEATURE_SET,
 ) -> pd.DataFrame:
     """Normalised features for every date that has full history,
-    as a long frame indexed (date, ticker) with FEATURE_NAMES columns.
-    Rows with any undefined factor are dropped."""
+    as a long frame indexed (date, ticker) with the feature set's
+    columns. Rows with any undefined factor are dropped."""
     if len(data) < MIN_BARS_REQUIRED:
         raise InsufficientHistoryError(
             f"Need at least {MIN_BARS_REQUIRED} bars to compute features, "
             f"have {len(data)}."
         )
-    raw = compute_raw_factors(data, dollar_volume)
+    raw = compute_raw_factors(data, dollar_volume, feature_set)
     if normalize:
         g = effective_groups(list(data.columns), groups)
         raw = {k: grouped_centered_rank(v, g) for k, v in raw.items()}
@@ -279,6 +362,7 @@ def build_features_at_index(
     groups: dict[str, str] | None = None,
     normalize: bool = True,
     dollar_volume: pd.DataFrame | None = None,
+    feature_set: str = DEFAULT_FEATURE_SET,
 ) -> pd.DataFrame:
     """One feature row per ticker, using ONLY data[: as_of_idx + 1].
 
@@ -297,7 +381,7 @@ def build_features_at_index(
     window = data.iloc[as_of_idx + 1 - MIN_BARS_REQUIRED: as_of_idx + 1]
     dv_window = (None if dollar_volume is None
                  else dollar_volume.reindex(index=window.index, columns=window.columns))
-    raw = compute_raw_factors(window, dv_window)
+    raw = compute_raw_factors(window, dv_window, feature_set)
     names = list(raw)
     last = pd.DataFrame({k: v.iloc[-1] for k, v in raw.items()})
     if normalize:
@@ -308,7 +392,7 @@ def build_features_at_index(
     out = last[names]
     if normalize:
         # mirror build_feature_panel exactly (live features == trained features)
-        has_price_factors = out[FEATURE_NAMES].notna().all(axis=1)
+        has_price_factors = out[price_feature_names(feature_set)].notna().all(axis=1)
         out = _neutral_fill_volume(out)
         out.loc[~has_price_factors] = np.nan
     return out
@@ -345,6 +429,7 @@ def build_training_set(
     panel: pd.DataFrame | None = None,
     last_label_idx: int | None = None,
     dollar_volume: pd.DataFrame | None = None,
+    feature_set: str = DEFAULT_FEATURE_SET,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """(features, target) pairs at every `step`-th date.
 
@@ -370,7 +455,8 @@ def build_training_set(
         )
 
     if panel is None:
-        panel = build_feature_panel(data, groups, dollar_volume=dollar_volume)
+        panel = build_feature_panel(data, groups, dollar_volume=dollar_volume,
+                                    feature_set=feature_set)
     fwd = compute_forward_returns(data, forward_return_days)
     y_wide = make_target(fwd, target, groups)
 

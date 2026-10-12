@@ -16,11 +16,15 @@ from pathlib import Path
 import yaml
 
 from umushroom.exceptions import ConfigError
-from umushroom.features import TARGET_TYPES
+from umushroom.features import FEATURE_SETS, TARGET_TYPES
 from umushroom.universe import SUPPORTED_BASE_CURRENCIES, resolve_universe
 
 FRENCH_REGIONS = ("US", "Developed", "Europe")
 EQUITY_SLEEVE = "equity"
+SELECTION_MODES = ("model", "all", "auto")
+GROUP_BY_OPTIONS = ("exchange", "asset_class")
+# UMushroom UK Stage 1 runs 12 Oct - 22 Nov 2026: six weeks = 30 trading days.
+DEFAULT_CONTEST_WINDOW_DAYS = 30
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,33 @@ class SleeveConfig:
     max_per_sector: int | None = None
     # per-sleeve forecast horizon; None = the global forward_return_days
     forward_return_days: int | None = None
+    # ---- v4.19 (ETF sleeve) ----
+    # which factor set the model learns from: "equity" (9 stock factors) or
+    # "etf" (trend / asset-class momentum factors, see features.py)
+    feature_set: str = "equity"
+    # CSV built by `python -m umushroom.etf_universe` (every UMushroom ETF
+    # that Yahoo can price); its `status == ok` rows join `tickers`
+    universe_file: Path | None = None
+    # instruments that are ALWAYS in the sleeve and that "auto" selection
+    # falls back to (equal weight) when the model fails its tests
+    core_tickers: list[str] = field(default_factory=list)
+    # rank within these groups ("exchange" | "asset_class"); asset_class
+    # needs universe_file (bond ETFs are ranked against bond ETFs)
+    group_by: str | None = None
+    # at most this many picks per group (asset class), like max_per_sector
+    max_per_group: int | None = None
+    # ticker -> group, filled from universe_file at load time
+    groups: dict[str, str] = field(default_factory=dict)
+    # ticker -> display metadata (name, UMushroom symbol/currency, ...)
+    meta: dict[str, dict[str, str]] = field(default_factory=dict)
+    # status counts from universe_file, for the website
+    universe_status: dict[str, int] = field(default_factory=dict)
+    universe_missing: bool = False     # universe_file configured but absent
+    # drop leveraged / inverse products and whole asset classes (e.g. crypto)
+    # from the universe (core_tickers are never dropped)
+    exclude_leveraged: bool = False
+    exclude_groups: list[str] = field(default_factory=list)
+    n_excluded: int = 0                # how many universe rows the two rules removed
 
 
 @dataclass(frozen=True)
@@ -92,6 +123,10 @@ class StrategyConfig:
     # company whose London line was delisted on Yahoo but which UMushroom
     # still prices from its US listing). Orders keep the UMushroom ticker.
     yahoo_symbols: dict[str, str] = field(default_factory=dict)
+    # v4.19: the contest is this many trading days long. Every sleeve's
+    # forecast horizon must fit inside it -- a return the model is trained
+    # to capture over 60 days cannot show up in a 30-day contest.
+    contest_window_days: int = DEFAULT_CONTEST_WINDOW_DAYS
 
     def __post_init__(self) -> None:
         _validate(self)
@@ -184,6 +219,13 @@ def _validate(cfg: StrategyConfig) -> None:
         elif not Path(cfg.sector_file).exists():
             errors.append(f"sector_file not found: {cfg.sector_file}")
 
+    if cfg.contest_window_days < 1:
+        errors.append("contest_window_days must be >= 1")
+    if cfg.forward_return_days > cfg.contest_window_days:
+        errors.append(f"forward_return_days ({cfg.forward_return_days}) is longer than "
+                      f"the contest window ({cfg.contest_window_days} trading days): "
+                      f"the return the model targets could not arrive in time")
+
     names = [sl.name for sl in cfg.sleeves]
     if EQUITY_SLEEVE in names or len(names) != len(set(names)):
         errors.append(f"sleeve names must be unique and not '{EQUITY_SLEEVE}'")
@@ -192,17 +234,41 @@ def _validate(cfg: StrategyConfig) -> None:
             errors.append(f"sleeve '{sl.name}' has no tickers")
         if not 0 < sl.weight < 1:
             errors.append(f"sleeve '{sl.name}' weight must be in (0, 1)")
-        if sl.forward_return_days is not None and not (
-                1 <= sl.forward_return_days <= cfg.purged_purge_days):
-            errors.append(f"sleeve '{sl.name}' forward_return_days must be between "
-                          f"1 and purged_purge_days ({cfg.purged_purge_days})")
-        if sl.selection not in ("model", "all"):
-            errors.append(f"sleeve '{sl.name}' selection must be 'model' or 'all'")
+        # v4.19: a sleeve horizon longer than purged_purge_days is fine -- the
+        # walk-forward lifts the purge to the horizon automatically (cli.py)
+        if sl.forward_return_days is not None and sl.forward_return_days < 1:
+            errors.append(f"sleeve '{sl.name}' forward_return_days must be >= 1")
+        if sl.forward_return_days is not None and (
+                sl.forward_return_days > cfg.contest_window_days):
+            errors.append(f"sleeve '{sl.name}' forward_return_days "
+                          f"({sl.forward_return_days}) is longer than the contest window "
+                          f"({cfg.contest_window_days} trading days)")
+        if sl.selection not in SELECTION_MODES:
+            errors.append(f"sleeve '{sl.name}' selection must be one of {SELECTION_MODES}")
         if sl.weighting not in (None, "equal", "hrp"):
             errors.append(f"sleeve '{sl.name}' weighting must be 'equal' or 'hrp'")
         if not 1 <= sl.top_n <= len(sl.tickers):
             errors.append(f"sleeve '{sl.name}' top_n must be between 1 and its "
                           f"ticker count ({len(sl.tickers)})")
+        if sl.feature_set not in FEATURE_SETS:
+            errors.append(f"sleeve '{sl.name}' feature_set must be one of "
+                          f"{sorted(FEATURE_SETS)}")
+        if sl.group_by is not None and sl.group_by not in GROUP_BY_OPTIONS:
+            errors.append(f"sleeve '{sl.name}' group_by must be one of {GROUP_BY_OPTIONS}")
+        if sl.group_by == "asset_class" and sl.universe_file is None:
+            errors.append(f"sleeve '{sl.name}' group_by: asset_class needs a "
+                          f"universe_file (its asset classes come from there)")
+        if sl.max_per_group is not None and sl.max_per_group < 1:
+            errors.append(f"sleeve '{sl.name}' max_per_group must be >= 1")
+        if sl.selection == "auto" and not sl.core_tickers:
+            errors.append(f"sleeve '{sl.name}' selection: auto needs core_tickers to "
+                          f"fall back to")
+        missing_core = sorted(set(sl.core_tickers) - set(sl.tickers))
+        if missing_core:
+            errors.append(f"sleeve '{sl.name}' core_tickers not in its tickers: "
+                          f"{missing_core}")
+        if len(sl.tickers) != len(set(sl.tickers)):
+            errors.append(f"sleeve '{sl.name}' tickers contain duplicates")
     if cfg.sleeves and cfg.equity_weight <= 0:
         errors.append("sleeve weights must sum to less than 1 "
                       "(the remainder goes to the equity sleeve)")
@@ -253,7 +319,11 @@ def load_sectors(path: Path) -> dict[str, str]:
                 if r.get("yahoo") and r.get("sector")}
 
 
-def _parse_sleeves(raw: object) -> list[SleeveConfig]:
+def _parse_sleeves(raw: object, base_dir: Path,
+                   universe_overrides: dict[str, str] | None = None
+                   ) -> list[SleeveConfig]:
+    """`universe_overrides`, when given, collects the currency overrides
+    implied by every sleeve's universe file (filled in place)."""
     if not raw:
         return []
     if not isinstance(raw, dict):
@@ -262,11 +332,53 @@ def _parse_sleeves(raw: object) -> list[SleeveConfig]:
     for name, spec in raw.items():
         if not isinstance(spec, dict):
             raise TypeError(f"sleeve {name!r} must be a mapping")
+        core = [str(t) for t in (spec.get("core_tickers") or [])]
+        listed = [str(t) for t in (spec.get("tickers") or [])]
+        tickers: list[str] = []
+        for t in core + listed:
+            if t not in tickers:
+                tickers.append(t)
+        groups: dict[str, str] = {}
+        meta: dict[str, dict[str, str]] = {}
+        status: dict[str, int] = {}
+        missing = False
+        n_excluded = 0
+        exclude_leveraged = _to_bool(spec.get("exclude_leveraged", False))
+        exclude_groups = [str(g) for g in (spec.get("exclude_groups") or [])]
+        universe_file = (None if spec.get("universe_file") is None
+                         else base_dir / str(spec["universe_file"]))
+        if universe_file is not None:
+            if universe_file.exists():
+                from umushroom.etf_universe import load_universe
+                uni = load_universe(universe_file)
+                groups, meta, status = uni.groups, uni.meta, uni.status_counts
+                leveraged = uni.leveraged if exclude_leveraged else set()
+                for t in uni.tickers:
+                    if t in core or t in tickers:
+                        if t not in tickers:
+                            tickers.append(t)
+                        continue
+                    if t in leveraged or groups.get(t) in exclude_groups:
+                        n_excluded += 1
+                        continue
+                    tickers.append(t)
+                if universe_overrides is not None:
+                    kept = set(tickers)
+                    for t, ccy in uni.currency_overrides.items():
+                        if t in kept:
+                            universe_overrides.setdefault(t, ccy)
+            else:
+                missing = True
+        top_n = int(spec.get("top_n", len(tickers)))
+        if missing and tickers and top_n > len(tickers):
+            # degraded run on the core basket only: never fail the whole
+            # pipeline because the universe file has not been built yet
+            top_n = len(tickers)
         out.append(SleeveConfig(
             name=str(name),
-            tickers=list(spec.get("tickers") or []),
+            tickers=tickers,
             weight=float(spec["weight"]),
-            top_n=int(spec.get("top_n", len(spec.get("tickers") or []))),
+            top_n=top_n,
             fractional=_to_bool(spec.get("fractional", False)),
             neutralize_by_exchange=_to_bool(spec.get("neutralize_by_exchange", False)),
             selection=str(spec.get("selection", "model")),
@@ -274,6 +386,19 @@ def _parse_sleeves(raw: object) -> list[SleeveConfig]:
                                  else int(spec["forward_return_days"])),
             weighting=(None if spec.get("weighting") is None
                        else str(spec["weighting"])),
+            feature_set=str(spec.get("feature_set", "equity")),
+            universe_file=universe_file,
+            core_tickers=core,
+            group_by=(None if spec.get("group_by") is None else str(spec["group_by"])),
+            max_per_group=(None if spec.get("max_per_group") in (None, "", 0)
+                           else int(spec["max_per_group"])),
+            groups=groups,
+            meta=meta,
+            universe_status=status,
+            universe_missing=missing,
+            exclude_leveraged=exclude_leveraged,
+            exclude_groups=exclude_groups,
+            n_excluded=n_excluded,
         ))
     return out
 
@@ -316,6 +441,10 @@ def load_config(path: str | Path = "config.yaml") -> StrategyConfig:
             raw[key] = os.environ[env_key]
 
     try:
+        universe_overrides: dict[str, str] = {}
+        sleeves = _parse_sleeves(raw.get("sleeves"), path.parent, universe_overrides)
+        # explicit overrides in config.yaml win over the universe file's
+        overrides = {**universe_overrides, **dict(raw.get("currency_overrides") or {})}
         return StrategyConfig(
             tickers=list(raw["tickers"]),
             starting_balance=float(raw["starting_balance"]),
@@ -335,14 +464,14 @@ def load_config(path: str | Path = "config.yaml") -> StrategyConfig:
             purged_min_train_days=int(raw["purged_min_train_days"]),
             prediction_log_path=Path(raw["prediction_log_path"]),
             base_currency=str(raw.get("base_currency", "GBP")).upper(),
-            currency_overrides=dict(raw.get("currency_overrides") or {}),
+            currency_overrides=overrides,
             target=str(raw.get("target", "rank")),
             neutralize_by_exchange=_to_bool(raw.get("neutralize_by_exchange", True)),
             max_single_exchange_fraction=float(
                 raw.get("max_single_exchange_fraction", 0.6)),
             drop_incomplete_bar=_to_bool(raw.get("drop_incomplete_bar", True)),
             fama_french_region=str(raw.get("fama_french_region", "Developed")),
-            sleeves=_parse_sleeves(raw.get("sleeves")),
+            sleeves=sleeves,
             neutralize_by_sector=_to_bool(raw.get("neutralize_by_sector", False)),
             sector_file=(None if raw.get("sector_file") is None
                          else (path.parent / str(raw["sector_file"]))),
@@ -352,6 +481,8 @@ def load_config(path: str | Path = "config.yaml") -> StrategyConfig:
                             else int(raw["max_per_sector"])),
             yahoo_symbols={str(k): str(v) for k, v in
                            (raw.get("yahoo_symbols") or {}).items()},
+            contest_window_days=int(raw.get("contest_window_days",
+                                            DEFAULT_CONTEST_WINDOW_DAYS)),
         )
     except (TypeError, ValueError, KeyError) as e:
         raise ConfigError(f"Config file {path} has a field of the wrong type: {e}") from e

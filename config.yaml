@@ -651,14 +651,45 @@ yahoo_symbols:
 sleeves:
   etf:
     weight: 0.20
-    top_n: 4
-    # First real run (2026-10-08): ETF model showed NO skill (IC t=1.10) and
-    # significantly NEGATIVE alpha vs holding all 13 equally (t=-2.09), so
-    # this sleeve holds all 13, equal weight. Set selection: "model" to let
-    # the model pick again if a later run shows skill.
-    selection: "all"
+    # v4.19 (2026-10-12): the ETF sleeve is now a MODEL sleeve over the whole
+    # UMushroom ETF catalogue, not an equal-weight basket of 13.
+    #   universe_file  every ETF UMushroom lists that Yahoo can price (2,047 of
+    #                  2,261 on 2026-10-12), built by
+    #                    python -m umushroom.etf_universe --config config.yaml
+    #                  from umushroom_etf_catalogue.json (python -m umushroom.catalogue)
+    #   core_tickers   the 13 ETFs the team already trades: always in the
+    #                  universe, and what "auto" falls back to
+    #   feature_set    trend / asset-class momentum factors (features.py)
+    #   group_by       rank bond ETFs against bond ETFs, commodities against
+    #                  commodities (UMushroom's own asset classes)
+    #   selection      auto = trade the model's top 8 ONLY while the purged
+    #                  walk-forward IC is significant AND the picks beat the
+    #                  benchmark inside contest-length windows (window.py);
+    #                  otherwise hold the 13 core ETFs equal weight. The
+    #                  website's ETFs tab shows which applied on each run.
+    #   exclude_leveraged  2x/3x/inverse/short ETPs are not ranked (their
+    #                  daily-reset decay is nothing the trend factors describe)
+    #   exclude_groups crypto ETPs: the team's no-crypto rule (v4.18)
+    #   forward_return_days must fit inside contest_window_days (30).
+    universe_file: "umushroom_etf_universe.csv"
+    exclude_leveraged: true
+    exclude_groups: ["crypto"]
+    feature_set: "etf"
+    group_by: "asset_class"
+    max_per_group: 3
+    top_n: 8
+    # HEAD-TO-HEAD (2026-10-12, 10 years, rule fixed before looking: among
+    # horizons with IC t >= 2 keep the highest contest-window active t):
+    #   5d  IC t +3.33, 6-week win 57%, 6-week active t +0.67
+    #   10d IC t +4.06, 6-week win 49%, 6-week active t +0.73  <- winner
+    #   21d IC t +0.74 (no skill)
+    # Ranking skill is real at 5-10 days; whether it beats holding every ETF
+    # inside one contest window is not yet proven (t < 2), which is exactly
+    # what `selection: auto` guards against.
+    forward_return_days: 10
+    selection: "auto"
     weighting: "equal"
-    tickers:
+    core_tickers:
       - "IWDA.L"     # iShares Core MSCI World (USD)
       - "VUAA.L"     # Vanguard S&P 500 (USD)
       - "CSNDX.SW"   # iShares Nasdaq 100 (USD)
@@ -740,6 +771,11 @@ cache_dir: ".cache"
 cache_max_age_hours: 12         # re-fetch at most twice a trading day
 
 log_level: "INFO"
+
+# v4.19: Stage 1 is 30 trading days (12 Oct - 22 Nov 2026). Every sleeve's
+# forecast horizon must fit inside it, and every sleeve is judged on rolling
+# windows of this length (see window.py and the ETFs tab).
+contest_window_days: 30
 
 # --- Purged & embargoed walk-forward backtest settings ---
 purged_test_window_days: 21     # length of each held-out test fold (~1 month)

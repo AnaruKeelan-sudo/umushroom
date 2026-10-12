@@ -71,6 +71,7 @@ def run_backtest(
     min_history_days: int,
     groups: dict[str, str] | None = None,
     dollar_volume: pd.DataFrame | None = None,
+    feature_set: str = "equity",
 ) -> BacktestResult:
     n = len(data)
     start_idx = max(min_history_days, MIN_BARS_REQUIRED) - 1
@@ -82,7 +83,8 @@ def run_backtest(
             f"need > {start_idx + rebalance_days}."
         )
 
-    panel = build_feature_panel(data, groups, dollar_volume=dollar_volume)
+    panel = build_feature_panel(data, groups, dollar_volume=dollar_volume,
+                                feature_set=feature_set)
     panel_dates = set(panel.index.get_level_values("date"))
 
     strategy_returns: list[float] = []

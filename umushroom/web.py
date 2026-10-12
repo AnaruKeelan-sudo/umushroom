@@ -211,6 +211,7 @@ def _daily(runner: Runner, hh: int, mm: int) -> None:
 
 TABS: list[tuple[str, str, str]] = [   # (key, label, path)
     ("overview", "Overview", "/"), ("stocks", "Stocks", "/stocks"),
+    ("etfs", "ETFs", "/etfs"),
     ("sell", "When to sell", "/sell"), ("tracker", "Tracker", "/tracker"),
     ("graphs", "Graphs", "/graphs"),
     ("montecarlo", "Monte Carlo", "/montecarlo"), ("risk", "Risk (VaR)", "/risk"),

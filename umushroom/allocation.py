@@ -98,6 +98,7 @@ def generate_allocation(
     exclude: frozenset[str] = frozenset(),
     sectors: dict[str, str] | None = None,
     max_per_sector: int | None = None,
+    feature_set: str = "equity",
 ) -> Allocation:
     """Rank today's universe and size integer-share orders.
 
@@ -117,7 +118,8 @@ def generate_allocation(
 
     as_of_idx = len(data) - 1
     feats_today = build_features_at_index(
-        data, as_of_idx, groups=groups, dollar_volume=dollar_volume).dropna()
+        data, as_of_idx, groups=groups, dollar_volume=dollar_volume,
+        feature_set=feature_set).dropna()
     preds = model.predict(feats_today)
 
     stale = sorted(set(preds.index) & set(exclude))
