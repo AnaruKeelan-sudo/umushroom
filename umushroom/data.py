@@ -37,6 +37,16 @@ logger = get_logger("data")
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2.0
+# v4.20: Yahoo answers a 2,000-symbol bulk download by rate-limiting part of
+# it (HTTP 429): those symbols come back EMPTY, not as an error. They are
+# re-fetched in small batches with a pause between rounds; whatever is still
+# empty after that is counted, and the run refuses to proceed (or to cache
+# anything) if more than MAX_MISSING_FRACTION of the universe is missing.
+# Before this guard, the 2026-10-19 run silently traded 1,039 of ~1,700 ETFs
+# and 5 of 13 core ETFs because 780 rate-limited symbols were cached as NaN.
+RETRY_BATCH_SIZE = 50
+MAX_MISSING_FRACTION = 0.10
+_sleep = time.sleep          # module attribute so tests can stub the pauses
 MIN_TICKER_COVERAGE = 0.9   # a ticker must have prices on >=90% of days
                             # or it is dropped (see _validate_prices)
 LOCAL_TZ = ZoneInfo("Europe/London")
@@ -63,31 +73,114 @@ def _cache_is_fresh(path: Path, max_age_hours: float) -> bool:
     return age_hours < max_age_hours
 
 
-def _fetch_with_retries(tickers: list[str], period: str
-                        ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+def _yf_download(symbols: list[str], period: str
+                 ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """ONE yfinance call: (closes, volumes). A symbol Yahoo could not serve
+    (unknown ticker, or rate-limited) is an all-NaN column or absent --
+    yfinance logs it but does not raise, so callers must inspect the result
+    (see missing_symbols)."""
     # Imported lazily so the whole offline test suite (and any library
     # use that passes its own prices) never needs yfinance importable.
     import yfinance as yf
 
+    raw = yf.download(
+        symbols, period=period, interval="1d",
+        auto_adjust=True, progress=False, threads=True,
+    )
+    if raw is None or raw.empty:
+        raise DataError("yfinance returned an empty result")
+    closes = raw.get("Close", raw) if isinstance(raw, pd.DataFrame) else raw
+    if isinstance(closes, pd.Series):
+        closes = closes.to_frame(symbols[0])
+    volumes = raw.get("Volume") if isinstance(raw, pd.DataFrame) else None
+    if isinstance(volumes, pd.Series):
+        volumes = volumes.to_frame(symbols[0])
+    return closes, volumes
+
+
+def missing_symbols(closes: pd.DataFrame, symbols: list[str]) -> list[str]:
+    """Requested symbols with no price at all in `closes`."""
+    return [s for s in symbols if s not in closes.columns or closes[s].isna().all()]
+
+
+def _merge_columns(base: pd.DataFrame, patch: pd.DataFrame) -> pd.DataFrame:
+    """`patch`'s columns replace (or join) `base`'s, on the union of dates."""
+    if patch.empty:
+        return base
+    idx = base.index.union(patch.index)
+    kept = base.drop(columns=[c for c in patch.columns if c in base.columns])
+    return pd.concat([kept.reindex(idx), patch.reindex(idx)], axis=1)
+
+
+def repair_missing(closes: pd.DataFrame, volumes: pd.DataFrame | None,
+                   symbols: list[str], period: str, download=None,
+                   rounds: int = MAX_RETRIES, batch_size: int = RETRY_BATCH_SIZE,
+                   backoff_seconds: float = RETRY_BACKOFF_SECONDS, sleep=None,
+                   ) -> tuple[pd.DataFrame, pd.DataFrame | None, list[str]]:
+    """Re-fetch every symbol that has no data, in small batches, pausing
+    longer before each round. Returns (closes, volumes, still_missing).
+    A batch that fails outright is logged and retried next round; nothing
+    here raises, so a partial recovery is never thrown away."""
+    download = download or _yf_download
+    sleep = sleep or _sleep
+    missing = missing_symbols(closes, symbols)
+    for rnd in range(1, rounds + 1):
+        if not missing:
+            break
+        logger.warning(f"{len(missing)} symbol(s) returned no data; re-fetching them "
+                       f"in batches of {batch_size} (round {rnd}/{rounds})")
+        sleep(backoff_seconds * rnd)
+        for i in range(0, len(missing), batch_size):
+            batch = missing[i:i + batch_size]
+            try:
+                c, v = download(batch, period)
+            except Exception as e:  # noqa: BLE001 -- see _fetch_with_retries
+                logger.warning(f"re-fetch of {len(batch)} symbol(s) failed: {e}")
+                continue
+            got = [s for s in batch if s in c.columns and not c[s].isna().all()]
+            if not got:
+                continue
+            closes = _merge_columns(closes, c[got])
+            if volumes is not None and v is not None:
+                volumes = _merge_columns(volumes, v[[s for s in got if s in v.columns]])
+        missing = missing_symbols(closes, symbols)
+    return closes, volumes, missing
+
+
+def _check_missing(missing: list[str], n_requested: int, max_missing_fraction: float,
+                   source: str) -> None:
+    """Fail loudly rather than run on a universe Yahoo only half served."""
+    if not missing:
+        return
+    frac = len(missing) / max(n_requested, 1)
+    msg = (f"{len(missing)} of {n_requested} symbols ({frac:.0%}) have no price data "
+           f"({source})")
+    if frac > max_missing_fraction:
+        raise DataError(
+            f"{msg}: more than the allowed {max_missing_fraction:.0%}. Yahoo is "
+            f"probably rate-limiting; refusing to run on a degraded universe. "
+            f"Try again in a few minutes (the cache is only written for a complete "
+            f"download). First missing: {missing[:10]}")
+    logger.warning(f"{msg}; continuing without them: {missing}")
+
+
+def _fetch_with_retries(tickers: list[str], period: str, download=None, sleep=None,
+                        max_missing_fraction: float = MAX_MISSING_FRACTION,
+                        ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """Bulk download with retries, then per-symbol repair and the
+    missing-data guard. Only a result that passes the guard is returned,
+    so get_market_data never caches a rate-limited download."""
+    download = download or _yf_download
+    sleep = sleep or _sleep
     last_error: Exception | None = None
+    closes: pd.DataFrame | None = None
+    volumes: pd.DataFrame | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             logger.info(f"Fetching data (attempt {attempt}/{MAX_RETRIES}) "
                         f"for {len(tickers)} tickers, period={period}")
-            raw = yf.download(
-                tickers, period=period, interval="1d",
-                auto_adjust=True, progress=False, threads=True,
-            )
-            if raw is None or raw.empty:
-                raise DataError("yfinance returned an empty result")
-
-            closes = raw.get("Close", raw) if isinstance(raw, pd.DataFrame) else raw
-            if isinstance(closes, pd.Series):
-                closes = closes.to_frame(tickers[0])
-            volumes = raw.get("Volume") if isinstance(raw, pd.DataFrame) else None
-            if isinstance(volumes, pd.Series):
-                volumes = volumes.to_frame(tickers[0])
-            return closes, volumes
+            closes, volumes = download(tickers, period)
+            break
         except Exception as e:  # noqa: BLE001 — yfinance/requests/urllib3 raise
             # a wide and version-dependent set of exception types for
             # network failures; catching broadly here and re-raising as
@@ -96,11 +189,15 @@ def _fetch_with_retries(tickers: list[str], period: str
             last_error = e
             logger.warning(f"Fetch attempt {attempt} failed: {e}")
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-
-    raise DataError(
-        f"Failed to fetch data after {MAX_RETRIES} attempts: {last_error}"
-    ) from last_error
+                sleep(RETRY_BACKOFF_SECONDS * attempt)
+    if closes is None:
+        raise DataError(
+            f"Failed to fetch data after {MAX_RETRIES} attempts: {last_error}"
+        ) from last_error
+    closes, volumes, missing = repair_missing(closes, volumes, tickers, period,
+                                              download=download, sleep=sleep)
+    _check_missing(missing, len(tickers), max_missing_fraction, "fresh download")
+    return closes, volumes
 
 
 def _validate_prices(data: pd.DataFrame, requested_tickers: list[str],
@@ -405,11 +502,15 @@ def get_market_data(
     calendar_tickers: list[str] | None = None,
     ragged: bool = False,
     yahoo_symbols: dict[str, str] | None = None,
+    max_missing_fraction: float = MAX_MISSING_FRACTION,
 ) -> MarketData:
     """Fetch, validate and currency-convert the full universe.
 
     `fetcher(tickers, period) -> DataFrame` is injectable so the whole
-    path is testable offline; it defaults to the yfinance fetcher.
+    path is testable offline; it defaults to the yfinance fetcher. The
+    missing-data guard (`max_missing_fraction`) applies to live Yahoo data
+    only -- fresh or cached; an injected fetcher or price snapshot is
+    taken as deliberately complete.
     """
     listings = resolve_universe(tickers, currency_overrides)
     fx_tickers = required_fx_tickers(listings, base_currency)
@@ -433,15 +534,34 @@ def get_market_data(
         raw = pd.read_parquet(cache_path)
         if vol_cache.exists():
             volumes = pd.read_parquet(vol_cache)
+        # v4.20: a cache written while Yahoo was rate-limiting (or by an
+        # older version) can hold empty columns: repair it in place rather
+        # than silently running on a shrunken universe for 12 hours
+        missing = missing_symbols(raw, all_symbols)
+        if missing:
+            logger.warning(f"Cached data has no prices for {len(missing)} symbol(s); "
+                           f"re-fetching those")
+            raw, volumes, still = repair_missing(raw, volumes, all_symbols, period)
+            if len(still) < len(missing):
+                raw.to_parquet(cache_path)
+                if volumes is not None:
+                    volumes.to_parquet(vol_cache)
+                logger.info(f"Repaired {len(missing) - len(still)} symbol(s) in the "
+                            f"cache {cache_path}")
+            _check_missing(still, len(all_symbols), max_missing_fraction,
+                           "cached download")
     else:
-        fetched = fetch(all_symbols, period)
-        raw, volumes = fetched if isinstance(fetched, tuple) else (fetched, None)
         if fetcher is None:
+            raw, volumes = _fetch_with_retries(all_symbols, period,
+                                               max_missing_fraction=max_missing_fraction)
             raw.to_parquet(cache_path)
             if volumes is not None:
                 volumes.to_parquet(vol_cache)
             logger.info(f"Cached fresh data to {cache_path} at "
                         f"{datetime.now(timezone.utc).isoformat()}")
+        else:
+            fetched = fetch(all_symbols, period)
+            raw, volumes = fetched if isinstance(fetched, tuple) else (fetched, None)
 
     # fetched under Yahoo symbols -> rename back to UMushroom tickers
     if any(k != v for k, v in sym_map.items()):
@@ -457,8 +577,21 @@ def get_market_data(
 
     missing_fx = [f for f in fx_tickers if f not in raw.columns or raw[f].isna().all()]
     if missing_fx:
-        raise DataError(f"FX rates unavailable for {missing_fx}; cannot convert "
-                        f"prices to {base_currency}")
+        # A missing FX pair is not fatal: Yahoo sometimes rate-limits a lone
+        # pair (e.g. AUDGBP=X / NOKGBP=X for a single AUD/NOK-listed ETF).
+        # Drop only the instruments that need the missing rate and keep going;
+        # aborting the whole run over 1-2 niche listings loses every pick.
+        missing_set = set(missing_fx)
+        dropped = [t for t in tickers
+                   if listings[t].currency != base_currency
+                   and f"{listings[t].currency}{base_currency}=X" in missing_set]
+        logger.warning(f"FX rates unavailable for {missing_fx}; dropping "
+                       f"{len(dropped)} instrument(s) needing them: {dropped}")
+        tickers = [t for t in tickers if t not in set(dropped)]
+        fx_tickers = [f for f in fx_tickers if f not in missing_set]
+        if not tickers:
+            raise DataError(f"FX rates unavailable for {missing_fx}; no "
+                            f"instruments left to price in {base_currency}")
 
     equities = raw[[t for t in tickers if t in raw.columns]]
     crypto = frozenset(t for t, lst in listings.items() if lst.exchange == "Crypto")

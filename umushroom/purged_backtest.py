@@ -47,13 +47,15 @@ particular backtest run happened to be profitable.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
-from umushroom.exceptions import InsufficientHistoryError
+from umushroom.exceptions import DataError, InsufficientHistoryError
 from umushroom.features import (
     MIN_BARS_REQUIRED,
     build_feature_panel,
@@ -61,7 +63,14 @@ from umushroom.features import (
 )
 from umushroom.logging_config import get_logger
 from umushroom.model import RankingModel
-from umushroom.selection import capped_top
+from umushroom.portfolio_construction import cap_weights, equal_weight
+from umushroom.selection import capped_top, correlation_filter
+
+# v4.20: (prices, picks, as_of_idx) -> weights. The backtest scores every
+# period with the SAME weighting scheme the live run trades (HRP or factor
+# parity), capped exactly as allocation.py caps it; before, HRP was applied
+# live but every backtest was equal weight.
+WeightFn = Callable[[pd.DataFrame, list[str], int], pd.Series]
 
 logger = get_logger("purged_backtest")
 
@@ -112,6 +121,9 @@ class PurgedWalkForwardResult:
     # v4.7 (validation): per-period (date, predictions, realized returns),
     # only filled when record_cross_sections=True
     cross_sections: list = field(default_factory=list)
+    # v4.20: periods where the weighting scheme failed and equal weight was
+    # used instead (reported, so a scheme that mostly falls back is visible)
+    weight_fallbacks: int = 0
 
     # ---- period length / annualisation (v4.6: totals compound over many
     # years -- e.g. crypto's 1,379% was ~6 years -- so show per-year too)
@@ -245,8 +257,18 @@ def run_purged_walk_forward(
     sectors: dict[str, str] | None = None,
     max_per_sector: int | None = None,
     feature_set: str = "equity",
+    model_type: str = "ridge",
+    max_pick_correlation: float | None = None,
+    weight_fn: WeightFn | None = None,
+    max_weight_multiple: float = 2.0,
 ) -> PurgedWalkForwardResult:
     """Walk-forward evaluation.
+
+    v4.20: `model_type` (ridge | mlp | gbm, model.py), `max_pick_correlation`
+    (near-duplicate guard, selection.py) and `weight_fn` (the weighting
+    scheme, capped at `max_weight_multiple` x equal weight like live
+    orders) are applied in every period exactly as the live run applies
+    them, so what is backtested is what is traded.
 
     The model is TRAINED on forward_return_days-ahead targets, but every
     test period is SCORED on the return actually earned while holding
@@ -303,6 +325,7 @@ def run_purged_walk_forward(
     p_dates: list[pd.Timestamp] = []
     p_end: list[pd.Timestamp] = []
     cross_sections: list = []
+    n_fallback = 0
     train_end = max(min_train_days, MIN_BARS_REQUIRED + forward_return_days + 1)
 
     while True:
@@ -333,7 +356,9 @@ def run_purged_walk_forward(
             train_end = test_end + embargo_days
             continue
 
-        model = RankingModel(alpha=model_alpha, random_seed=random_seed)
+        model = RankingModel(alpha=model_alpha, random_seed=random_seed,
+                             model_type=model_type,
+                             purge_dates=math.ceil(forward_return_days / rebalance_days))
         model.fit(X_train, y_train)
 
         fold_id += 1
@@ -356,14 +381,29 @@ def run_purged_walk_forward(
             if len(preds) < top_n:
                 continue
             ranked = preds.sort_values(ascending=False)
-            picks = capped_top(ranked.index, top_n, sectors, max_per_sector)
+            too_similar = (correlation_filter(data, idx, max_pick_correlation)
+                           if max_pick_correlation else None)
+            picks = capped_top(ranked.index, top_n, sectors, max_per_sector, too_similar)
 
-            period_strat = float(realized[picks].mean())
+            if weight_fn is None:
+                period_strat = float(realized[picks].mean())
+            else:
+                try:
+                    w = weight_fn(data, picks, idx).reindex(picks).astype(float)
+                    if w.isna().any() or (w < 0).any() or w.sum() <= 0:
+                        raise ValueError("weighting returned invalid weights")
+                    w = cap_weights(w, max_weight_multiple / len(picks))
+                except (DataError, ValueError) as e:
+                    n_fallback += 1
+                    logger.debug(f"{date.date()}: weighting failed ({e}); equal weight")
+                    w = equal_weight(picks)
+                period_strat = float((realized[picks] * w).sum())
             period_bench = float(realized.mean())
             q = max(1, len(ranked) // 5)
             period_ls = float(realized[ranked.head(q).index].mean()
                               - realized[ranked.tail(q).index].mean())
-            ic = float(spearmanr(preds, realized)[0]) if len(preds) >= 3 else np.nan
+            ic = (float(spearmanr(preds, realized)[0])
+                  if len(preds) >= 3 and preds.nunique() > 1 else np.nan)
 
             strat_rets.append(period_strat)
             bench_rets.append(period_bench)
@@ -430,7 +470,11 @@ def run_purged_walk_forward(
         period_end_dates=pd.Series(pd.DatetimeIndex(p_end), index=idx_dates,
                                    name="period_end"),
         cross_sections=cross_sections,
+        weight_fallbacks=n_fallback,
     )
+    if n_fallback:
+        logger.warning(f"Weighting scheme fell back to equal weight in {n_fallback} of "
+                       f"{len(period_returns)} periods")
     logger.info(f"Purged walk-forward complete: {len(folds)} folds, "
                 f"{len(period_returns)} periods, mean IC={mean_ic:+.4f} "
                 f"(t={result.ic_tstat:+.2f})")

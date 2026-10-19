@@ -131,13 +131,30 @@ def test_get_market_data_end_to_end_offline(tmp_path):
     assert not md.prices.isna().any().any()
 
 
-def test_get_market_data_raises_when_fx_missing(tmp_path):
+def test_get_market_data_drops_instruments_with_missing_fx(tmp_path):
+    """A missing FX pair (Yahoo rate-limits a lone pair) must drop only the
+    instruments that need it, not abort the whole run -- otherwise one niche
+    AUD/NOK listing kills every pick."""
+    base_fetch = _fake_fetcher()
+
+    def no_fx(symbols, period):
+        return base_fetch([s for s in symbols if not s.endswith("=X")], period)
+    # AAPL is USD (needs USDGBP=X, now missing); AZN.L is GBP (needs no FX).
+    md = get_market_data(["AAPL", "AZN.L"], "2y", tmp_path, 12, 70, "GBP",
+                         fetcher=no_fx, drop_today_bar=False)
+    assert "AZN.L" in md.prices.columns
+    assert "AAPL" not in md.prices.columns
+
+
+def test_get_market_data_raises_when_no_instrument_can_be_priced(tmp_path):
+    """If every instrument needs a missing FX pair, there is nothing left to
+    price and the run should still fail loudly."""
     base_fetch = _fake_fetcher()
 
     def no_fx(symbols, period):
         return base_fetch([s for s in symbols if not s.endswith("=X")], period)
     with pytest.raises(DataError):
-        get_market_data(["AAPL", "AZN.L"], "2y", tmp_path, 12, 70, "GBP",
+        get_market_data(["AAPL"], "2y", tmp_path, 12, 70, "GBP",
                         fetcher=no_fx, drop_today_bar=False)
 
 
@@ -299,3 +316,163 @@ def test_snapshot_env_var_drives_get_market_data(tmp_path, monkeypatch):
         data_mod.get_market_data(
             tickers=["AAA.L"], period="10y", cache_dir=tmp_path / ".cache",
             cache_max_age_hours=12, min_history_days=100, base_currency="GBP")
+
+
+# ------------------------------------------- v4.20: rate-limit resilience
+# Yahoo answers a big bulk download by serving part of it and returning the
+# rest EMPTY (HTTP 429 per symbol, no exception). On 2026-10-19 that left
+# 780 of 2,281 symbols as NaN columns, which were then cached for 12 hours:
+# the ETF sleeve ran on 1,039 of ~1,700 instruments and 5 of 13 core ETFs.
+
+def _flaky_download(fail_first: set[str], always_fail: set[str] = frozenset(),
+                    n_days: int = 320):
+    """A yfinance stand-in: symbols in `fail_first` come back empty on the
+    first (bulk) call only; `always_fail` never return data. Records every
+    call so tests can check what was re-fetched."""
+    rng = np.random.default_rng(3)
+    idx = pd.bdate_range("2025-01-01", periods=n_days)
+    calls: list[list[str]] = []
+
+    def download(symbols, period):
+        calls.append(list(symbols))
+        first = len(calls) == 1
+        cols, vols = {}, {}
+        for s in symbols:
+            if s in always_fail or (first and s in fail_first):
+                cols[s] = np.full(n_days, np.nan)
+            elif s.endswith("=X"):
+                cols[s] = 0.8 + rng.normal(0, 0.001, n_days).cumsum()
+            else:
+                level = 10000.0 if s.endswith(".L") else 100.0
+                cols[s] = level * np.cumprod(1 + rng.normal(0, 0.01, n_days))
+            vols[s] = np.where(np.isnan(cols[s]), np.nan, 1000.0)
+        return pd.DataFrame(cols, index=idx), pd.DataFrame(vols, index=idx)
+    download.calls = calls   # type: ignore[attr-defined]
+    return download
+
+
+def test_repair_missing_refetches_only_the_empty_symbols_in_small_batches():
+    symbols = [f"S{i}" for i in range(12)]
+    failed = {"S1", "S4", "S5", "S9", "S10"}
+    dl = _flaky_download(fail_first=failed)
+    closes, volumes = dl(symbols, "2y")
+    assert set(data_mod.missing_symbols(closes, symbols)) == failed
+    pauses: list[float] = []
+    closes, volumes, still = data_mod.repair_missing(
+        closes, volumes, symbols, "2y", download=dl, batch_size=2,
+        sleep=pauses.append)
+    assert still == []
+    assert not closes[symbols].isna().any().any()
+    assert volumes is not None and not volumes[symbols].isna().any().any()
+    retries = dl.calls[1:]
+    assert all(set(b) <= failed and len(b) <= 2 for b in retries)
+    assert sorted(s for b in retries for s in b) == sorted(failed)   # each once
+    assert pauses == [data_mod.RETRY_BACKOFF_SECONDS]                  # one round
+
+
+def test_repair_missing_keeps_trying_dead_symbols_until_rounds_run_out():
+    symbols = ["A", "B", "C"]
+    dl = _flaky_download(fail_first=set(), always_fail={"C"})
+    closes, volumes = dl(symbols, "2y")
+    pauses: list[float] = []
+    _c, _v, still = data_mod.repair_missing(closes, volumes, symbols, "2y",
+                                            download=dl, rounds=3, sleep=pauses.append)
+    assert still == ["C"]
+    assert len(dl.calls) == 4                      # bulk + one batch per round
+    assert pauses == [data_mod.RETRY_BACKOFF_SECONDS * r for r in (1, 2, 3)]
+
+
+def test_merge_columns_replaces_empty_columns_on_the_union_of_dates():
+    idx = pd.bdate_range("2025-01-01", periods=3)
+    base = pd.DataFrame({"A": [1.0, 2, 3], "B": [np.nan] * 3}, index=idx)
+    patch = pd.DataFrame({"B": [5.0, 6.0, 7.0]}, index=idx[1:].append(
+        pd.bdate_range("2025-01-07", periods=1)))
+    out = data_mod._merge_columns(base, patch)
+    assert list(out.index) == list(idx) + [pd.Timestamp("2025-01-07")]
+    assert out["B"].tolist()[1:] == [5.0, 6.0, 7.0] and np.isnan(out["B"].iloc[0])
+    assert out["A"].tolist()[:3] == [1.0, 2.0, 3.0] and np.isnan(out["A"].iloc[-1])
+
+
+def test_live_fetch_refuses_a_degraded_download_and_caches_nothing(tmp_path, monkeypatch):
+    tickers = [f"T{i}" for i in range(10)] + ["AZN.L", "NESN.SW"]
+    dead = {f"T{i}" for i in range(4)}                           # 4/14 symbols = 29%
+    monkeypatch.setattr(data_mod, "_yf_download", _flaky_download(set(), dead))
+    monkeypatch.setattr(data_mod, "_sleep", lambda s: None)
+    with pytest.raises(DataError, match="rate-limiting"):
+        get_market_data(tickers, "2y", tmp_path, 12, 70, "GBP", drop_today_bar=False)
+    assert not list(tmp_path.glob("*.parquet"))                  # nothing cached
+
+
+def test_live_fetch_repairs_a_partial_download_before_caching(tmp_path, monkeypatch):
+    tickers = [f"T{i}" for i in range(10)] + ["AZN.L", "NESN.SW"]
+    dl = _flaky_download(fail_first={"T2", "T7", "AZN.L", "USDGBP=X"})
+    monkeypatch.setattr(data_mod, "_yf_download", dl)
+    monkeypatch.setattr(data_mod, "_sleep", lambda s: None)
+    md = get_market_data(tickers, "2y", tmp_path, 12, 70, "GBP", drop_today_bar=False)
+    assert set(md.prices.columns) == set(tickers)
+    price_cache = [f for f in tmp_path.glob("*.parquet") if "_volume" not in f.name]
+    assert len(price_cache) == 1
+    cached = pd.read_parquet(price_cache[0])
+    assert data_mod.missing_symbols(cached, tickers + ["USDGBP=X", "CHFGBP=X"]) == []
+
+
+def test_a_few_dead_symbols_are_tolerated_and_dropped(tmp_path, monkeypatch):
+    tickers = [f"T{i}" for i in range(20)] + ["AZN.L"]
+    monkeypatch.setattr(data_mod, "_yf_download", _flaky_download(set(), {"T19"}))
+    monkeypatch.setattr(data_mod, "_sleep", lambda s: None)
+    md = get_market_data(tickers, "2y", tmp_path, 12, 70, "GBP", drop_today_bar=False)
+    assert "T19" not in md.prices.columns and len(md.prices.columns) == 20
+
+
+def test_damaged_cache_is_repaired_in_place_on_the_next_run(tmp_path, monkeypatch):
+    """The 2026-10-19 situation: a fresh cache whose rate-limited columns are
+    all NaN. The next run must re-fetch just those, rewrite the cache, and
+    run on the full universe."""
+    tickers = ["AAPL", "MSFT", "AZN.L", "SHEL.L"]
+    symbols = tickers + ["USDGBP=X"]
+    good = _flaky_download(set())
+    closes, volumes = good(symbols, "2y")
+    closes[["MSFT", "SHEL.L"]] = np.nan                       # as the 429s left them
+    volumes[["MSFT", "SHEL.L"]] = np.nan
+    path = data_mod._cache_path(tmp_path, symbols, "2y")
+    closes.to_parquet(path)
+    volumes.to_parquet(path.with_name(path.stem + "_volume.parquet"))
+    monkeypatch.setattr(data_mod, "_yf_download", good)
+    monkeypatch.setattr(data_mod, "_sleep", lambda s: None)
+    md = get_market_data(tickers, "2y", tmp_path, 12, 70, "GBP", drop_today_bar=False)
+    assert set(md.prices.columns) == set(tickers)
+    assert [c for c in good.calls[1:]] == [["MSFT", "SHEL.L"]]  # only the empty ones
+    repaired = pd.read_parquet(path)
+    assert data_mod.missing_symbols(repaired, symbols) == []
+    assert md.dollar_volume is not None and md.dollar_volume["MSFT"].notna().all()
+
+
+def test_damaged_cache_that_cannot_be_repaired_fails_loudly(tmp_path, monkeypatch):
+    tickers = [f"T{i}" for i in range(10)]
+    symbols = list(tickers)                                    # all USD -> no FX
+    good = _flaky_download(set())
+    closes, _volumes = good(symbols + ["USDGBP=X"], "2y")
+    closes = closes[symbols]
+    closes[[f"T{i}" for i in range(4)]] = np.nan
+    closes.to_parquet(data_mod._cache_path(tmp_path, symbols, "2y"))
+    monkeypatch.setattr(data_mod, "_yf_download",
+                        _flaky_download(set(), {f"T{i}" for i in range(4)}))
+    monkeypatch.setattr(data_mod, "_sleep", lambda s: None)
+    with pytest.raises(DataError, match="cached download"):
+        get_market_data(tickers, "2y", tmp_path, 12, 70, "USD", drop_today_bar=False)
+    # a deliberately degraded run is still possible by raising the limit
+    md = get_market_data(tickers, "2y", tmp_path, 12, 70, "USD", drop_today_bar=False,
+                         max_missing_fraction=0.5)
+    assert len(md.prices.columns) == 6
+
+
+def test_injected_fetcher_and_snapshot_are_trusted_as_complete(tmp_path):
+    """The guard is for live Yahoo data only: an injected fetcher (tests,
+    research) that omits symbols keeps the old behaviour."""
+    base = _fake_fetcher()
+
+    def partial(symbols, period):
+        return base([s for s in symbols if s not in ("MSFT", "NESN.SW")], period)
+    md = get_market_data(["AAPL", "MSFT", "AZN.L", "NESN.SW"], "2y", tmp_path, 12, 70,
+                         "GBP", fetcher=partial, drop_today_bar=False)
+    assert set(md.prices.columns) == {"AAPL", "AZN.L"}

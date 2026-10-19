@@ -118,6 +118,54 @@ The ETF sleeve is the stock model's twin for ETFs:
 Offline, reproducible runs: `UMUSHROOM_PRICE_SNAPSHOT=prices.json.gz`
 replays a saved price snapshot instead of calling Yahoo (`data.py`).
 
+### v4.20: data guard, near-duplicate guard, factor-risk weights, learners
+
+The 2026-10-19 run exposed four things; each has a fix and, where it would
+change the strategy, a pre-declared head-to-head:
+
+- **Data guard.** Yahoo rate-limits big downloads *per symbol* and returns
+  the rest empty; those were cached for 12 hours, so the ETF sleeve traded
+  1,039 of ~1,700 ETFs with 5 of 13 core ETFs. `data.py` now re-fetches empty
+  symbols in small batches, repairs a damaged cache on the next run, and
+  refuses to run (or cache) when more than `max_missing_fraction` (10%) of
+  the universe is missing. A refused run is the correct outcome: the website
+  keeps the last good run and GitHub emails you.
+- **Near-duplicate guard** (`max_pick_correlation`). Two MSCI Korea trackers
+  and three USD high-yield funds filled five of the eight ETF slots. The
+  guard skips a candidate whose trailing-year return correlation with a name
+  already picked exceeds the threshold (causal; same rule in the backtest
+  and live). `--compare-dedup etf:0.9,0.95` decides whether to switch it on.
+- **Factor-risk weights** (`weighting: factor`, `factor_risk.py`). Factors =
+  the sleeve's group averages (asset classes / exchanges); each pick's betas
+  and the factors' covariance (their correlation) set weights so that every
+  factor contributes its budgeted share of risk (equal by default). The
+  walk-forward now scores the configured weighting scheme -- HRP included,
+  which it never was before. Weights sit between 0.25x and 2x an equal
+  share; groups that barely move (money-market ETFs) are not used as
+  factors; a held-all basket stays equal weight.
+  `--compare-weighting etf:equal,hrp,factor`.
+- **Learners** (`model_type: ridge | mlp | gbm`). A one-hidden-layer neural
+  network (date-purged early stopping) and gradient boosting behind the same
+  interface, compared by `--compare-model etf:ridge,mlp,gbm`. Why there is no
+  LSTM/CNN over raw prices is argued in `model.py`'s docstring: with ~430
+  weekly cross-sections and factors that already summarise the trailing year,
+  the shallow net *is* the appropriate neural network, and the walk-forward
+  decides whether even it earns its place.
+
+Rules are fixed before the numbers: learners -- IC t >= 2, then the highest
+contest-window active t (a new learner needs t >= 2 of its own), ties to the
+simpler model; weighting and guard -- keep >= 75% of the current alpha AND
+do not raise the weekly 95% VaR.
+
+Results on 2026-10-19 (full data, 30-day folds; details in CHANGELOG 4.20.0
+and config.yaml): ETFs -- factor weighting adopted (alpha +2.7%/yr vs
+-0.4%, VaR unchanged), learner and guard unchanged, and on the complete ETF
+model's IC is borderline (t +1.9 to +3.2) with no contest-window edge, so
+`auto` holds the core basket; stocks -- HRP adopted (alpha +11.9%/yr, VaR
+2.54% vs 3.16%), guard unchanged, and gradient boosting beat ridge by a
+wide, significant margin (6-week active t +3.95 vs +2.07) and passed the
+7-check validation suite -- adopted (`model_type: gbm`).
+
 ### HTML report
 
 ```
@@ -187,7 +235,8 @@ umushroom/
   window.py       # v4.19: contest-window (30-day) evaluation + verdict
   data.py         # Fetch w/ retry+backoff, validate, FX-convert, parquet cache
   features.py     # Pure functions: prices -> cross-sectionally ranked factors
-  model.py        # RankingModel: fit/predict/save/load, purged date-CV with IC
+  model.py        # RankingModel (ridge | mlp | gbm): fit/predict/save/load, purged date-CV
+  factor_risk.py  # v4.20: factor exposures, factor covariance, factor-risk-parity weights
   backtest.py     # Quick IN-SAMPLE sanity check (not a performance claim)
   purged_backtest.py      # Out-of-sample purged/embargoed walk-forward + skill stats
   robustness.py           # Block-bootstrap Sharpe confidence interval

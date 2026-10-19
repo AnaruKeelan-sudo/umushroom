@@ -271,7 +271,18 @@ def test_shipped_config_sleeves_are_valid():
     assert set(names) == {"equity", "etf"}
     assert sum(s.weight for s in cfg.all_sleeves) == pytest.approx(1.0)
     assert names["equity"].weight == pytest.approx(0.80)
-    assert names["etf"].selection == "auto" and names["etf"].weighting == "equal"
+    # v4.20 (2026-10-19 head-to-heads): factor-risk weights for ETFs, HRP for
+    # stocks; learner ridge and the near-duplicate guard off until their
+    # rules say otherwise (see config.yaml for the numbers)
+    assert names["etf"].selection == "auto" and names["etf"].weighting == "factor"
+    assert names["equity"].weighting == "hrp" and cfg.weighting == "hrp"
+    # gbm: won the learner head-to-head (6-week active t +3.95) and passed
+    # the 7-check validation suite on 2026-10-19 -- for STOCKS; the ETF sleeve
+    # keeps ridge (no learner had a contest-window edge there)
+    assert cfg.model_type == "gbm" and cfg.max_pick_correlation is None
+    assert sleeve_model_type(cfg, names["equity"]) == "gbm"
+    assert sleeve_model_type(cfg, names["etf"]) == "ridge"
+    assert cfg.max_missing_fraction == pytest.approx(0.10)
 
 
 def test_sleeve_selection_all_and_weighting_parse(tmp_path):
@@ -296,7 +307,7 @@ def test_shipped_config_etf_sleeve_is_a_model_sleeve_over_the_universe():
     """v4.19: the ETF sleeve ranks the whole UMushroom ETF universe with the
     ETF feature set and falls back to the 13 core ETFs under `auto`."""
     etf = next(s for s in load_config(REPO_CONFIG).all_sleeves if s.name == "etf")
-    assert etf.selection == "auto" and etf.weighting == "equal"
+    assert etf.selection == "auto" and etf.weighting == "factor"
     assert etf.feature_set == "etf" and etf.group_by == "asset_class"
     assert len(etf.core_tickers) == 13 and set(etf.core_tickers) <= set(etf.tickers)
     assert len(etf.tickers) > 1000 and not etf.universe_missing
@@ -477,3 +488,85 @@ def test_contest_window_days_from_yaml(tmp_path):
     assert cfg.contest_window_days == 20
     with pytest.raises(ConfigError):
         load_config(_write(tmp_path, VALID_YAML + "contest_window_days: 0\n"))
+
+
+# ------------------------------------------------------------- v4.20 fields
+from umushroom.config import sleeve_model_type, sleeve_pick_correlation
+
+
+def test_v420_defaults_keep_the_strategy_unchanged(tmp_path):
+    cfg = load_config(_write(tmp_path, VALID_YAML))
+    assert cfg.model_type == "ridge" and cfg.max_pick_correlation is None
+    assert cfg.max_missing_fraction == pytest.approx(0.10)
+    eq = cfg.all_sleeves[0]
+    assert sleeve_model_type(cfg, eq) == "ridge"
+    assert sleeve_pick_correlation(cfg, eq) is None
+
+
+def test_v420_fields_parse_and_sleeves_inherit_or_override(tmp_path):
+    yaml_text = VALID_YAML + textwrap.dedent("""\
+        model_type: gbm
+        max_pick_correlation: 0.9
+        max_missing_fraction: 0.25
+        sleeves:
+          etf:
+            weight: 0.2
+            top_n: 1
+            tickers: ["IWDA.L", "SGLD.L"]
+            weighting: factor
+            model_type: mlp
+          crypto:
+            weight: 0.1
+            top_n: 1
+            tickers: ["BTC-USD"]
+            max_pick_correlation: 0
+    """)
+    cfg = load_config(_write(tmp_path, yaml_text))
+    assert cfg.model_type == "gbm" and cfg.max_missing_fraction == 0.25
+    eq, etf, crypto = cfg.all_sleeves
+    assert sleeve_model_type(cfg, eq) == "gbm" and sleeve_model_type(cfg, etf) == "mlp"
+    assert sleeve_pick_correlation(cfg, eq) == 0.9
+    assert sleeve_pick_correlation(cfg, etf) == 0.9        # inherits the global
+    assert sleeve_pick_correlation(cfg, crypto) is None    # 0 switches it OFF
+    assert etf.weighting == "factor"
+
+
+@pytest.mark.parametrize("extra", [
+    "model_type: lstm\n", "max_pick_correlation: 1.5\n", "max_pick_correlation: 0\n",
+    "max_missing_fraction: 1.5\n",
+])
+def test_invalid_v420_top_level_values_raise(tmp_path, extra):
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, VALID_YAML + extra))
+
+
+@pytest.mark.parametrize("field, value", [
+    ("model_type", "lstm"), ("max_pick_correlation", 2), ("weighting", "markowitz"),
+])
+def test_invalid_v420_sleeve_values_raise(tmp_path, field, value):
+    yaml_text = VALID_YAML + textwrap.dedent(f"""\
+        sleeves:
+          etf:
+            weight: 0.2
+            top_n: 1
+            tickers: ["IWDA.L"]
+            {field}: {value}
+    """)
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, yaml_text))
+
+
+def test_env_override_of_v420_fields(tmp_path, monkeypatch):
+    monkeypatch.setenv("UMUSHROOM_MAX_PICK_CORRELATION", "0.85")
+    monkeypatch.setenv("UMUSHROOM_MODEL_TYPE", "gbm")
+    cfg = load_config(_write(tmp_path, VALID_YAML + "max_pick_correlation: 0.9\n"
+                             "model_type: ridge\n"))
+    assert cfg.max_pick_correlation == 0.85 and cfg.model_type == "gbm"
+
+
+def test_top_level_weighting_sets_the_stock_sleeve(tmp_path):
+    cfg = load_config(_write(tmp_path, VALID_YAML + "weighting: hrp\n"))
+    assert cfg.weighting == "hrp" and cfg.all_sleeves[0].weighting == "hrp"
+    assert load_config(_write(tmp_path, VALID_YAML)).all_sleeves[0].weighting is None
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, VALID_YAML + "weighting: markowitz\n"))

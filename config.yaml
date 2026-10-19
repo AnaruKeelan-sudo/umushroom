@@ -688,7 +688,25 @@ sleeves:
     # what `selection: auto` guards against.
     forward_return_days: 10
     selection: "auto"
-    weighting: "equal"
+    # v4.20 HEAD-TO-HEADS (2026-10-19, full 1,590-ETF universe, 30-day folds):
+    #   weighting   equal  alpha -0.4%/yr  win 56%  VaR95/wk 2.86%
+    #               hrp    alpha -0.9%/yr  win 47%  VaR95/wk 1.98%  (lost alpha)
+    #               factor alpha +2.7%/yr  win 62%  VaR95/wk 2.85%  <- ADOPTED by the rule
+    #               (alpha t 0.54: a modest, not yet significant edge in sizing;
+    #               an earlier +9.1% came from the unconditioned factor model
+    #               before the volatility and weight floors). Applies when the
+    #               model's picks are traded; the core basket stays equal weight.
+    #   model_type  ridge 6-week active t -0.18 / mlp +0.34 / gbm -0.30: no
+    #               learner has a reliable contest-window edge here (all IC t
+    #               3.2-3.9). mlp "won" by +0.34 -- noise; ridge kept.
+    #   max_pick_correlation  0.90 / 0.95: no improvement -> off.
+    # (set explicitly: the top-level model_type is the STOCK sleeve's)
+    model_type: "ridge"
+    # Headline on the FULL universe: walk-forward IC t +1.93 (21-day folds),
+    # +3.21 (30-day folds); active return ~0: `auto` holds the core basket.
+    # The 2026-10-19 20:07 run that traded 8 picks did so on a cache missing
+    # 780 symbols (Yahoo rate limit) -- fixed in data.py.
+    weighting: "factor"
     core_tickers:
       - "IWDA.L"     # iShares Core MSCI World (USD)
       - "VUAA.L"     # Vanguard S&P 500 (USD)
@@ -723,6 +741,40 @@ sleeves:
 #               "XLM-USD", "TRX-USD", "ATOM-USD", "ETC-USD", "HBAR-USD", "FIL-USD"]
 
 starting_balance: 100000        # contest virtual capital (in base_currency)
+
+# --- v4.20 (2026-10-19; every number below is from ONE pre-declared head-to-head
+# on identical data, 568 stocks / 1,590 ETFs, 30-day test folds; see CHANGELOG) ---
+#
+# Learner for the stock sleeve (sleeves may set their own): ridge | mlp (small
+# neural network) | gbm (gradient boosting).
+#   python -m umushroom.cli --config config.yaml --compare-model equity:ridge,mlp,gbm
+#   ridge  IC t +4.71  6-week active t +2.07  alpha  +9.2%/yr (t 1.91)  VaR95/wk 3.16%
+#   mlp    IC t +3.66  6-week active t +2.53  alpha +12.2%/yr (t 2.37)  VaR95/wk 3.50%
+#   gbm    IC t +5.08  6-week active t +3.95  alpha +24.2%/yr (t 3.92)  VaR95/wk 3.99%  <- rule: gbm
+# gbm wins the rule by a wide, significant margin AND passed the validation
+# suite on 2026-10-19 (7/7: placebo 20/20 p=0.048, deciles ordered rho 0.89,
+# IC positive 9/9 years, LSE/SIX/US all positive, survives a 1-day delay,
+# 526 names picked, max 10%) -> ADOPTED. It takes MORE weekly risk than ridge
+# (VaR 3.99% vs 3.16%); HRP below brings that back down.
+# Re-check any time: `python -m umushroom.cli --config config.yaml --validate`.
+model_type: "gbm"
+# Weighting of the stock sleeve: equal | hrp | factor (the walk-forward scores
+# the same scheme, capped at 2x equal weight like live orders).
+#   python -m umushroom.cli --config config.yaml --compare-weighting equity:equal,hrp,factor
+#   equal  alpha  +9.2%/yr (t 1.91)  VaR95/wk 3.16%
+#   hrp    alpha +11.9%/yr (t 2.65)  VaR95/wk 2.54%   <- ADOPTED (kept the alpha, lower risk)
+#   factor alpha  +6.4%/yr (t 1.25)  VaR95/wk 3.66%   (exchange factors are too coarse for stocks)
+weighting: "hrp"
+# Near-duplicate guard: skip a pick whose 1-year return correlation with a
+# name already picked exceeds this (0 / left out = off).
+#   python -m umushroom.cli --config config.yaml --compare-dedup equity:0.9,0.95
+#   stocks: 0.90 VaR 3.23% / 0.95 VaR 3.21% vs 3.16% without -> KEEP OFF
+#   ETFs:   0.90 VaR 2.88% / 0.95 alpha lower  vs 2.86% without -> KEEP OFF
+#   (the twins the guard was built for are handled by factor-risk SIZING instead)
+# max_pick_correlation: 0.9
+# Refuse to run (and to cache) when Yahoo serves less than 90% of the
+# universe -- a rate-limited download must never be traded (data.py).
+max_missing_fraction: 0.10
 top_n_holdings: 10              # v4.5: back to 10 -- won the 10-year
                                 # head-to-head (alpha t=2.22) vs 25
 lookback_period: "10y"          # v4.4: 10 years (each stock joins the model

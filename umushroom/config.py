@@ -15,13 +15,16 @@ from pathlib import Path
 
 import yaml
 
+from umushroom.data import MAX_MISSING_FRACTION
 from umushroom.exceptions import ConfigError
 from umushroom.features import FEATURE_SETS, TARGET_TYPES
+from umushroom.model import MODEL_TYPES
 from umushroom.universe import SUPPORTED_BASE_CURRENCIES, resolve_universe
 
 FRENCH_REGIONS = ("US", "Developed", "Europe")
 EQUITY_SLEEVE = "equity"
 SELECTION_MODES = ("model", "all", "auto")
+WEIGHTINGS = ("equal", "hrp", "factor")
 GROUP_BY_OPTIONS = ("exchange", "asset_class")
 # UMushroom UK Stage 1 runs 12 Oct - 22 Nov 2026: six weeks = 30 trading days.
 DEFAULT_CONTEST_WINDOW_DAYS = 30
@@ -82,6 +85,12 @@ class SleeveConfig:
     exclude_leveraged: bool = False
     exclude_groups: list[str] = field(default_factory=list)
     n_excluded: int = 0                # how many universe rows the two rules removed
+    # ---- v4.20 ----
+    # learner for this sleeve: ridge | mlp | gbm (None = the global model_type)
+    model_type: str | None = None
+    # near-duplicate guard: skip a candidate whose trailing return correlation
+    # with a name already picked exceeds this (None = global; 0 = off)
+    max_pick_correlation: float | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +136,15 @@ class StrategyConfig:
     # forecast horizon must fit inside it -- a return the model is trained
     # to capture over 60 days cannot show up in a 30-day contest.
     contest_window_days: int = DEFAULT_CONTEST_WINDOW_DAYS
+    # ---- v4.20 ----
+    model_type: str = "ridge"                   # ridge | mlp | gbm (model.py)
+    max_pick_correlation: float | None = None   # near-duplicate guard (selection.py)
+    # weighting scheme of the stock sleeve: equal | hrp | factor (None = the
+    # --weighting flag, default equal). Set here so the GitHub run uses it too.
+    weighting: str | None = None
+    # data.py: refuse to run (and to cache) when Yahoo serves less than this
+    # share of the universe -- a rate-limited download must never be traded
+    max_missing_fraction: float = MAX_MISSING_FRACTION
 
     def __post_init__(self) -> None:
         _validate(self)
@@ -143,7 +161,10 @@ class StrategyConfig:
             neutralize_by_exchange=self.neutralize_by_exchange,
             neutralize_by_sector=self.neutralize_by_sector,
             use_volume_features=self.use_volume_features,
-            max_per_sector=self.max_per_sector)
+            max_per_sector=self.max_per_sector,
+            model_type=self.model_type,
+            max_pick_correlation=self.max_pick_correlation,
+            weighting=self.weighting)
         return [equity, *self.sleeves]
 
     @property
@@ -221,6 +242,15 @@ def _validate(cfg: StrategyConfig) -> None:
 
     if cfg.contest_window_days < 1:
         errors.append("contest_window_days must be >= 1")
+    if cfg.model_type not in MODEL_TYPES:
+        errors.append(f"model_type must be one of {MODEL_TYPES}, got {cfg.model_type!r}")
+    if cfg.max_pick_correlation is not None and not 0 < cfg.max_pick_correlation <= 1:
+        errors.append("max_pick_correlation must be in (0, 1] (or left out to switch "
+                      "the near-duplicate guard off)")
+    if not 0 <= cfg.max_missing_fraction <= 1:
+        errors.append("max_missing_fraction must be between 0 and 1")
+    if cfg.weighting is not None and cfg.weighting not in WEIGHTINGS:
+        errors.append(f"weighting must be one of {WEIGHTINGS}, got {cfg.weighting!r}")
     if cfg.forward_return_days > cfg.contest_window_days:
         errors.append(f"forward_return_days ({cfg.forward_return_days}) is longer than "
                       f"the contest window ({cfg.contest_window_days} trading days): "
@@ -245,8 +275,13 @@ def _validate(cfg: StrategyConfig) -> None:
                           f"({cfg.contest_window_days} trading days)")
         if sl.selection not in SELECTION_MODES:
             errors.append(f"sleeve '{sl.name}' selection must be one of {SELECTION_MODES}")
-        if sl.weighting not in (None, "equal", "hrp"):
-            errors.append(f"sleeve '{sl.name}' weighting must be 'equal' or 'hrp'")
+        if sl.weighting not in (None, *WEIGHTINGS):
+            errors.append(f"sleeve '{sl.name}' weighting must be one of {WEIGHTINGS}")
+        if sl.model_type is not None and sl.model_type not in MODEL_TYPES:
+            errors.append(f"sleeve '{sl.name}' model_type must be one of {MODEL_TYPES}")
+        if sl.max_pick_correlation is not None and not 0 <= sl.max_pick_correlation <= 1:
+            errors.append(f"sleeve '{sl.name}' max_pick_correlation must be between 0 "
+                          f"(off) and 1")
         if not 1 <= sl.top_n <= len(sl.tickers):
             errors.append(f"sleeve '{sl.name}' top_n must be between 1 and its "
                           f"ticker count ({len(sl.tickers)})")
@@ -399,8 +434,18 @@ def _parse_sleeves(raw: object, base_dir: Path,
             exclude_leveraged=exclude_leveraged,
             exclude_groups=exclude_groups,
             n_excluded=n_excluded,
+            model_type=(None if spec.get("model_type") is None
+                        else str(spec["model_type"])),
+            max_pick_correlation=_optional_float(spec.get("max_pick_correlation")),
         ))
     return out
+
+
+def _optional_float(value: object) -> float | None:
+    """None / "" -> None; anything else must parse as a float."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return float(value)  # type: ignore[arg-type]
 
 
 def load_config(path: str | Path = "config.yaml") -> StrategyConfig:
@@ -483,6 +528,12 @@ def load_config(path: str | Path = "config.yaml") -> StrategyConfig:
                            (raw.get("yahoo_symbols") or {}).items()},
             contest_window_days=int(raw.get("contest_window_days",
                                             DEFAULT_CONTEST_WINDOW_DAYS)),
+            model_type=str(raw.get("model_type", "ridge")),
+            max_pick_correlation=_optional_float(raw.get("max_pick_correlation")),
+            max_missing_fraction=float(raw.get("max_missing_fraction",
+                                               MAX_MISSING_FRACTION)),
+            weighting=(None if raw.get("weighting") in (None, "")
+                       else str(raw["weighting"])),
         )
     except (TypeError, ValueError, KeyError) as e:
         raise ConfigError(f"Config file {path} has a field of the wrong type: {e}") from e
@@ -490,3 +541,15 @@ def load_config(path: str | Path = "config.yaml") -> StrategyConfig:
 
 def sleeve_horizon(cfg: StrategyConfig, sleeve: SleeveConfig) -> int:
     return sleeve.forward_return_days or cfg.forward_return_days
+
+
+def sleeve_model_type(cfg: StrategyConfig, sleeve: SleeveConfig) -> str:
+    return sleeve.model_type or cfg.model_type
+
+
+def sleeve_pick_correlation(cfg: StrategyConfig, sleeve: SleeveConfig) -> float | None:
+    """The near-duplicate threshold in force for a sleeve: its own setting,
+    else the global one; 0 (or nothing anywhere) = guard off."""
+    v = (sleeve.max_pick_correlation if sleeve.max_pick_correlation is not None
+         else cfg.max_pick_correlation)
+    return v if v else None
