@@ -284,3 +284,133 @@ def test_window_payload_and_cards_render(verdict):
     body = section_bodies(p)["etfs"]
     assert verdict in body and "20 priced today" in body
     assert ("model picks" if verdict == PASS else "core basket") in body
+
+
+# --------------------------------------------------- v4.20: learner, weights, guard
+
+def test_model_weighting_and_guard_settings_flow_through_to_orders_and_report(
+        tmp_path, monkeypatch, capsys):
+    """gbm learner, factor-risk weights and the near-duplicate guard, set on the
+    sleeve, must show in the console, drive the orders and reach the website."""
+    # `extra` is spliced in at the sleeve's indentation (12 spaces) before the
+    # template is dedented, so every line after the first must carry it
+    cfg = _config(tmp_path, selection="model",
+                  extra="model_type: gbm\n            weighting: factor\n"
+                        "            max_pick_correlation: 0.9")
+    rc, out_csv, report = _run(monkeypatch, cfg, tmp_path, _fetch_factory(seed=12),
+                               "--skip-purged-backtest")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "Model: gbm; weighting: factor; near-duplicate guard: max correlation 0.90" in out
+    assert "Feature importance (permutation importance" in out
+    assert "Factor-risk weights (v4.20)" in out and "idiosyncratic" in out
+    etf = pd.read_csv(out_csv, index_col=0).query("sleeve == 'etf'")
+    assert len(etf) == 4 and etf["target_weight"].round(4).nunique() > 1
+    s = next(x for x in _payload(report)["sleeves"] if x["name"] == "etf")
+    assert s["model_type"] == "gbm" and s["weighting"] == "factor"
+    assert s["max_pick_correlation"] == pytest.approx(0.9)
+    fr = s["factor_risk"]
+    assert set(fr["factors"]) == {"bond", "equity"}
+    assert sum(fr["contributions"].values()) == pytest.approx(1.0, abs=1e-6)
+    assert set(fr["weights"]) == set(etf.index)
+    assert all(set(v) == {"bond", "equity"} for v in fr["exposures"].values())
+
+
+def test_defaults_are_unchanged_ridge_equal_no_guard(tmp_path, monkeypatch, capsys):
+    cfg = _config(tmp_path, selection="model")
+    rc, _out_csv, report = _run(monkeypatch, cfg, tmp_path, _fetch_factory(seed=12),
+                               "--skip-purged-backtest")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "Model: ridge; weighting: equal; near-duplicate guard: off" in out
+    assert "Feature importance (Ridge coefficients)" in out
+    s = next(x for x in _payload(report)["sleeves"] if x["name"] == "etf")
+    assert s["model_type"] == "ridge" and s["weighting"] == "equal"
+    assert s["max_pick_correlation"] is None and s["factor_risk"] is None
+
+
+def test_v420_head_to_heads_print_tables_and_verdicts(tmp_path, monkeypatch, capsys):
+    cfg = _config(tmp_path)
+    rc, _, _ = _run(monkeypatch, cfg, tmp_path, _fetch_factory(seed=3),
+                    "--compare-model", "etf:ridge,gbm",
+                    "--compare-weighting", "etf:equal,factor",
+                    "--compare-dedup", "etf:0.9")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    for title in ("Learner: head-to-head", "Weighting: head-to-head",
+                  "Near-duplicate guard: head-to-head"):
+        assert title in out, title
+    assert out.count("VERDICT") >= 5          # backtest, window + three comparisons
+    assert "VaR95/wk" in out and "current setting: ridge" in out
+    assert "current setting: equal" in out and "current setting: no guard" in out
+
+
+def test_v420_head_to_heads_refuse_bad_arguments(tmp_path, monkeypatch, capsys):
+    cfg = _config(tmp_path)
+    rc, _, _ = _run(monkeypatch, cfg, tmp_path, _fetch_factory(seed=3),
+                    "--compare-model", "etf:lstm", "--compare-weighting", "etf:markowitz",
+                    "--compare-dedup", "etf:1.5")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "Model comparison refused" in out
+    assert "Weighting comparison refused" in out
+    assert "Dedup comparison refused" in out
+
+
+def test_factor_risk_renders_on_the_risk_tab_and_the_etf_tile():
+    from tests.test_factor_risk import _two_factor_universe
+    from umushroom.factor_risk import factor_risk
+    from umushroom.report import SleeveReport, build_payload, factor_risk_payload
+    px, groups = _two_factor_universe()
+    fr = factor_risk(px, ["A0", "A1", "B0"], len(px) - 1, groups)
+    s = SleeveReport("etf", 0.2, "model", feature_set="etf", horizon_days=10,
+                     selection_used="model", n_instruments=20, contest_window_days=30,
+                     model_type="gbm", weighting="factor", max_pick_correlation=0.9,
+                     factor_risk=factor_risk_payload(fr))
+    p = build_payload({"base_currency": "GBP"}, [s], pd.DataFrame())
+    sl = p["sleeves"][0]
+    assert sl["model_type"] == "gbm" and sl["weighting"] == "factor"
+    assert sl["factor_risk"]["factors"] == ["ga", "gb"]
+    assert json.dumps(p)                                   # JSON-clean
+    body = section_bodies(p)
+    assert "gbm / factor" in body["etfs"] and "max correlation 0.90" in body["etfs"]
+    risk = body["risk"]
+    assert "Factor risk" in risk and "beta ga" in risk and "A0" in risk and "B0" in risk
+    assert "idiosyncratic" in risk
+    # a sleeve without factor weights adds nothing to the Risk tab
+    plain = SleeveReport("etf", 0.2, "model", feature_set="etf")
+    assert "Factor risk" not in section_bodies(
+        build_payload({"base_currency": "GBP"}, [plain], pd.DataFrame()))["risk"]
+
+
+def test_learner_rule_needs_a_significant_window_edge_to_replace_the_current():
+    from umushroom.cli import skill_verdict
+    base = {"ic_t": 3.0, "w_t": -0.2}
+    rows = {"ridge": base, "mlp": {"ic_t": 3.3, "w_t": 0.34}, "gbm": {"ic_t": 3.9, "w_t": -0.3}}
+    winner, why = skill_verdict(rows, "ridge", ["ridge", "gbm", "mlp"])
+    assert winner is None and "noise" in why and "mlp" in why           # the 10-19 ETF case
+    rows["gbm"] = {"ic_t": 5.1, "w_t": 3.95}
+    winner, why = skill_verdict(rows, "ridge", ["ridge", "gbm", "mlp"])
+    assert winner == "gbm" and "+3.95" in why                             # the 10-19 stock case
+    winner, why = skill_verdict({"ridge": {"ic_t": 1.2, "w_t": 2.5}}, "ridge")
+    assert winner is None and "IC t < 2" in why
+    tie = {"ridge": {"ic_t": 3.0, "w_t": 2.5}, "gbm": {"ic_t": 3.0, "w_t": 2.5}}
+    assert skill_verdict(tie, "ridge", ["ridge", "gbm"])[0] is None        # tie -> current
+    assert skill_verdict(tie, "mlp", ["ridge", "gbm"])[0] == "ridge"       # tie -> simpler
+
+
+def test_auto_fallback_basket_is_equal_weight_even_with_factor_weighting(
+        tmp_path, monkeypatch, capsys):
+    """The core basket is held equal weight (what the benchmark, the report and
+    the Monte Carlo assume); `weighting: factor` applies to model picks only."""
+    cfg = _config(tmp_path, extra="weighting: factor")
+    rc, out_csv, report = _run(monkeypatch, cfg, tmp_path, _fetch_factory(seed=5))
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "holding the core basket" in out
+    assert "(weighting 'factor' applies to model picks only)" in out
+    etf = pd.read_csv(out_csv, index_col=0).query("sleeve == 'etf'")
+    assert set(etf.index) == set(CORE)
+    assert etf["target_weight"].round(4).nunique() == 1
+    s = next(x for x in _payload(report)["sleeves"] if x["name"] == "etf")
+    assert s["weighting"] == "factor" and s["factor_risk"] is None

@@ -142,3 +142,87 @@ def test_summary_reports_test_period_and_annualised_returns(synthetic_prices):
     assert "Test period:" in text and "years)" in text and "a year)" in text
     expected = (1 + r.overall_strategy_return) ** (1 / r.years) - 1
     assert f"{expected:+.1%} a year" in text
+
+
+# -------------------------------------------- v4.20: weighting hook, caps
+import numpy as np
+import pandas as pd
+
+from umushroom.portfolio_construction import cap_weights, equal_weight
+
+KW = {"test_window_days": 21, "purge_days": 5, "embargo_days": 5, "rebalance_days": 5,
+      "forward_return_days": 5, "top_n": 3, "min_train_days": 504, "model_alpha": 1.0,
+      "random_seed": 42}
+
+
+def test_equal_weight_fn_reproduces_the_default_exactly(planted_signal_prices):
+    base = run_purged_walk_forward(planted_signal_prices, **KW)
+    same = run_purged_walk_forward(
+        planted_signal_prices, weight_fn=lambda p, picks, i: equal_weight(picks), **KW)
+    pd.testing.assert_series_equal(base.period_returns, same.period_returns)
+    assert same.weight_fallbacks == 0
+
+
+def _top3(preds):
+    return preds.sort_values(ascending=False).index[:3].tolist()
+
+
+def test_weight_fn_is_applied_capped_and_falls_back_on_failure(planted_signal_prices):
+    def tilted(prices, picks, idx):
+        return pd.Series([0.6, 0.3, 0.1], index=picks)          # inside the 2x cap
+    r = run_purged_walk_forward(planted_signal_prices, weight_fn=tilted,
+                                record_cross_sections=True, **KW)
+    assert len(r.cross_sections) == len(r.period_returns) > 0
+    for (_d, preds, realized), ret in zip(r.cross_sections, r.period_returns):
+        assert ret == pytest.approx(float(realized[_top3(preds)] @ np.array([0.6, 0.3, 0.1])))
+
+    def broken(prices, picks, idx):
+        raise ValueError("no")
+    base = run_purged_walk_forward(planted_signal_prices, **KW)
+    f = run_purged_walk_forward(planted_signal_prices, weight_fn=broken, **KW)
+    pd.testing.assert_series_equal(f.period_returns, base.period_returns)
+    assert f.weight_fallbacks == len(f.period_returns)
+
+    def concentrated(prices, picks, idx):                     # capped like live orders
+        return pd.Series([1.0, 0.0, 0.0], index=picks)
+    c = run_purged_walk_forward(planted_signal_prices, weight_fn=concentrated,
+                                record_cross_sections=True, **KW)
+    w = cap_weights(pd.Series([1.0, 0.0, 0.0], index=list("abc")), 2 / 3).to_numpy()
+    assert w == pytest.approx([2 / 3, 1 / 6, 1 / 6])
+    for (_d, preds, realized), ret in zip(c.cross_sections, c.period_returns):
+        assert ret == pytest.approx(float(realized[_top3(preds)] @ w))
+
+
+def test_max_pick_correlation_never_holds_a_clone_next_to_its_twin(planted_signal_prices):
+    px = planted_signal_prices.copy()
+    rng = np.random.default_rng(0)
+    twins = {"S00": "S00X", "S01": "S01X", "S02": "S02X"}
+    for a, b in twins.items():
+        px[b] = px[a] * (1 + rng.normal(0, 5e-4, len(px)))
+    mirror = {**twins, **{v: k for k, v in twins.items()}}
+    plain = run_purged_walk_forward(px, record_cross_sections=True, **KW)
+    together = sum(any(mirror.get(t) in top for t in top)
+                   for _d, p, _r in plain.cross_sections for top in [_top3(p)])
+    assert together > 0                      # without the guard twins ARE bought together
+    r = run_purged_walk_forward(px, max_pick_correlation=0.95,
+                                record_cross_sections=True, **KW)
+    assert len(r.period_returns) == len(plain.period_returns)
+    for (_d, preds, realized), ret in zip(r.cross_sections, r.period_returns):
+        # independent re-derivation: walk the ranking, never take a twin
+        picks: list[str] = []
+        for t in preds.sort_values(ascending=False).index:
+            if mirror.get(t) not in picks:
+                picks.append(t)
+            if len(picks) == 3:
+                break
+        assert ret == pytest.approx(float(realized[picks].mean()))
+    assert not r.period_returns.equals(plain.period_returns)
+
+
+def test_model_type_is_plumbed_into_every_fold(synthetic_prices):
+    kw = {"test_window_days": 20, "purge_days": 5, "embargo_days": 5, "rebalance_days": 5,
+          "forward_return_days": 5, "top_n": 3, "min_train_days": 70, "model_alpha": 1.0,
+          "random_seed": 42}
+    assert len(run_purged_walk_forward(synthetic_prices, model_type="gbm", **kw).folds) > 0
+    with pytest.raises(ValueError):
+        run_purged_walk_forward(synthetic_prices, model_type="lstm", **kw)

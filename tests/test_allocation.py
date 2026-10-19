@@ -217,3 +217,70 @@ def test_hold_all_drops_unaffordable_and_respreads_budget(synthetic_prices,
     assert len(alloc.orders) == data.shape[1] - 1
     assert (alloc.orders["shares"] > 0).all()
     assert alloc.orders["target_weight"].round(4).nunique() == 1
+
+
+# ------------------------------------- v4.20: factor weighting, twin guard
+import numpy as np
+import pandas as pd
+
+
+def _two_group_prices(n=600, seed=4):
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2023-01-02", periods=n)
+    f1, f2 = rng.normal(0.0002, 0.010, n), rng.normal(0.0002, 0.020, n)
+    cols, groups = {}, {}
+    for i in range(6):
+        cols[f"A{i}"], groups[f"A{i}"] = f1 + rng.normal(0, 0.001, n), "ga"
+        cols[f"B{i}"], groups[f"B{i}"] = f2 + rng.normal(0, 0.001, n), "gb"
+    return pd.DataFrame({k: 100 * np.cumprod(1 + v) for k, v in cols.items()},
+                        index=idx), groups
+
+
+def test_factor_weighting_sizes_by_factor_risk_and_reports_it(trained_model):
+    model = trained_model
+    px, groups = _two_group_prices()
+    alloc = generate_allocation(px, model, top_n=4, balance=100_000, hold_all=True,
+                                weighting="factor", factor_groups=groups)
+    assert alloc.factor_risk is not None
+    w = alloc.orders["target_weight"]
+    # the low-vol group (A) carries twice the money for equal factor risk
+    assert w[[t for t in w.index if t.startswith("A")]].sum() == pytest.approx(2 / 3, abs=0.05)
+    assert alloc.total_deployed <= 100_000
+    assert alloc.factor_risk.contributions["ga"] == pytest.approx(0.5, abs=0.05)
+    assert "idiosyncratic" in alloc.factor_risk.summary()
+
+
+def test_factor_weighting_falls_back_to_equal_without_groups(trained_model, caplog):
+    model = trained_model
+    px, _groups = _two_group_prices()
+    alloc = generate_allocation(px, model, top_n=4, balance=100_000, hold_all=True,
+                                weighting="factor")
+    assert alloc.factor_risk is None
+    assert alloc.orders["target_weight"].round(6).nunique() == 1
+    assert "falling back to equal weight" in caplog.text
+
+
+def test_invalid_weighting_is_rejected(synthetic_prices, trained_model):
+    model = trained_model
+    with pytest.raises(ValueError):
+        generate_allocation(synthetic_prices, model, top_n=3, balance=100_000,
+                            weighting="markowitz")   # type: ignore[arg-type]
+
+
+def test_live_correlation_cap_keeps_twins_apart(synthetic_prices, trained_model):
+    model = trained_model
+    px = synthetic_prices.copy()
+    rng = np.random.default_rng(1)
+    for t in list(px.columns):
+        px[t + "X"] = px[t] * (1 + rng.normal(0, 5e-4, len(px)))     # a clone of every name
+    base = generate_allocation(px, model, top_n=4, balance=100_000)
+    held = set(base.orders.index)
+    assert any(t + "X" in held for t in held)       # without the guard: twins together
+    alloc = generate_allocation(px, model, top_n=4, balance=100_000,
+                                max_pick_correlation=0.95)
+    held = list(alloc.orders.index)
+    assert len(held) == 4
+    assert not any(t + "X" in held or (t.endswith("X") and t[:-1] in held) for t in held)
+    # hold-all sleeves are never filtered: they hold the basket as given
+    assert len(generate_allocation(px, model, top_n=4, balance=100_000, hold_all=True,
+                                   max_pick_correlation=0.95).orders) == 16

@@ -1,5 +1,104 @@
 # Changelog
 
+## 4.20.0 (2026-10-19) -- data guard, near-duplicate guard, factor-risk weights, learner head-to-head
+Root-cause fixes for the ETF sleeve's bad 2026-10-19 run, each behind a
+pre-declared rule; the live strategy is unchanged until a rule says switch.
+- FIX (data.py): Yahoo rate-limited 780 of 2,281 symbols in the bulk download
+  (HTTP 429 per symbol, no exception) and the empty columns were CACHED for
+  12 hours: the ETF sleeve ran on 1,039 of ~1,700 instruments and only 5 of
+  its 13 core ETFs, the stock sleeve on 381 of 587. Now: symbols that come
+  back empty are re-fetched in batches of 50 with a growing pause (3 rounds);
+  a cached frame with empty columns is repaired in place on the next run; and
+  a download still missing more than `max_missing_fraction` (10%) of the
+  universe is refused and never cached (`UMUSHROOM_MAX_MISSING_FRACTION` for a
+  deliberately degraded research run).
+- FIX (data.py): a missing FX pair drops only the instruments that need it
+  instead of aborting the run (carried over from the uncommitted 10-19 fix).
+- Near-duplicate guard `max_pick_correlation` (selection.py): the 10-19 ETF
+  picks held two MSCI Korea trackers (1-year return correlation 0.99) and
+  three USD high-yield funds (0.6-0.92) -- eight slots, about four bets. A
+  candidate whose trailing-252-day return correlation with a name already
+  picked exceeds the threshold is skipped for the next-ranked name; causal,
+  applied identically in the walk-forward and in live orders; near-duplicates
+  are used last only if the universe cannot fill top_n. Off by default;
+  `--compare-dedup SLEEVE:0.9,0.95` is the head-to-head (rule: keep >= 75%
+  of alpha and do not raise weekly VaR).
+- `weighting: factor` (new factor_risk.py): factor-risk parity. Factors are
+  the sleeve's group averages (asset classes for ETFs, exchanges for stocks);
+  each pick's betas and residual variance come from a trailing-year OLS; the
+  factor COVARIANCE (the factors' correlation, not just their variances)
+  prices every exposure; weights make the factor risk contributions match
+  the budgets (equal by default; Roncalli & Weisang 2016), long-only, capped
+  at 2x equal weight like every scheme and floored at 0.25x so every pick
+  stays investable. A group whose average moves less than 0.05% a day (the
+  money-market ETFs) is not a factor: as a regressor it blew betas up to
+  +7.7 in the first live run. Falls back to equal weight with a warning
+  when the book is exposed to fewer than two factors. Exposures and
+  contributions are printed and shown on the website. A held-all basket
+  (`selection: all`, or `auto` holding the core ETFs) is ALWAYS equal
+  weight -- that is what the benchmark, the report's held curve and the
+  Monte Carlo assume; hrp/factor apply to the model's picks.
+- The purged walk-forward now scores the CONFIGURED weighting scheme
+  (`weight_fn`), capped exactly as live orders are. Before 4.20 HRP could be
+  traded but was never backtested. `--compare-weighting SLEEVE:equal,hrp,factor`.
+- `model_type: ridge | mlp | gbm` (model.py) behind the unchanged
+  RankingModel interface: a one-hidden-layer neural network (32 units) with
+  early stopping judged on the latest tenth of the training DATES (purged, no
+  random row split) and histogram gradient boosting with fixed rounds. Every
+  hyper-parameter is a module constant fixed before any result was seen.
+  Permutation importance (drop in training IC) replaces coefficients for the
+  non-linear learners. `--compare-model SLEEVE:ridge,mlp,gbm` (rule: IC t >= 2,
+  then the highest contest-window active t; ties to the simpler model). Why
+  no LSTM/CNN: see model.py's docstring.
+- One `_walk_forward_kwargs` builder feeds the headline backtest, the
+  contest-window evaluation, every head-to-head and the validation suite, so
+  the learner, caps, guard and weighting can never differ between them.
+- cap_weights moved to portfolio_construction.py (shared) and no longer
+  returns NaN when the uncapped names all have zero weight.
+- Website: ETFs tab shows the learner, weighting scheme and guard in force;
+  Risk tab shows the factor-risk decomposition of each sleeve sized by it.
+- Learner rule: a learner other than the current one must also show a
+  contest-window active t >= 2 (window.py's PASS bar) to be adopted -- added
+  after the first ETF comparison produced a "winner" at t = +0.34 vs -0.18.
+  `cli.skill_verdict` is a pure, unit-tested function.
+- Top-level `weighting:` sets the stock sleeve's scheme from config (the
+  GitHub run passes no --weighting flag).
+- 58 new tests (batched re-fetch, cache repair, guard thresholds, twin guard
+  in backtest and live, closed-form factor-parity answers, causality,
+  learner round-trips and date-purged early stopping, config, CLI flags,
+  the learner rule).
+
+RESULTS of the pre-declared head-to-heads on the repaired data
+(2026-10-19, 568 stocks / 1,590 ETFs, 30-day test folds, ridge unless stated):
+- Data repair: 780 empty symbols re-fetched in one 26-second round; the
+  stock sleeve went from 381 to 568 instruments, the ETF sleeve from 1,039
+  (5 core) to 1,590 (12 core).
+- ETF sleeve on the FULL universe: walk-forward IC t +1.93 (21-day folds) /
+  +3.21 (30-day folds), active return ~0, alpha -0.4%/yr, 6-week win 56%:
+  `auto` holds the core basket. The IC t of +2.71 reported on the damaged
+  cache was a property of the missing 40%, not of the model.
+- ETF weighting (final, with the factor-vol and weight floors): factor
+  +2.7%/yr (t 0.54), win 62%, VaR 2.85% vs equal -0.4%, 56%, 2.86% ->
+  ADOPTED (`weighting: factor`): keeps the alpha, does not raise VaR; hrp
+  -0.9%, VaR 1.98% lost alpha. (The first run, before the floors, showed
+  +9.1% -- partly the degenerate exposures the floors now prevent.)
+- ETF learner: mlp 6-week t +0.34, ridge -0.18, gbm -0.30 -> no reliable
+  edge, ridge kept. ETF guard 0.90/0.95: no improvement -> off.
+- ETF validation suite (informational, run with gbm): placebo FAIL (active
+  -0.08%/period beat 5/20 shuffled runs, p = 0.76), deciles ordered but
+  +0.09%/period top-minus-bottom, 8/9 years, markets mixed, 488 names
+  picked. The ranking is faintly real and does not beat holding every ETF:
+  `auto` holding the core basket is the right outcome, not a failure.
+- Stock learner: gbm 6-week active t +3.95, alpha +24.2%/yr (t 3.92), win
+  71%, VaR 3.99% vs ridge +2.07, +9.2% (t 1.91), 69%, 3.16% -> rule says gbm.
+  Validation suite with gbm: 7/7 PASS (placebo beat 20/20 shuffled runs,
+  p = 0.048; deciles ordered, rank corr 0.89; IC positive 9/9 years; LSE,
+  SIX and US all positive; active +0.44%/period at delay 0, +0.26% at a
+  1-day delay; 526 names picked, max 10%) -> ADOPTED (`model_type: gbm`).
+- Stock weighting: hrp +11.9%/yr (t 2.65), VaR 2.54% vs equal +9.2%, 3.16%
+  -> ADOPTED (`weighting: hrp`); factor +6.4%, VaR 3.66% (too coarse for
+  stocks). Stock guard: VaR up 0.05-0.07pp -> off.
+
 ## 4.19.0 (2026-10-12) -- ETF model over the whole UMushroom ETF universe
 - ETF sleeve is now a model sleeve: `feature_set: etf` (13 trend /
   asset-class momentum factors), ranked within UMushroom's asset classes,

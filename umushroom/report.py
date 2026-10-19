@@ -58,6 +58,11 @@ class SleeveReport:
     # today's model scores over the WHOLE sleeve universe (even when the
     # sleeve ends up holding the core basket), for the ranking tables
     scores: pd.Series | None = None
+    # ---- v4.20 ----
+    model_type: str = "ridge"               # ridge | mlp | gbm
+    weighting: str = "equal"                # equal | hrp | factor
+    max_pick_correlation: float | None = None   # near-duplicate guard, None = off
+    factor_risk: dict | None = None         # factor_risk_payload(), when sized by it
 
 
 def _clean(v: Any) -> Any:
@@ -150,6 +155,20 @@ def _window_payload(w: WindowResult | None) -> dict | None:
     }
 
 
+def factor_risk_payload(fr: Any) -> dict:
+    """JSON-ready view of a factor_risk.FactorRisk (v4.20)."""
+    factors = [str(f) for f in fr.budgets.index]
+    return {
+        "factors": factors,
+        "contributions": {f: _clean(fr.contributions.get(f)) for f in factors},
+        "budgets": {f: _clean(fr.budgets[f]) for f in factors},
+        "idiosyncratic_share": _clean(fr.idiosyncratic_share),
+        "weights": {str(t): _clean(w) for t, w in fr.weights.items()},
+        "exposures": {str(t): {f: _clean(fr.exposures.loc[t, f]) for f in factors}
+                      for t in fr.weights.index},
+    }
+
+
 def _sleeve_payload(s: SleeveReport, periods_per_year: float) -> dict:
     out: dict[str, Any] = {"name": s.name, "weight": s.weight, "selection": s.selection,
                            "alpha": _clean(s.alpha_annual), "alpha_t": _clean(s.alpha_t),
@@ -163,7 +182,10 @@ def _sleeve_payload(s: SleeveReport, periods_per_year: float) -> dict:
                            "universe_status": dict(s.universe_status),
                            "universe_missing": s.universe_missing,
                            "contest_window_days": s.contest_window_days,
-                           "window": _window_payload(s.window)}
+                           "window": _window_payload(s.window),
+                           "model_type": s.model_type, "weighting": s.weighting,
+                           "max_pick_correlation": _clean(s.max_pick_correlation),
+                           "factor_risk": s.factor_risk}
     r = s.backtest
     if r is None or len(r.period_returns) == 0:
         return out
@@ -860,6 +882,11 @@ def _etf_section(payload: dict) -> str:
             _tile("Forecast horizon",
                   f"{s.get('horizon_days') or '?'} trading days",
                   f"inside the {s.get('contest_window_days') or '?'}-day contest window"),
+            _tile("Learner and weights",
+                  f"{s.get('model_type') or 'ridge'} / {s.get('weighting') or 'equal'}",
+                  ("near-duplicate guard: max correlation "
+                   f"{s['max_pick_correlation']:.2f}"
+                   if s.get("max_pick_correlation") else "near-duplicate guard off")),
         ]
         if s.get("ic") is not None:
             tiles.append(_tile("Ranking skill (out of sample)",
@@ -1006,9 +1033,39 @@ def _var_backtest_card(bt: dict) -> str:
             f"<b>95% VaR held up out of sample</b>: {_esc(detail)}</li></ul></div>")
 
 
+def _factor_risk_block(payload: dict) -> str:
+    """v4.20: the factor-risk decomposition of every sleeve sized by
+    `weighting: factor` -- which factor carries how much of the risk, and
+    each pick's exposures."""
+    parts: list[str] = []
+    for s in payload.get("sleeves", []):
+        fr = s.get("factor_risk")
+        if not fr:
+            continue
+        factors = list(fr.get("factors") or [])
+        parts.append(f'<h3 class="sec">Factor risk: {_esc(_label(s["name"]))} sleeve</h3>')
+        parts.append('<p class="note">Weights were set so that each risk factor (the '
+                     "average of its group in the sleeve's universe) contributes its "
+                     "budgeted share of the picks' systematic risk, using the factors' "
+                     "full covariance. Exposures are 1-year betas.</p>")
+        idio = fr.get("idiosyncratic_share")
+        rows = [[f, f"{(fr['contributions'].get(f) or 0):.1%}",
+                 f"{(fr['budgets'].get(f) or 0):.1%}"] for f in factors]
+        parts.append(_plain_table(["Factor", "Share of systematic risk", "Budget"], rows))
+        if idio is not None:
+            parts.append(f'<p class="note">Not explained by the factors (idiosyncratic): '
+                         f"{idio:.1%} of total variance.</p>")
+        picks = list((fr.get("weights") or {}).items())
+        rows = [[t, f"{w:.1%}"] + [f"{(fr['exposures'].get(t) or {}).get(f) or 0:+.2f}"
+                                  for f in factors] for t, w in picks]
+        parts.append(_plain_table(["Pick", "Weight"] + [f"beta {f}" for f in factors], rows))
+    return "".join(parts)
+
+
 def _risk_section(payload: dict) -> str:
     risk = payload.get("risk")
     ccy = payload["meta"].get("base_currency", "")
+    factor_block = _factor_risk_block(payload)
     out = ["<h2>Value at Risk</h2>",
            ('<p class="note"><b>VaR 95%</b>: in 19 weeks out of 20 the portfolio should '
             "lose less than this. <b>Expected shortfall (ES) 95%</b>: in the worst 1 week "
@@ -1016,7 +1073,8 @@ def _risk_section(payload: dict) -> str:
             "says where the bad tail starts, not how deep it goes.</p>")]
     if not risk:
         return "".join(out) + ('<p class="note">Not enough out-of-sample history in this '
-                               "run to estimate VaR (needs at least 20 weeks).</p>")
+                               "run to estimate VaR (needs at least 20 weeks).</p>"
+                               + factor_block)
     v, wk, hz = risk.get("value"), risk.get("weekly"), risk.get("horizon")
     tiles = []
     if wk:
@@ -1075,6 +1133,7 @@ def _risk_section(payload: dict) -> str:
             ["Sleeve", "Weeks", "VaR 95%", "ES 95%", "VaR 99%", "ES 99%"],
             [[_label(x["name"]), str(x["n"]), f"{x['var95']:.1%}", f"{x['es95']:.1%}",
               f"{x['var99']:.1%}", f"{x['es99']:.1%}"] for x in risk["sleeves"]])]
+    out.append(factor_block)
     return "".join(out)
 
 

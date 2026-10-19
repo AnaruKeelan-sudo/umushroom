@@ -137,3 +137,77 @@ sector_file: "s.csv"
                                      + "max_per_sector: 3\n")
     with pytest.raises(ConfigError):
         load_config(tmp_path / "e.yaml")
+
+
+# ------------------------------------------------ v4.20 near-duplicate guard
+import numpy as np
+import pandas as pd
+
+from umushroom.selection import correlation_filter
+
+
+def _clones_and_others(n=400, seed=5):
+    """A, A2 move together (rho ~ 0.99); B, C, D are independent; NEW listed
+    only 30 days ago (not judgeable)."""
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2024-01-01", periods=n)
+    base = rng.normal(0, 0.01, n)
+    r = {"A": base, "A2": base + rng.normal(0, 0.001, n),
+         "B": rng.normal(0, 0.01, n), "C": rng.normal(0, 0.01, n),
+         "D": rng.normal(0, 0.01, n), "NEW": rng.normal(0, 0.01, n)}
+    px = pd.DataFrame({k: 100 * np.cumprod(1 + v) for k, v in r.items()}, index=idx)
+    px.loc[px.index[:-30], "NEW"] = np.nan
+    return px
+
+
+def test_near_duplicate_is_skipped_for_the_next_ranked_name():
+    px = _clones_and_others()
+    sim = correlation_filter(px, len(px) - 1, max_correlation=0.9)
+    assert sim("A2", ["A"]) and not sim("B", ["A"]) and not sim("A", [])
+    assert capped_top(["A", "A2", "B", "C", "D"], 3, too_similar=sim) == ["A", "B", "C"]
+    # combined with the sector cap: both constraints hold
+    sect = {"A": "s1", "A2": "s1", "B": "s1", "C": "s2", "D": "s2"}
+    assert capped_top(["A", "A2", "B", "C", "D"], 3, sect, 1, too_similar=sim) == \
+        ["A", "C", "B"]
+
+
+def test_duplicates_fill_last_only_when_nothing_else_is_left():
+    px = _clones_and_others()
+    sim = correlation_filter(px, len(px) - 1, max_correlation=0.9)
+    # only A, A2 and B exist: a 3-name book must take the clone, last
+    assert capped_top(["A", "A2", "B"], 3, too_similar=sim) == ["A", "B", "A2"]
+    sect = {"A": "s1", "A2": "s1", "B": "s2"}
+    # sector-capped names top up BEFORE near-duplicates
+    assert capped_top(["A", "A2", "B", "C"], 4, sect, 1, too_similar=sim) == \
+        ["A", "B", "C", "A2"]
+
+
+def test_unjudgeable_pairs_are_allowed_and_unknown_names_pass():
+    px = _clones_and_others()
+    sim = correlation_filter(px, len(px) - 1, max_correlation=0.9)
+    assert not sim("NEW", ["A", "B"])          # 30 days of overlap < MIN_CORR_OBS
+    assert not sim("ZZZ", ["A"])               # not in the price frame
+
+
+def test_correlation_filter_is_causal():
+    """The predicate at idx must not change when future rows are appended
+    or altered -- same discipline as the no-lookahead feature test."""
+    px = _clones_and_others()
+    idx = 300
+    future = px.copy()
+    future.iloc[idx + 1:] *= 3.0                   # corrupt everything after idx
+    a = correlation_filter(px, idx, 0.9)
+    b = correlation_filter(future, idx, 0.9)
+    c = correlation_filter(px.iloc[: idx + 1], idx, 0.9)
+    for cand, picks in (("A2", ["A"]), ("B", ["A"]), ("C", ["A", "B"])):
+        assert a(cand, picks) == b(cand, picks) == c(cand, picks)
+
+
+def test_correlation_filter_rejects_bad_arguments():
+    px = _clones_and_others()
+    with pytest.raises(ValueError):
+        correlation_filter(px, len(px) - 1, 0.0)
+    with pytest.raises(ValueError):
+        correlation_filter(px, len(px) - 1, 1.5)
+    with pytest.raises(ValueError):
+        correlation_filter(px, len(px), 0.9)

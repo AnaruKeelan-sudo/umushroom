@@ -10,6 +10,7 @@ library (e.g. from a notebook) without side effects.
 from __future__ import annotations
 
 import argparse
+import functools
 import math
 import sys
 from pathlib import Path
@@ -24,11 +25,14 @@ from umushroom.allocation import Allocation, WeightingScheme, generate_allocatio
 from umushroom.backtest import run_backtest
 from umushroom.config import (
     EQUITY_SLEEVE,
+    WEIGHTINGS,
     SleeveConfig,
     StrategyConfig,
     load_config,
     load_sectors,
     sleeve_horizon,
+    sleeve_model_type,
+    sleeve_pick_correlation,
 )
 from umushroom.exceptions import DataError, InsufficientHistoryError, UMushroomError
 from umushroom.factor_regression import (
@@ -36,13 +40,25 @@ from umushroom.factor_regression import (
     fama_french_alpha,
     fetch_french_factors,
 )
+from umushroom.factor_risk import factor_weight
 from umushroom.features import hierarchical_groups
 from umushroom.logging_config import configure_logging, get_logger
-from umushroom.model import RankingModel
+from umushroom.model import MODEL_TYPES, RankingModel
 from umushroom.montecarlo import combine_sleeves, simulate
+from umushroom.portfolio_construction import hrp_weight
 from umushroom.prediction_log import evaluate_latest_predictions, log_predictions
-from umushroom.purged_backtest import PurgedWalkForwardResult, run_purged_walk_forward
-from umushroom.report import SleeveReport, build_payload, stock_snapshot, write_report
+from umushroom.purged_backtest import (
+    PurgedWalkForwardResult,
+    WeightFn,
+    run_purged_walk_forward,
+)
+from umushroom.report import (
+    SleeveReport,
+    build_payload,
+    factor_risk_payload,
+    stock_snapshot,
+    write_report,
+)
 from umushroom.risk import var_es
 from umushroom.robustness import bootstrap_sharpe
 from umushroom.selection import (
@@ -54,7 +70,13 @@ from umushroom.selection import (
 )
 from umushroom.universe import check_concentration
 from umushroom.validation import ValidationReport, decile_returns, run_validation
-from umushroom.window import FAIL, WindowResult, contest_windows, window_periods_for
+from umushroom.window import (
+    FAIL,
+    WINDOW_T_THRESHOLD,
+    WindowResult,
+    contest_windows,
+    window_periods_for,
+)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -84,9 +106,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Skip evaluating the previous run's prediction accuracy.",
     )
     parser.add_argument(
-        "--weighting", choices=["equal", "hrp"], default="equal",
-        help="Portfolio weighting scheme for today's allocation: "
-             "'equal' (default, 1/N) or 'hrp' (Hierarchical Risk Parity).",
+        "--weighting", choices=list(WEIGHTINGS), default="equal",
+        help="Portfolio weighting scheme for sleeves without their own: "
+             "'equal' (default, 1/N), 'hrp' (Hierarchical Risk Parity) or "
+             "'factor' (v4.20 factor-risk parity, factor_risk.py). The walk-forward "
+             "backtest scores the same scheme.",
     )
     parser.add_argument(
         "--fama-french", action="store_true",
@@ -102,6 +126,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="v4.19: head-to-head of forecast horizons for one sleeve on identical "
              "data, e.g. etf:5,10,21, judged by the contest-window rule declared in "
              "window.py. Every horizon must fit inside contest_window_days.")
+    parser.add_argument(
+        "--compare-model", metavar="SLEEVE:TYPE,TYPE,...", default=None,
+        help="v4.20: head-to-head of learners (ridge, mlp, gbm) for one sleeve on "
+             "identical data, e.g. etf:ridge,mlp,gbm, judged by the contest-window "
+             "rule; ties go to the simpler model.")
+    parser.add_argument(
+        "--compare-weighting", metavar="SLEEVE:SCHEME,SCHEME,...", default=None,
+        help="v4.20: head-to-head of weighting schemes (equal, hrp, factor) for one "
+             "sleeve, e.g. etf:equal,hrp,factor. Rule: adopt a scheme only if it keeps "
+             ">= 75%% of equal weight's alpha AND does not raise the weekly 95%% VaR.")
+    parser.add_argument(
+        "--compare-dedup", metavar="SLEEVE:CORR,CORR,...", default=None,
+        help="v4.20: head-to-head of the near-duplicate guard, e.g. etf:0.9,0.95 "
+             "(max trailing return correlation between two picks) vs. no guard. "
+             "Same rule as --compare-weighting.")
     parser.add_argument(
         "--compare-baseline", action="store_true",
         help="Also run the v4.3 equity setup on the same data and print a "
@@ -172,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
             calendar_tickers=cfg.tickers,
             ragged=cfg.ragged_history,
             yahoo_symbols=cfg.yahoo_symbols,
+            max_missing_fraction=cfg.max_missing_fraction,
         )
         prices = market.prices
         print(f"\nData: {prices.shape[1]} instruments, {len(prices)} trading days "
@@ -426,15 +466,29 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
     horizon = sleeve_horizon(cfg, sleeve)
     print(f"Forecast horizon: {horizon} trading days (rebalanced every "
           f"{cfg.rebalance_days}; contest window {cfg.contest_window_days})")
+    # v4.20: learner, weighting scheme and near-duplicate guard are decided
+    # here ONCE and used identically by the backtests and the live orders
+    model_type = sleeve_model_type(cfg, sleeve)
+    pick_corr = sleeve_pick_correlation(cfg, sleeve)
+    weighting = cast(WeightingScheme, sleeve.weighting or args.weighting)
+    if weighting == "factor" and not groups:
+        print("NOTE: weighting 'factor' needs ranking groups (exchange or asset class) "
+              "to build the factors; this sleeve has none -- using equal weight.")
+        weighting = "equal"
+    weight_fn = _weight_fn_for(weighting, groups)
+    print(f"Model: {model_type}; weighting: {weighting}; near-duplicate guard: "
+          + (f"max correlation {pick_corr:.2f}" if pick_corr else "off"))
+    wf = _walk_forward_kwargs(cfg, sleeve, groups, dvol, cap_groups, cap_n, weight_fn)
     X, y = features_mod.build_training_set(
         prices, forward_return_days=horizon, step=cfg.rebalance_days,
         min_history_days=cfg.min_history_days, target=cfg.target, groups=groups,
         dollar_volume=dvol, feature_set=sleeve.feature_set)
-    model = RankingModel(alpha=cfg.model_alpha, random_seed=cfg.random_seed)
-    cv_stats = model.cross_validate(
-        X, y, purge_dates=math.ceil(horizon / cfg.rebalance_days))
+    purge_dates = math.ceil(horizon / cfg.rebalance_days)
+    model = RankingModel(alpha=cfg.model_alpha, random_seed=cfg.random_seed,
+                         model_type=model_type, purge_dates=purge_dates)
+    cv_stats = model.cross_validate(X, y, purge_dates=purge_dates)
     model.fit(X, y)
-    print("\n--- Feature importance (Ridge coefficients) ---")
+    print(f"\n--- Feature importance ({model.importance_label}) ---")
     print(model.feature_importance().to_string())
     print(f"\nCross-validated IC: {cv_stats['ic_mean']:+.4f} "
           f"(t = {cv_stats['ic_tstat']:+.2f} over {int(cv_stats['ic_n_dates'])} dates)")
@@ -456,13 +510,14 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
                         n_instruments=len(cols), n_core=len(core_cols),
                         universe_status=dict(sleeve.universe_status),
                         universe_missing=sleeve.universe_missing,
-                        contest_window_days=cfg.contest_window_days)
+                        contest_window_days=cfg.contest_window_days,
+                        model_type=model_type, weighting=weighting,
+                        max_pick_correlation=pick_corr)
     if collect is not None:
         collect[sleeve.name] = info
     pwf: PurgedWalkForwardResult | None = None
     if not args.skip_purged_backtest:
-        pwf = _report_out_of_sample(cfg, args, sleeve, prices, groups, dvol, cap_groups,
-                                    cap_n)
+        pwf = _report_out_of_sample(cfg, args, sleeve, prices, wf)
         if pwf is not None:
             info.backtest = pwf
             try:
@@ -471,24 +526,31 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
                 info.alpha_annual, info.alpha_t = a.alpha_annualized, a.alpha_tstat
             except ValueError:
                 pass
-            info.window = _report_contest_window(cfg, pwf, sleeve, prices, groups, dvol,
-                                                 cap_groups, cap_n)
+            info.window = _report_contest_window(cfg, pwf, sleeve, prices, wf)
         if args.compare_baseline and sleeve.name == EQUITY_SLEEVE:
-            _compare_with_baseline(cfg, sleeve, prices, listings, groups, dvol)
+            _compare_with_baseline(cfg, sleeve, prices, listings, wf)
         if args.compare_sector_cap and sleeve.name == EQUITY_SLEEVE:
             if sectors is None:
                 print("\nSector-cap comparison skipped: no sector_file in config.")
             else:
-                compare_sector_cap(cfg, sleeve, prices, groups, dvol, sectors,
+                compare_sector_cap(cfg, sleeve, prices, wf, sectors,
                                    args.compare_sector_cap)
         if args.compare_horizon:
             name, _, days = str(args.compare_horizon).partition(":")
             if name == sleeve.name:
-                compare_horizons(cfg, sleeve, prices, groups, dvol, cap_groups, cap_n,
+                compare_horizons(cfg, sleeve, prices, wf,
                                  [int(d) for d in days.split(",") if d.strip()])
+        for flag, fn in (("compare_model", compare_models),
+                         ("compare_weighting", compare_weightings),
+                         ("compare_dedup", compare_dedup)):
+            spec = getattr(args, flag, None)
+            if spec:
+                name, _, items = str(spec).partition(":")
+                if name == sleeve.name:
+                    fn(cfg, sleeve, prices, wf, groups,
+                       [x.strip() for x in items.split(",") if x.strip()])
     if args.validate and sleeve.selection in ("model", "auto"):
-        vr = _run_validation(cfg, args, sleeve, prices, listings, groups, dvol,
-                             cap_groups, cap_n)
+        vr = _run_validation(cfg, args, sleeve, prices, listings, wf, cap_groups, cap_n)
         info.validation = [(c.name, c.status, c.detail) for c in vr.checks]
 
     # v4.19 "auto": trade the model's picks only while the out-of-sample
@@ -506,19 +568,25 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
             raise DataError(f"sleeve '{sleeve.name}': auto fallback needs core "
                             f"instruments with data; none usable today")
         alloc_prices, alloc_cols = prices[core_cols], core_cols
-    weighting = cast(WeightingScheme, sleeve.weighting or args.weighting)
     stale_here = sorted(market.stale_last & set(alloc_cols))
     if hold_all and stale_here:
         print(f"NOTE: no fresh close yet for {stale_here}; sizing them on the "
               f"previous close. Check their prices on UMushroom when entering.")
+    # v4.20: a held-all basket is EQUAL weight whatever the sleeve's scheme --
+    # that is what the walk-forward benchmark, the report's "what is actually
+    # held" curve and the Monte Carlo assume, and the only sizing of the core
+    # basket that has been evaluated. hrp/factor apply to the model's picks.
+    alloc_weighting: WeightingScheme = "equal" if hold_all else weighting
     if hold_all:
         print(f"\nSelection: holding ALL {len(alloc_cols)} "
               f"{'core ' if sleeve.selection == 'auto' else ''}instruments "
-              f"({weighting} weight); the model above is reported but does not pick.")
+              f"(equal weight); the model above is reported but does not pick."
+              + (f" (weighting '{weighting}' applies to model picks only)"
+                 if weighting != "equal" else ""))
     alloc = generate_allocation(
         alloc_prices, model, top_n=sleeve.top_n, hold_all=hold_all,
         balance=cfg.starting_balance * sleeve.weight,
-        weighting=weighting, groups=groups,
+        weighting=alloc_weighting, groups=groups,
         local_prices=market.local_prices[alloc_cols],
         currencies={t: listings[t].currency for t in alloc_cols},
         fractional=sleeve.fractional,
@@ -533,7 +601,14 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
         exclude=(frozenset() if hold_all
                  else frozenset(market.stale_last & set(alloc_cols))),
         feature_set=sleeve.feature_set,
+        max_pick_correlation=pick_corr,
+        factor_groups=groups,
+        factor_prices=prices,          # the factors come from the WHOLE sleeve
     )
+    if alloc.factor_risk is not None:
+        print("\n--- Factor-risk weights (v4.20) ---")
+        print(alloc.factor_risk.summary())
+        info.factor_risk = factor_risk_payload(alloc.factor_risk)
     log_predictions(log_path=log_path, run_date=prices.index[-1],
                     all_scores=alloc.all_scores, prices=prices.iloc[-1],
                     picked_tickers=set(alloc.orders.index))
@@ -584,6 +659,46 @@ def decide_selection(sleeve: SleeveConfig, pwf: PurgedWalkForwardResult | None,
                   f"{sleeve.top_n}")
 
 
+def _weight_fn_for(weighting: str, groups: dict[str, str] | None) -> WeightFn | None:
+    """The weighting scheme as a (prices, picks, as_of_idx) -> weights function
+    for the walk-forward; None = equal weight."""
+    if weighting == "hrp":
+        return hrp_weight
+    if weighting == "factor":
+        return functools.partial(factor_weight, groups=groups or {})
+    return None
+
+
+def _walk_forward_kwargs(cfg: StrategyConfig, sleeve: SleeveConfig,
+                         groups: dict[str, str] | None, dvol: pd.DataFrame | None,
+                         cap_groups: dict[str, str] | None, cap_n: int | None,
+                         weight_fn: WeightFn | None) -> dict[str, Any]:
+    """ONE definition of how a sleeve is evaluated out of sample, shared by
+    the headline backtest, the contest-window evaluation, every head-to-head
+    and the validation suite -- so they cannot drift apart."""
+    horizon = sleeve_horizon(cfg, sleeve)
+    return {
+        "test_window_days": cfg.purged_test_window_days,
+        "purge_days": max(cfg.purged_purge_days, horizon),
+        "embargo_days": cfg.purged_embargo_days,
+        "rebalance_days": cfg.rebalance_days,
+        "forward_return_days": horizon,
+        "top_n": sleeve.top_n,
+        "min_train_days": cfg.purged_min_train_days,
+        "model_alpha": cfg.model_alpha,
+        "random_seed": cfg.random_seed,
+        "target": cfg.target,
+        "groups": groups,
+        "dollar_volume": dvol,
+        "sectors": cap_groups,
+        "max_per_sector": cap_n,
+        "feature_set": sleeve.feature_set,
+        "model_type": sleeve_model_type(cfg, sleeve),
+        "max_pick_correlation": sleeve_pick_correlation(cfg, sleeve),
+        "weight_fn": weight_fn,
+    }
+
+
 def _window_test_days(cfg: StrategyConfig) -> int:
     """Test-fold length for the contest-window evaluation: a window needs
     `window_periods` CONSECUTIVE rebalance periods inside one test fold
@@ -595,26 +710,15 @@ def _window_test_days(cfg: StrategyConfig) -> int:
 
 def _report_contest_window(cfg: StrategyConfig, pwf: PurgedWalkForwardResult,
                            sleeve: SleeveConfig, prices: pd.DataFrame,
-                           groups: dict[str, str] | None, dvol: pd.DataFrame | None,
-                           cap_groups: dict[str, str] | None, cap_n: int | None,
-                           ) -> WindowResult | None:
+                           wf: dict[str, Any]) -> WindowResult | None:
     periods = window_periods_for(cfg.contest_window_days, cfg.rebalance_days)
     test_days = _window_test_days(cfg)
     source = pwf
     note = ""
     if test_days > cfg.purged_test_window_days:
         # re-run the walk-forward with folds exactly one contest window long
-        horizon = sleeve_horizon(cfg, sleeve)
         try:
-            source = run_purged_walk_forward(
-                prices, test_window_days=test_days,
-                purge_days=max(cfg.purged_purge_days, horizon),
-                embargo_days=cfg.purged_embargo_days, rebalance_days=cfg.rebalance_days,
-                forward_return_days=horizon, top_n=sleeve.top_n,
-                min_train_days=cfg.purged_min_train_days, model_alpha=cfg.model_alpha,
-                random_seed=cfg.random_seed, target=cfg.target, groups=groups,
-                dollar_volume=dvol, sectors=cap_groups, max_per_sector=cap_n,
-                feature_set=sleeve.feature_set)
+            source = run_purged_walk_forward(prices, **{**wf, "test_window_days": test_days})
         except InsufficientHistoryError as e:
             print(f"\nContest-window evaluation skipped: {e}")
             return None
@@ -633,9 +737,7 @@ def _report_contest_window(cfg: StrategyConfig, pwf: PurgedWalkForwardResult,
 
 
 def compare_horizons(cfg: StrategyConfig, sleeve: SleeveConfig, prices: pd.DataFrame,
-                     groups: dict[str, str] | None, dvol: pd.DataFrame | None,
-                     cap_groups: dict[str, str] | None, cap_n: int | None,
-                     horizons: list[int]) -> int | None:
+                     wf: dict[str, Any], horizons: list[int]) -> int | None:
     """v4.19: ONE pre-declared head-to-head of forecast horizons on identical
     data. Rule (fixed before looking): keep the horizon with the highest
     contest-window active-return t-statistic among those whose walk-forward
@@ -657,14 +759,9 @@ def compare_horizons(cfg: StrategyConfig, sleeve: SleeveConfig, prices: pd.DataF
     for h in sorted(set(horizons)):
         try:
             r = run_purged_walk_forward(
-                prices, test_window_days=test_days,
-                purge_days=max(cfg.purged_purge_days, h),
-                embargo_days=cfg.purged_embargo_days, rebalance_days=cfg.rebalance_days,
-                forward_return_days=h, top_n=sleeve.top_n,
-                min_train_days=cfg.purged_min_train_days, model_alpha=cfg.model_alpha,
-                random_seed=cfg.random_seed, target=cfg.target, groups=groups,
-                dollar_volume=dvol, sectors=cap_groups, max_per_sector=cap_n,
-                feature_set=sleeve.feature_set)
+                prices, **{**wf, "test_window_days": test_days,
+                           "purge_days": max(cfg.purged_purge_days, h),
+                           "forward_return_days": h})
             w = contest_windows(r.period_returns, r.benchmark_period_returns,
                                 r.period_end_dates, periods, cfg.rebalance_days)
         except (InsufficientHistoryError, ValueError) as e:
@@ -724,27 +821,14 @@ def _sleeve_groups(cfg: StrategyConfig, sleeve: SleeveConfig,
 
 def _run_validation(cfg: StrategyConfig, args: argparse.Namespace,
                     sleeve: SleeveConfig, prices: pd.DataFrame, listings: dict,
-                    groups: dict[str, str] | None,
-                    dvol: pd.DataFrame | None,
+                    wf: dict[str, Any],
                     cap_groups: dict[str, str] | None = None,
                     cap_n: int | None = None) -> ValidationReport:
     if cap_groups is None and sleeve.max_per_sector and cfg.sector_file is not None:
         cap_groups, cap_n = load_sectors(cfg.sector_file), sleeve.max_per_sector
-    kwargs: dict[str, Any] = {
-        "test_window_days": cfg.purged_test_window_days,
-        "purge_days": max(cfg.purged_purge_days, sleeve_horizon(cfg, sleeve)),
-        "embargo_days": cfg.purged_embargo_days,
-        "rebalance_days": cfg.rebalance_days,
-        "forward_return_days": sleeve_horizon(cfg, sleeve),
-        "top_n": sleeve.top_n,
-        "min_train_days": cfg.purged_min_train_days,
-        "model_alpha": cfg.model_alpha, "random_seed": cfg.random_seed,
-        "target": cfg.target, "groups": groups, "dollar_volume": dvol,
-        # the live selection rule is what gets validated
-        "sectors": cap_groups if cap_n else None,
-        "max_per_sector": cap_n,
-        "feature_set": sleeve.feature_set,
-    }
+    # the live selection rule (caps, guard, weighting, learner) is what gets validated
+    kwargs: dict[str, Any] = {**wf, "sectors": cap_groups if cap_n else None,
+                              "max_per_sector": cap_n}
     exchanges = {t: lst.exchange for t, lst in listings.items()}
     multi_market = len(set(exchanges.values())) > 1
     is_crypto = all(lst.exchange == "Crypto" for lst in listings.values())
@@ -762,8 +846,7 @@ def _run_validation(cfg: StrategyConfig, args: argparse.Namespace,
 
 def _compare_with_baseline(cfg: StrategyConfig, sleeve: SleeveConfig,
                            prices: pd.DataFrame, listings: dict,
-                           groups: dict[str, str] | None,
-                           dvol: pd.DataFrame | None) -> None:
+                           wf: dict[str, Any]) -> None:
     """ONE pre-declared head-to-head on identical data: the v4.3 equity
     setup vs. the current one. Both are scored on the same weekly holding
     returns, so the comparison is like-for-like."""
@@ -774,6 +857,7 @@ def _compare_with_baseline(cfg: StrategyConfig, sleeve: SleeveConfig,
               "model_alpha": cfg.model_alpha, "random_seed": cfg.random_seed,
               "target": cfg.target}
     base_fwd = cfg.rebalance_days
+    dvol = wf.get("dollar_volume")
     runs = {
         "v4.3 baseline (exch-neutral, 5d, top 10, no volume)": run_purged_walk_forward(
             prices, purge_days=max(base_fwd, cfg.rebalance_days),
@@ -782,9 +866,7 @@ def _compare_with_baseline(cfg: StrategyConfig, sleeve: SleeveConfig,
         f"current ({sleeve_horizon(cfg, sleeve)}d, top {sleeve.top_n}"
         f"{', sector' if sleeve.neutralize_by_sector else ''}"
         f"{', volume' if dvol is not None else ''})": run_purged_walk_forward(
-            prices, purge_days=cfg.purged_purge_days,
-            forward_return_days=sleeve_horizon(cfg, sleeve), top_n=sleeve.top_n,
-            groups=groups, dollar_volume=dvol, **common),
+            prices, **wf),
     }
     ppy = 252 / cfg.rebalance_days
     print("\n=== Head-to-head on identical data (scored on weekly holding returns) ===")
@@ -805,8 +887,7 @@ def _compare_with_baseline(cfg: StrategyConfig, sleeve: SleeveConfig,
 
 
 def compare_sector_cap(cfg: StrategyConfig, sleeve: SleeveConfig,
-                       prices: pd.DataFrame, groups: dict[str, str] | None,
-                       dvol: pd.DataFrame | None, sectors: dict[str, str],
+                       prices: pd.DataFrame, wf: dict[str, Any], sectors: dict[str, str],
                        cap: int) -> CapVerdict:
     """v4.18: ONE pre-declared head-to-head on identical data -- the equity
     sleeve with no sector cap vs. at most `cap` picks per sector."""
@@ -814,18 +895,11 @@ def compare_sector_cap(cfg: StrategyConfig, sleeve: SleeveConfig,
     print(f"Rule (decided BEFORE the results): switch the cap on only if it keeps "
           f"at least {ALPHA_RETENTION:.0%} of the uncapped alpha AND does not raise "
           f"the weekly 95% VaR.")
-    kw: dict[str, Any] = {
-        "test_window_days": cfg.purged_test_window_days,
-        "purge_days": cfg.purged_purge_days, "embargo_days": cfg.purged_embargo_days,
-        "rebalance_days": cfg.rebalance_days,
-        "forward_return_days": sleeve_horizon(cfg, sleeve), "top_n": sleeve.top_n,
-        "min_train_days": cfg.purged_min_train_days, "model_alpha": cfg.model_alpha,
-        "random_seed": cfg.random_seed, "target": cfg.target, "groups": groups,
-        "dollar_volume": dvol, "record_cross_sections": True, "sectors": sectors}
+    kw: dict[str, Any] = {**wf, "record_cross_sections": True, "sectors": sectors}
     ppy = 252 / cfg.rebalance_days
     rows = {}
     for label, mps in (("no cap", None), (f"max {cap} per sector", cap)):
-        r = run_purged_walk_forward(prices, max_per_sector=mps, **kw)
+        r = run_purged_walk_forward(prices, **{**kw, "max_per_sector": mps})
         try:
             a = benchmark_alpha(r.period_returns, r.benchmark_period_returns, ppy)
             alpha, alpha_t = a.alpha_annualized, a.alpha_tstat
@@ -857,33 +931,232 @@ def compare_sector_cap(cfg: StrategyConfig, sleeve: SleeveConfig,
     return verdict
 
 
+SKILL_RULE = "skill"      # keep the variant with the best contest-window active t
+RISK_RULE = "risk"        # adopt only if alpha is kept and weekly VaR is not raised
+
+
+def skill_verdict(rows: dict[str, dict[str, float]], current: str,
+                  simplicity: list[str] | None = None) -> tuple[str | None, str]:
+    """The learner rule (pure, unit-tested). Returns (variant to adopt or
+    None, reason).
+
+    Among variants with walk-forward IC t >= 2, the highest contest-window
+    active t wins; ties go to the current setting, then the simpler one.
+    A variant OTHER than the current one is adopted only if its
+    contest-window active t is itself >= WINDOW_T_THRESHOLD: the first ETF
+    comparison (2026-10-19) produced a "winner" at t = +0.34 against
+    -0.18, a difference that is pure noise -- a live model is not changed
+    on that. The floor is the same bar window.py uses for a PASS."""
+    eligible = {n: m for n, m in rows.items()
+                if np.isfinite(m["ic_t"]) and m["ic_t"] >= 2.0 and np.isfinite(m["w_t"])}
+    if not eligible:
+        return None, ("no variant shows reliable ranking skill (IC t < 2 for all); keep "
+                      "the current setting and do not trade on these results")
+    order = simplicity or list(rows)
+
+    def key(item: tuple[str, dict[str, float]]) -> tuple[float, int, int]:
+        n, m = item
+        return (-m["w_t"], 0 if n == current else 1,
+                order.index(n) if n in order else len(order))
+    best = min(eligible.items(), key=key)[0]
+    t = eligible[best]["w_t"]
+    if best == current:
+        return None, (f"{best} wins (contest-window active t = {t:+.2f}) -- already the "
+                      f"current setting")
+    if t < WINDOW_T_THRESHOLD:
+        return None, (f"{best} has the highest contest-window active t ({t:+.2f}) but "
+                      f"below the {WINDOW_T_THRESHOLD:.0f} needed to replace {current}: "
+                      f"the difference is noise; keep {current}")
+    return best, f"{best} wins (contest-window active t = {t:+.2f})"
+
+
+def _variant_stats(cfg: StrategyConfig, r: PurgedWalkForwardResult,
+                   periods: int) -> dict[str, float]:
+    ppy = 252 / cfg.rebalance_days
+    try:
+        a = benchmark_alpha(r.period_returns, r.benchmark_period_returns, ppy)
+        alpha, alpha_t = a.alpha_annualized, a.alpha_tstat
+    except ValueError:
+        alpha, alpha_t = float("nan"), float("nan")
+    try:
+        w = contest_windows(r.period_returns, r.benchmark_period_returns,
+                            r.period_end_dates, periods, cfg.rebalance_days)
+        win, w_active, w_t = w.win_rate, w.mean_active, w.active_tstat
+    except ValueError:
+        win = w_active = w_t = float("nan")
+    try:
+        var95, _es = var_es(r.period_returns, 0.95)
+    except ValueError:
+        var95 = float("nan")
+    return {"ic": r.mean_information_coefficient, "ic_t": r.ic_tstat,
+            "active": float(r.active_returns.mean()), "active_t": r.active_tstat,
+            "win": win, "w_active": w_active, "w_t": w_t, "sharpe": r.overall_sharpe,
+            "alpha": alpha, "alpha_t": alpha_t, "var": var95,
+            "fallbacks": float(r.weight_fallbacks)}
+
+
+def compare_variants(cfg: StrategyConfig, sleeve: SleeveConfig, prices: pd.DataFrame,
+                     wf: dict[str, Any], title: str, variants: dict[str, dict[str, Any]],
+                     current: str, rule: str, simplicity: list[str] | None = None
+                     ) -> str | None:
+    """v4.20: ONE pre-declared head-to-head of settings for one sleeve on
+    identical data, with test folds one contest window long. Returns the
+    name of the variant to adopt (None = keep the current setting).
+
+    SKILL_RULE (learners): among variants with walk-forward IC t >= 2, keep
+      the highest contest-window active t; ties -> the current setting, then
+      the simpler one (`simplicity` order).
+    RISK_RULE (weighting, near-duplicate guard): a variant is adopted only
+      if it keeps >= ALPHA_RETENTION of the current setting's alpha AND does
+      not raise the weekly 95% VaR (decide_cap); if several qualify, the one
+      with the lowest VaR.
+    """
+    periods = window_periods_for(cfg.contest_window_days, cfg.rebalance_days)
+    test_days = _window_test_days(cfg)
+    print(f"\n=== {title}: head-to-head on identical data (sleeve {sleeve.name}) ===")
+    if rule == SKILL_RULE:
+        print("Rule (decided BEFORE the results): among variants with IC t >= 2, keep the "
+              "one with the highest contest-window active t; ties -> the current, then "
+              f"the simpler setting; a new setting needs that t >= "
+              f"{WINDOW_T_THRESHOLD:.0f} to replace the current one.")
+    else:
+        print(f"Rule (decided BEFORE the results): adopt a variant only if it keeps at "
+              f"least {ALPHA_RETENTION:.0%} of the current setting's alpha AND does not "
+              f"raise the weekly 95% VaR; several -> the lowest VaR.")
+    print(f"(test folds of {test_days} days so each holds one contest window; "
+          f"current setting: {current})")
+    rows: dict[str, dict[str, float]] = {}
+    for name, overrides in variants.items():
+        try:
+            r = run_purged_walk_forward(
+                prices, **{**wf, "test_window_days": test_days, **overrides})
+        except (InsufficientHistoryError, ValueError) as e:
+            print(f"  {name}: skipped ({e})")
+            continue
+        rows[name] = _variant_stats(cfg, r, periods)
+    if not rows:
+        print("No variant produced a result.")
+        return None
+    print(f"{'variant':<16}{'IC':>8}{'IC t':>7}{'active/wk':>11}{'act t':>7}"
+          f"{'win(6w)':>9}{'active/6w':>11}{'6w t':>7}{'Sharpe':>8}{'alpha/yr':>10}"
+          f"{'alpha t':>8}{'VaR95/wk':>10}")
+    for name, m in rows.items():
+        print(f"{name:<16}{m['ic']:>+8.4f}{m['ic_t']:>+7.2f}{m['active']:>+11.3%}"
+              f"{m['active_t']:>+7.2f}{m['win']:>9.0%}{m['w_active']:>+11.2%}"
+              f"{m['w_t']:>+7.2f}{m['sharpe']:>8.2f}{m['alpha']:>+10.2%}"
+              f"{m['alpha_t']:>+8.2f}{m['var']:>10.2%}"
+              + (f"   (equal-weight fallback in {m['fallbacks']:.0f} periods)"
+                 if m["fallbacks"] else ""))
+    if rule == SKILL_RULE:
+        winner, reason = skill_verdict(rows, current, simplicity or list(variants))
+        print(f"\nVERDICT: {reason}.")
+        return winner
+    if current not in rows:
+        print(f"\nVERDICT: the current setting ({current}) produced no result; "
+              f"nothing to compare against.")
+        return None
+    cur = rows[current]
+    adoptable: dict[str, float] = {}
+    for n, m in rows.items():
+        if n == current:
+            continue
+        v = decide_cap(cur["alpha"], m["alpha"], cur["var"], m["var"])
+        print(f"  {n}: {'ADOPTABLE' if v.adopt else 'keep ' + current} -- {v.reason}")
+        if v.adopt:
+            adoptable[n] = m["var"]
+    if not adoptable:
+        print(f"\nVERDICT: KEEP {current}.")
+        return None
+    best = min(adoptable.items(), key=lambda kv: (kv[1], list(rows).index(kv[0])))[0]
+    print(f"\nVERDICT: SWITCH TO {best} (lowest weekly VaR among the variants that keep "
+          f"the alpha).")
+    return best
+
+
+def compare_models(cfg: StrategyConfig, sleeve: SleeveConfig, prices: pd.DataFrame,
+                   wf: dict[str, Any], groups: dict[str, str] | None,
+                   types: list[str]) -> str | None:
+    """`--compare-model SLEEVE:ridge,mlp,gbm` (v4.20)."""
+    bad = [t for t in types if t not in MODEL_TYPES]
+    if bad:
+        print(f"\nModel comparison refused: unknown model type(s) {bad}; "
+              f"choose from {MODEL_TYPES}.")
+        return None
+    current = sleeve_model_type(cfg, sleeve)
+    variants = {t: {"model_type": t} for t in dict.fromkeys([*types])}
+    best = compare_variants(cfg, sleeve, prices, wf, "Learner", variants, current,
+                            SKILL_RULE, simplicity=list(MODEL_TYPES))
+    if best:
+        print(f"To adopt it, set model_type: {best} under sleeves.{sleeve.name} "
+              f"(or at the top level for the stock sleeve) in config.yaml.")
+    return best
+
+
+def compare_weightings(cfg: StrategyConfig, sleeve: SleeveConfig, prices: pd.DataFrame,
+                       wf: dict[str, Any], groups: dict[str, str] | None,
+                       schemes: list[str]) -> str | None:
+    """`--compare-weighting SLEEVE:equal,hrp,factor` (v4.20)."""
+    bad = [s for s in schemes if s not in WEIGHTINGS]
+    if bad:
+        print(f"\nWeighting comparison refused: unknown scheme(s) {bad}; "
+              f"choose from {WEIGHTINGS}.")
+        return None
+    if "factor" in schemes and not groups:
+        print("\nNOTE: 'factor' needs ranking groups to build factors; this sleeve has "
+              "none, so it is left out.")
+        schemes = [s for s in schemes if s != "factor"]
+    current = "equal" if wf.get("weight_fn") is None else (
+        "factor" if isinstance(wf["weight_fn"], functools.partial) else "hrp")
+    variants = {s: {"weight_fn": _weight_fn_for(s, groups)} for s in dict.fromkeys(schemes)}
+    best = compare_variants(cfg, sleeve, prices, wf, "Weighting", variants, current,
+                            RISK_RULE)
+    if best:
+        print(f"To adopt it, set weighting: {best} under sleeves.{sleeve.name} in "
+              f"config.yaml (or pass --weighting {best} for the stock sleeve).")
+    return best
+
+
+def compare_dedup(cfg: StrategyConfig, sleeve: SleeveConfig, prices: pd.DataFrame,
+                  wf: dict[str, Any], groups: dict[str, str] | None,
+                  thresholds: list[str]) -> str | None:
+    """`--compare-dedup SLEEVE:0.9,0.95` (v4.20): the near-duplicate guard at
+    each threshold vs. no guard."""
+    try:
+        vals = [float(t) for t in thresholds]
+    except ValueError:
+        print(f"\nDedup comparison refused: thresholds must be numbers, got {thresholds}.")
+        return None
+    if any(not 0 < v <= 1 for v in vals):
+        print("\nDedup comparison refused: thresholds must be in (0, 1].")
+        return None
+    cur_v = sleeve_pick_correlation(cfg, sleeve)
+    current = f"max corr {cur_v:.2f}" if cur_v else "no guard"
+    variants: dict[str, dict[str, Any]] = {"no guard": {"max_pick_correlation": None}}
+    for v in sorted(set(vals)):
+        variants[f"max corr {v:.2f}"] = {"max_pick_correlation": v}
+    best = compare_variants(cfg, sleeve, prices, wf, "Near-duplicate guard", variants,
+                            current, RISK_RULE)
+    if best:
+        value = "0" if best == "no guard" else best.split()[-1]
+        print(f"To adopt it, set max_pick_correlation: {value} under sleeves."
+              f"{sleeve.name} (or at the top level for the stock sleeve) in config.yaml.")
+    return best
+
+
 def _report_out_of_sample(cfg: StrategyConfig, args: argparse.Namespace,
                           sleeve: SleeveConfig, prices: pd.DataFrame,
-                          groups: dict[str, str] | None,
-                          dvol: pd.DataFrame | None = None,
-                          sectors: dict[str, str] | None = None,
-                          cap_n: int | None = None,
-                          ) -> PurgedWalkForwardResult | None:
-    if cap_n is None:
-        cap_n = sleeve.max_per_sector
-    horizon = sleeve_horizon(cfg, sleeve)
+                          wf: dict[str, Any]) -> PurgedWalkForwardResult | None:
     try:
         pwf = run_purged_walk_forward(
-            prices, test_window_days=cfg.purged_test_window_days,
-            purge_days=max(cfg.purged_purge_days, horizon),
-            embargo_days=cfg.purged_embargo_days,
-            rebalance_days=cfg.rebalance_days,
-            forward_return_days=horizon, top_n=sleeve.top_n,
-            min_train_days=cfg.purged_min_train_days, model_alpha=cfg.model_alpha,
-            random_seed=cfg.random_seed, target=cfg.target, groups=groups,
-            dollar_volume=dvol,
-            record_cross_sections=bool(getattr(args, "report", None)),
-            sectors=sectors, max_per_sector=cap_n, feature_set=sleeve.feature_set)
+            prices, record_cross_sections=bool(getattr(args, "report", None)), **wf)
     except InsufficientHistoryError as e:
         print(f"\n--- Purged & Embargoed Walk-Forward Backtest ---\nSkipped: {e}")
         return None
     print("\n--- Purged & Embargoed Walk-Forward Backtest ---")
     print(pwf.summary())
+    if pwf.weight_fallbacks:
+        print(f"NOTE: the weighting scheme fell back to equal weight in "
+              f"{pwf.weight_fallbacks} of {len(pwf.period_returns)} periods.")
 
     periods_per_year = 252 / cfg.rebalance_days
     print("\n--- Alpha Regression ---")

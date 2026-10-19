@@ -55,6 +55,33 @@ MIN_HRP_LOOKBACK_DAYS = 60   # need enough return history for a stable
 HRP_COV_LOOKBACK_DAYS = 252  # covariance window: one trading year
 
 
+def cap_weights(weights: pd.Series, cap: float) -> pd.Series:
+    """Cap every weight at `cap` (e.g. 2x equal weight), redistributing the
+    excess pro rata to uncapped names. v4.4's real run had HRP put 59% of
+    the stock sleeve in one name; nothing should ever dominate like that.
+    v4.20: shared by live sizing AND the walk-forward, so a weighting scheme
+    is backtested exactly as it is traded.
+    """
+    if cap * len(weights) < 1.0:
+        cap = 1.0 / len(weights)          # infeasible cap -> equal weight
+    w = weights.astype(float) / weights.sum()
+    for _ in range(len(w)):
+        over = w > cap + 1e-12
+        if not over.any():
+            break
+        excess = float((w[over] - cap).sum())
+        w[over] = cap
+        under = ~over & (w < cap)
+        if not under.any():
+            break
+        base = w[under]
+        # pro rata to the uncapped names; equally if they are all zero
+        share = base / base.sum() if base.sum() > 0 else pd.Series(1.0 / len(base),
+                                                                   index=base.index)
+        w[under] += excess * share
+    return w / w.sum()
+
+
 def equal_weight(tickers: list[str]) -> pd.Series:
     if not tickers:
         raise ValueError("Cannot compute weights for an empty ticker list")

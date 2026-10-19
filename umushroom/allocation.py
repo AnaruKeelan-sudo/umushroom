@@ -18,36 +18,26 @@ from typing import Literal, cast
 import pandas as pd
 
 from umushroom.exceptions import DataError
+from umushroom.factor_risk import FactorRisk, factor_risk
 from umushroom.features import build_features_at_index
 from umushroom.logging_config import get_logger
 from umushroom.model import RankingModel
-from umushroom.portfolio_construction import equal_weight, hrp_weight
-from umushroom.selection import capped_top, top_sector_share
+from umushroom.portfolio_construction import cap_weights, equal_weight, hrp_weight
+from umushroom.selection import capped_top, correlation_filter, top_sector_share
 
 logger = get_logger("allocation")
 
 
-def cap_weights(weights: pd.Series, cap: float) -> pd.Series:
-    """Cap every weight at `cap` (e.g. 2x equal weight), redistributing the
-    excess pro rata to uncapped names. v4.4's real run had HRP put 59% of
-    the stock sleeve in one name; nothing should ever dominate like that.
-    """
-    if cap * len(weights) < 1.0:
-        cap = 1.0 / len(weights)          # infeasible cap -> equal weight
-    w = weights.astype(float) / weights.sum()
-    for _ in range(len(w)):
-        over = w > cap + 1e-12
-        if not over.any():
-            break
-        excess = float((w[over] - cap).sum())
-        w[over] = cap
-        under = ~over & (w < cap)
-        if not under.any():
-            break
-        w[under] += excess * w[under] / w[under].sum()
-    return w / w.sum()
+WeightingScheme = Literal["equal", "hrp", "factor"]
+WEIGHTING_SCHEMES: tuple[str, ...] = ("equal", "hrp", "factor")
 
-WeightingScheme = Literal["equal", "hrp"]
+__all__ = [
+    "WEIGHTING_SCHEMES",
+    "Allocation",
+    "WeightingScheme",
+    "cap_weights",
+    "generate_allocation",
+]
 
 
 @dataclass(frozen=True)
@@ -64,6 +54,9 @@ class Allocation:
                                     # metrics toward whatever the model already
                                     # favored, rather than measuring it fairly
                                     # across the whole universe.
+    # v4.20: the factor-risk decomposition behind `weighting: factor`
+    # (None when another scheme was used or the factor model fell back)
+    factor_risk: FactorRisk | None = None
 
     def __post_init__(self) -> None:
         if self.total_deployed > self.balance + 1e-6:
@@ -99,8 +92,18 @@ def generate_allocation(
     sectors: dict[str, str] | None = None,
     max_per_sector: int | None = None,
     feature_set: str = "equity",
+    max_pick_correlation: float | None = None,
+    factor_groups: dict[str, str] | None = None,
+    factor_prices: pd.DataFrame | None = None,
 ) -> Allocation:
     """Rank today's universe and size integer-share orders.
+
+    v4.20: `max_pick_correlation` skips a candidate whose trailing return
+    correlation with a name already picked exceeds it (selection.py);
+    `weighting="factor"` sizes the picks by factor-risk parity over the
+    group factors of `factor_prices` (the whole sleeve universe; defaults
+    to `data`) -- see factor_risk.py. Both fall back safely: no groups or
+    too little history -> equal weight, with a warning.
 
     `data` must be in the ACCOUNT's base currency (data.get_market_data
     guarantees this), so `balance * weight // price` buys the right
@@ -113,8 +116,8 @@ def generate_allocation(
         raise ValueError(f"balance must be > 0, got {balance}")
     if top_n < 1:
         raise ValueError(f"top_n must be >= 1, got {top_n}")
-    if weighting not in ("equal", "hrp"):
-        raise ValueError(f"weighting must be 'equal' or 'hrp', got {weighting!r}")
+    if weighting not in WEIGHTING_SCHEMES:
+        raise ValueError(f"weighting must be one of {WEIGHTING_SCHEMES}, got {weighting!r}")
 
     as_of_idx = len(data) - 1
     feats_today = build_features_at_index(
@@ -159,21 +162,37 @@ def generate_allocation(
         )
 
     cap = None if hold_all else max_per_sector     # hold-all sleeves hold everything
+    too_similar = (correlation_filter(data, as_of_idx, max_pick_correlation)
+                   if max_pick_correlation and not hold_all else None)
     ranked_all = preds.sort_values(ascending=False).index.tolist()
-    picked_tickers = capped_top(ranked_all, top_n, sectors, cap)
+    picked_tickers = capped_top(ranked_all, top_n, sectors, cap, too_similar)
     if cap and sectors:
         logger.info(f"Sector cap: at most {cap} per sector "
                     f"(largest sector now {top_sector_share(picked_tickers, sectors):.0%} "
                     f"of picks)")
 
+    factor_report: FactorRisk | None = None
+
     def size(selected: list[str]) -> tuple[pd.Series, dict[str, dict[str, object]]]:
+        nonlocal factor_report
         picked_tickers = selected
+        factor_report = None
         if weighting == "hrp":
             try:
                 weights = hrp_weight(data, picked_tickers, as_of_idx)
             except (DataError, ValueError) as e:
                 logger.warning(f"HRP weighting failed ({e}); falling back to "
                                 f"equal weight for this run.")
+                weights = equal_weight(picked_tickers)
+        elif weighting == "factor":
+            try:
+                fr = factor_risk(factor_prices if factor_prices is not None else data,
+                                 picked_tickers, as_of_idx, factor_groups or {},
+                                 max_weight=max_weight_multiple / len(picked_tickers))
+                weights, factor_report = fr.weights, fr
+            except (DataError, ValueError) as e:
+                logger.warning(f"Factor-risk weighting failed ({e}); falling back to "
+                               f"equal weight for this run.")
                 weights = equal_weight(picked_tickers)
         else:
             weights = equal_weight(picked_tickers)
@@ -235,7 +254,7 @@ def generate_allocation(
             pool = [t for t in ranked if t not in unaffordable]
             selected = capped_top([t for t in pool if t in selected]
                                   + [t for t in pool if t not in selected],
-                                  top_n, sectors, cap)
+                                  top_n, sectors, cap, too_similar)
     if unaffordable:
         logger.warning(f"Not buying {unaffordable}: one unit costs more than its share "
                        f"of the budget; the money was spread over the other holdings.")
@@ -258,6 +277,7 @@ def generate_allocation(
         cash_remaining=balance - total_deployed,
         balance=balance,
         all_scores=preds,
+        factor_risk=factor_report,
     )
     logger.info(f"Generated allocation: {len(orders)} positions, "
                 f"{total_deployed:,.2f}/{balance:,.2f} deployed")
