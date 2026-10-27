@@ -476,3 +476,66 @@ def test_injected_fetcher_and_snapshot_are_trusted_as_complete(tmp_path):
     md = get_market_data(["AAPL", "MSFT", "AZN.L", "NESN.SW"], "2y", tmp_path, 12, 70,
                          "GBP", fetcher=partial, drop_today_bar=False)
     assert set(md.prices.columns) == {"AAPL", "AZN.L"}
+
+
+
+# ---------------------------------------------- v4.21: freshness, fixed start
+from umushroom.data import START_PREFIX, check_freshness, last_trading_day_before
+from umushroom.exceptions import StaleDataError
+
+
+@pytest.mark.parametrize("today, expected", [
+    (date(2026, 10, 27), date(2026, 10, 26)),     # Tuesday -> Monday
+    (date(2026, 10, 26), date(2026, 10, 23)),     # Monday -> Friday
+    (date(2026, 10, 24), date(2026, 10, 23)),     # Saturday -> Friday
+    (date(2026, 10, 25), date(2026, 10, 23)),     # Sunday -> Friday
+])
+def test_last_trading_day_before(today, expected):
+    assert last_trading_day_before(today) == expected
+
+
+def test_check_freshness_accepts_yesterday_and_refuses_older():
+    check_freshness(date(2026, 10, 26), date(2026, 10, 27))
+    check_freshness(date(2026, 10, 23), date(2026, 10, 26))       # Monday run
+    with pytest.raises(StaleDataError, match="2026-10-26 has already closed"):
+        check_freshness(date(2026, 10, 23), date(2026, 10, 27))   # the 27 Oct live run
+    with pytest.raises(StaleDataError):
+        check_freshness(date(2026, 10, 22), date(2026, 10, 26))
+
+
+def test_get_market_data_refuses_stale_data_only_when_asked(tmp_path):
+    md = get_market_data(["AAPL", "MSFT"], "2y", tmp_path, 12, 70, "USD",
+                         fetcher=_fake_fetcher(), drop_today_bar=False)
+    last = md.prices.index[-1].date()
+    day_after = np.busday_offset(np.datetime64(last), 1, roll="forward").astype(date)
+    # fresh: the data reaches the last trading day before "today"
+    get_market_data(["AAPL", "MSFT"], "2y", tmp_path, 12, 70, "USD", fetcher=_fake_fetcher(),
+                    drop_today_bar=False, require_fresh=True, today=day_after)
+    # stale: refused -- but only when asked (library default stays permissive)
+    with pytest.raises(StaleDataError):
+        get_market_data(["AAPL", "MSFT"], "2y", tmp_path, 12, 70, "USD",
+                        fetcher=_fake_fetcher(), drop_today_bar=False, require_fresh=True,
+                        today=date(2030, 1, 7))
+    get_market_data(["AAPL", "MSFT"], "2y", tmp_path, 12, 70, "USD", fetcher=_fake_fetcher(),
+                    drop_today_bar=False, today=date(2030, 1, 7))
+
+
+def test_fixed_start_period_is_passed_to_yahoo_and_keyed_in_the_cache(tmp_path, monkeypatch):
+    import sys
+    import types
+    calls = []
+    idx = pd.bdate_range("2016-10-03", periods=5)
+
+    def download(symbols, **kw):
+        calls.append(kw)
+        cols = pd.MultiIndex.from_product([["Close", "Volume"], list(symbols)])
+        return pd.DataFrame(1.0, index=idx, columns=cols)
+    monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(download=download))
+    closes, volumes = data_mod._yf_download(["A", "B"], START_PREFIX + "2016-10-01")
+    assert calls[-1]["start"] == "2016-10-01" and "period" not in calls[-1]
+    assert list(closes.columns) == ["A", "B"] and volumes is not None
+    data_mod._yf_download(["A"], "10y")
+    assert calls[-1]["period"] == "10y" and "start" not in calls[-1]
+    rolling = data_mod._cache_path(tmp_path, ["A", "B"], "10y")
+    fixed = data_mod._cache_path(tmp_path, ["A", "B"], START_PREFIX + "2016-10-01")
+    assert rolling != fixed

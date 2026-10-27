@@ -694,19 +694,34 @@ sleeves:
     #               factor alpha +2.7%/yr  win 62%  VaR95/wk 2.85%  <- ADOPTED by the rule
     #               (alpha t 0.54: a modest, not yet significant edge in sizing;
     #               an earlier +9.1% came from the unconditioned factor model
-    #               before the volatility and weight floors). Applies when the
-    #               model's picks are traded; the core basket stays equal weight.
+    #               before the volatility and weight floors). REVERTED 2026-10-27:
+    #               see max_pick_correlation below.
     #   model_type  ridge 6-week active t -0.18 / mlp +0.34 / gbm -0.30: no
     #               learner has a reliable contest-window edge here (all IC t
     #               3.2-3.9). mlp "won" by +0.34 -- noise; ridge kept.
     #   max_pick_correlation  0.90 / 0.95: no improvement -> off.
     # (set explicitly: the top-level model_type is the STOCK sleeve's)
     model_type: "ridge"
+    # v4.21 (2026-10-27): the live 27 Oct model book put 72% of the sleeve in
+    # three silver ETPs (PHAG 25%, SLVR 22%, ISLN 25%) -- the factor weights
+    # loading up one "commodity" exposure through near-identical lines. Two
+    # conservative changes, both back toward what was validated:
+    #   weighting back to EQUAL (factor's measured edge was alpha t 0.54);
+    #   near-duplicate guard ON at 0.90: in its head-to-head it had HIGHER
+    #   alpha (+0.21% vs -0.44%) and VaR 2.88% vs 2.86% -- within the 0.05pp
+    #   tolerance now written into the rule (selection.VAR_TOLERANCE).
+    # Re-run under the fixed history start (2026-10-27, 30-day folds):
+    #   guard 0.90  alpha -4.9%/yr  win 51%  VaR 2.94%  vs  no guard -6.4%, 36%, 3.15%
+    #   factor      alpha -4.6%/yr  win 44%  VaR 2.83%  (rule: adoptable; kept OFF after
+    #               the 72%-silver live book -- and moot while the sleeve holds core)
+    # Every variant LOSES to holding every ETF inside a contest window, so with
+    # auto_trade_on: pass the sleeve holds the core basket until that changes.
+    max_pick_correlation: 0.9
     # Headline on the FULL universe: walk-forward IC t +1.93 (21-day folds),
     # +3.21 (30-day folds); active return ~0: `auto` holds the core basket.
     # The 2026-10-19 20:07 run that traded 8 picks did so on a cache missing
     # 780 symbols (Yahoo rate limit) -- fixed in data.py.
-    weighting: "factor"
+    weighting: "equal"
     core_tickers:
       - "IWDA.L"     # iShares Core MSCI World (USD)
       - "VUAA.L"     # Vanguard S&P 500 (USD)
@@ -779,6 +794,26 @@ top_n_holdings: 10              # v4.5: back to 10 -- won the 10-year
                                 # head-to-head (alpha t=2.22) vs 25
 lookback_period: "10y"          # v4.4: 10 years (each stock joins the model
                                 # once it has a year of its own history)
+# v4.21: fetch from a FIXED first date instead of a rolling 10 years. A rolling
+# window starts one day later every day, which moved every training-sample
+# date and fold boundary: the 26 and 27 Oct 2026 live runs shared 2 of 10
+# stock picks on identical data, and the ETF walk-forward IC t jittered
+# 1.9 <-> 3.1 from one day to the next. Bump this once a year.
+history_start: "2016-10-01"
+# v4.21: refuse to run when the data does not reach the last trading day
+# (the pipeline exits 3 = "not ready"; the GitHub workflow retries later).
+# Every Tue-Fri GitHub run of 20-27 Oct 2026 built signals on the close two
+# days back because Yahoo publishes European closes after 07:00 UTC.
+require_fresh_data: true
+# v4.21: `selection: auto` switches between the model's picks and the core
+# basket only after the rule has said the same thing on this many
+# consecutive runs (it flipped the ETF sleeve on 4 of 6 live days).
+auto_confirm_runs: 3
+# v4.21: trade an `auto` sleeve's model picks only on a contest-window PASS
+# (active t >= 2 AND win rate > 50%). Under the fixed history start the ETF
+# picks had alpha -4.9%/yr, 6-week active t -0.83 and a 51% win rate --
+# verdict WARN -- and the v4.19 rule ("not FAIL") still traded them.
+auto_trade_on: "pass"
 forward_return_days: 5          # v4.5: back to 5 days -- won the head-to-head
 rebalance_days: 5               # backtest + live cadence
 min_history_days: 300           # minimum clean bars required to run

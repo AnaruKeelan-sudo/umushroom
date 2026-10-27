@@ -28,13 +28,19 @@ from umushroom.config import (
     WEIGHTINGS,
     SleeveConfig,
     StrategyConfig,
+    data_period,
     load_config,
     load_sectors,
     sleeve_horizon,
     sleeve_model_type,
     sleeve_pick_correlation,
 )
-from umushroom.exceptions import DataError, InsufficientHistoryError, UMushroomError
+from umushroom.exceptions import (
+    DataError,
+    InsufficientHistoryError,
+    StaleDataError,
+    UMushroomError,
+)
 from umushroom.factor_regression import (
     benchmark_alpha,
     fama_french_alpha,
@@ -72,6 +78,7 @@ from umushroom.universe import check_concentration
 from umushroom.validation import ValidationReport, decile_returns, run_validation
 from umushroom.window import (
     FAIL,
+    PASS,
     WINDOW_T_THRESHOLD,
     WindowResult,
     contest_windows,
@@ -200,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
 
         market = data_mod.get_market_data(
             tickers=cfg.all_tickers,
-            period=cfg.lookback_period,
+            period=data_period(cfg),
             cache_dir=cfg.cache_dir,
             cache_max_age_hours=cfg.cache_max_age_hours,
             min_history_days=cfg.min_history_days,
@@ -212,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
             ragged=cfg.ragged_history,
             yahoo_symbols=cfg.yahoo_symbols,
             max_missing_fraction=cfg.max_missing_fraction,
+            require_fresh=cfg.require_fresh_data,
         )
         prices = market.prices
         print(f"\nData: {prices.shape[1]} instruments, {len(prices)} trading days "
@@ -269,6 +277,12 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("=== Pipeline completed successfully ===")
         return 0
 
+    except StaleDataError as e:
+        # v4.21: not a failure of the pipeline, a "not yet" -- exit code 3 lets
+        # the website workflow keep the last good run and retry later
+        logger.warning(f"Data not ready: {e}")
+        print(f"NOT READY: {e}", file=sys.stderr)
+        return 3
     except UMushroomError as e:
         logger.error(f"Pipeline failed: {e}")
         print(f"ERROR: {e}", file=sys.stderr)
@@ -555,7 +569,18 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
 
     # v4.19 "auto": trade the model's picks only while the out-of-sample
     # evidence holds up; otherwise hold the core basket, equal weight.
-    use_model, reason = decide_selection(sleeve, pwf, info.window)
+    # v4.21: with hysteresis -- the raw rule flipped the ETF sleeve between
+    # core and model on four of six live days (its IC t sits on the 2.0 line)
+    run_date = prices.index[-1].date()
+    ledger_path = cfg.cache_dir / f"selection_{sleeve.name}.csv"
+    past = [h for h in read_selection_ledger(ledger_path) if h["run_date"] < run_date]
+    use_model, reason = decide_selection(
+        sleeve, pwf, info.window, raw_history=[h["raw_use_model"] for h in past],
+        prev_used=past[-1]["used_model"] if past else None,
+        confirm=cfg.auto_confirm_runs, trade_on=cfg.auto_trade_on)
+    if sleeve.selection == "auto":
+        raw_now, _ = raw_selection(sleeve, pwf, info.window, cfg.auto_trade_on)
+        append_selection_ledger(ledger_path, run_date, raw_now, use_model)
     info.selection_used = ("model" if use_model else
                            "core" if sleeve.selection == "auto" else "all")
     info.decision = reason
@@ -627,13 +652,86 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
     return alloc
 
 
+def read_selection_ledger(path: Path) -> list[dict[str, Any]]:
+    """Past `auto` decisions of one sleeve: run_date, raw_use_model, used_model."""
+    if not path.exists():
+        return []
+    import csv
+    from datetime import date as _date
+    out: list[dict[str, Any]] = []
+    with open(path, newline="") as fh:
+        for r in csv.DictReader(fh):
+            try:
+                out.append({"run_date": _date.fromisoformat(r["run_date"]),
+                            "raw_use_model": r["raw_use_model"] == "1",
+                            "used_model": r["used_model"] == "1"})
+            except (KeyError, ValueError):
+                continue
+    return sorted(out, key=lambda h: h["run_date"])
+
+
+def append_selection_ledger(path: Path, run_date: Any, raw_use_model: bool,
+                            used_model: bool) -> None:
+    """Record today's decision (a re-run on the same data date replaces it)."""
+    import csv
+    rows = [h for h in read_selection_ledger(path) if h["run_date"] != run_date]
+    rows.append({"run_date": run_date, "raw_use_model": raw_use_model,
+                 "used_model": used_model})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["run_date", "raw_use_model", "used_model"])
+        for h in sorted(rows, key=lambda h: h["run_date"]):
+            w.writerow([h["run_date"], int(bool(h["raw_use_model"])),
+                        int(bool(h["used_model"]))])
+
+
+def sticky_decision(prev_used: bool | None, raw_history: list[bool],
+                    confirm: int) -> tuple[bool, str]:
+    """Hysteresis for `auto` (pure). `raw_history` ends with today's raw
+    verdict. The state switches only when the raw rule has said the same
+    thing on `confirm` consecutive runs; until then the previous state is
+    kept. Returns (use_model, note)."""
+    raw_now = raw_history[-1]
+    if confirm <= 1 or prev_used is None:
+        return raw_now, ""
+    if raw_now == prev_used:
+        return prev_used, ""
+    streak = 0
+    for v in reversed(raw_history):
+        if v != raw_now:
+            break
+        streak += 1
+    if streak >= confirm:
+        return raw_now, f"switch confirmed on {streak} consecutive runs"
+    return prev_used, (f"the rule now says {'model' if raw_now else 'core'} but only on "
+                       f"{streak} of the {confirm} consecutive runs needed: keeping "
+                       f"{'model' if prev_used else 'core'}")
+
+
 def decide_selection(sleeve: SleeveConfig, pwf: PurgedWalkForwardResult | None,
-                     window: WindowResult | None) -> tuple[bool, str]:
+                     window: WindowResult | None,
+                     raw_history: list[bool] | None = None,
+                     prev_used: bool | None = None, confirm: int = 1,
+                     trade_on: str = "warn") -> tuple[bool, str]:
+    """`raw_selection` plus hysteresis (v4.21): see sticky_decision."""
+    raw, reason = raw_selection(sleeve, pwf, window, trade_on)
+    if sleeve.selection != "auto" or confirm <= 1:
+        return raw, reason
+    use, note = sticky_decision(prev_used, [*(raw_history or []), raw], confirm)
+    return use, (f"{reason} [{note}]" if note else reason)
+
+
+def raw_selection(sleeve: SleeveConfig, pwf: PurgedWalkForwardResult | None,
+                  window: WindowResult | None, trade_on: str = "warn") -> tuple[bool, str]:
     """The pre-declared rule behind `selection: auto`.
 
     Use the model's picks only if BOTH hold out of sample:
       1. ranking skill: walk-forward IC t-stat >= SKILL_T_THRESHOLD, and
-      2. contest-window verdict is not FAIL (window.py).
+      2. contest-window verdict is at least `trade_on` (window.py): "warn" =
+         not FAIL (v4.19); "pass" = active t >= 2 AND win rate > 50% (v4.21:
+         on the stable fold layout the ETF picks had negative alpha and a
+         51% win rate -- WARN -- and were still traded).
     Otherwise hold the core basket. "model"/"all" bypass the rule.
     Returns (use_model, reason)."""
     if sleeve.selection == "model":
@@ -648,10 +746,12 @@ def decide_selection(sleeve: SleeveConfig, pwf: PurgedWalkForwardResult | None,
                        f"reliable ranking skill, holding the core basket")
     if window is None:
         return False, "no contest-window evaluation possible: holding the core basket"
-    if window.verdict == FAIL:
+    if window.verdict == FAIL or (trade_on == "pass" and window.verdict != PASS):
         return False, (f"IC t = {pwf.ic_tstat:+.2f} but the picks did not beat the "
-                       f"benchmark inside contest-length windows (win rate "
-                       f"{window.win_rate:.0%}, t = {window.active_tstat:+.2f}): "
+                       f"benchmark reliably inside contest-length windows (verdict "
+                       f"{window.verdict}: win rate {window.win_rate:.0%}, "
+                       f"t = {window.active_tstat:+.2f}; needs "
+                       f"{'PASS' if trade_on == 'pass' else 'not FAIL'}): "
                        f"holding the core basket")
     return True, (f"IC t = {pwf.ic_tstat:+.2f} and contest-window verdict "
                   f"{window.verdict} (win rate {window.win_rate:.0%}, "

@@ -26,12 +26,20 @@ Sells are listed first: do them first, so the cash is there for the buys.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date
 
+import numpy as np
 import pandas as pd
 
 DEFAULT_REBALANCE_DAYS = 5
+# v4.21: rebalance periods are counted in trading days from a fixed Monday,
+# so with rebalance_days = 5 a period is a calendar week (Mon-Fri). Before,
+# the sell tab compared each day's run with the previous day's and told the
+# team to turn the whole book over daily (16 sells, 13 buys on 2026-10-27);
+# the strategy was only ever validated holding its picks for 5 trading days.
+EPOCH = date(2000, 1, 3)
 ORDER = {"SELL ALL": 0, "SELL": 1, "BUY NEW": 2, "BUY MORE": 3, "HOLD": 4}
 
 
@@ -59,6 +67,70 @@ def next_review(as_of: str, rebalance_days: int = DEFAULT_REBALANCE_DAYS) -> dat
     """The trading day the holding period chosen on `as_of` ends."""
     d0 = pd.Timestamp(as_of[:10])
     return (d0 + pd.offsets.BDay(rebalance_days)).date()
+
+
+def _as_date(d: str | date) -> date:
+    return d if isinstance(d, date) else pd.Timestamp(str(d)[:10]).date()
+
+
+def trade_day(as_of: str | date) -> date:
+    """Orders built on the close of `as_of` are entered the next trading day."""
+    # roll a weekend back to Friday first, so Saturday -> Monday (not Tuesday)
+    return np.busday_offset(np.datetime64(_as_date(as_of)), 1, roll="backward").astype(date)
+
+
+def period_index(d: str | date, rebalance_days: int = DEFAULT_REBALANCE_DAYS) -> int:
+    """Which holding period a trading day belongs to (weeks for 5 days)."""
+    if rebalance_days < 1:
+        raise ValueError("rebalance_days must be >= 1")
+    return int(np.busday_count(np.datetime64(EPOCH), np.datetime64(_as_date(d)))) \
+        // rebalance_days
+
+
+def period_start(d: str | date, rebalance_days: int = DEFAULT_REBALANCE_DAYS) -> date:
+    k = period_index(d, rebalance_days)
+    return np.busday_offset(np.datetime64(EPOCH), k * rebalance_days).astype(date)
+
+
+def next_rebalance(as_of: str | date, rebalance_days: int = DEFAULT_REBALANCE_DAYS) -> date:
+    """First trading day of the period after the one `as_of`'s orders fall in."""
+    start = period_start(trade_day(as_of), rebalance_days)
+    return np.busday_offset(np.datetime64(start), rebalance_days).astype(date)
+
+
+@dataclass(frozen=True)
+class Cadence:
+    held: str | None          # the run whose orders you hold (None = nothing yet)
+    rebalance_now: bool       # is the latest run the first of a new period?
+    period_start: date        # first trading day of the latest run's period
+    next_rebalance: date      # first trading day of the next period
+
+
+def cadence(runs: Iterable[tuple[str, str]], latest: str,
+            rebalance_days: int = DEFAULT_REBALANCE_DAYS) -> Cadence:
+    """The weekly rule applied to a run history.
+
+    `runs` are (stamp, as_of) pairs of successful runs. A run's orders fall
+    in the period of their trade day (as_of + 1 trading day). The FIRST run
+    of a period is that period's book: when the latest run is it, rebalance
+    (sell what the previous period's book held that is no longer picked);
+    otherwise hold the first run's book until the next period starts."""
+    table = {stamp: as_of for stamp, as_of in runs}
+    if latest not in table:
+        raise ValueError(f"latest run {latest!r} is not in the history")
+    idx = {stamp: period_index(trade_day(a), rebalance_days) for stamp, a in table.items()}
+    p = idx[latest]
+    same = sorted(s for s, k in idx.items() if k == p)
+    start = period_start(trade_day(table[latest]), rebalance_days)
+    nxt = np.busday_offset(np.datetime64(start), rebalance_days).astype(date)
+    if same[0] != latest:
+        return Cadence(same[0], False, start, nxt)
+    earlier = [k for k in idx.values() if k < p]
+    if not earlier:
+        return Cadence(None, True, start, nxt)
+    prev = max(earlier)
+    held = min(s for s, k in idx.items() if k == prev)
+    return Cadence(held, True, start, nxt)
 
 
 def _num(v: object) -> float:

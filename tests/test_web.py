@@ -261,7 +261,7 @@ def test_sell_page_with_one_run_says_nothing_to_sell_yet(site):
     _run_once(runner, base)
     _, body = _get(base + "/sell")
     assert "When to sell" in body and "nothing to sell yet" in body
-    assert "Next sell / rebalance check" in body or "Rebalance due" in body
+    assert "Sell / rebalance now" in body or "Holding period in progress" in body
 
 
 def test_sell_page_lists_trades_against_the_run_you_bought_from(tmp_path):
@@ -284,9 +284,39 @@ def test_sell_page_lists_trades_against_the_run_you_bought_from(tmp_path):
 
 
 def test_sell_page_due_dates(tmp_path):
+    from umushroom.rebalance import Cadence
     from umushroom.web import _due_box
-    assert "2 trading days to go" in _due_box("2026-10-09", 5, date(2026, 10, 14), False)
-    assert "Rebalance due" in _due_box("2026-10-02", 5, date(2026, 10, 9), False)
+    mid = Cadence("20261012-080000", False, date(2026, 10, 12), date(2026, 10, 19))
+    assert "3 trading days to go" in _due_box(mid, 5, date(2026, 10, 14))
+    assert "Holding period in progress" in _due_box(mid, 5, date(2026, 10, 14))
+    start = Cadence("20261005-080000", True, date(2026, 10, 12), date(2026, 10, 19))
+    assert "Sell / rebalance now" in _due_box(start, 5, date(2026, 10, 12))
+
+
+def test_sell_page_holds_mid_period_instead_of_churning_daily(tmp_path):
+    """v4.21: two runs in the SAME week (signals of Mon 10-05 and Tue 10-06)
+    must not produce a trade list -- the 2026-10-20..27 site told the team to
+    turn the whole book over every morning."""
+    from umushroom.web import Site, _default_held, sell_body
+    runner = Runner(tmp_path / "site", _fake(as_of="2026-10-05"))
+    runner.start()
+    runner.wait()
+    first = runner.latest_report()
+    import time
+    time.sleep(1.1)
+    runner.command = _fake(as_of="2026-10-06")
+    runner.start()
+    runner.wait()
+    latest = runner.latest_report()
+    site = Site(runner, _yahoo())
+    assert _default_held(site, latest, site.payload(latest)) == first
+    body = sell_body(site, latest, site.payload(latest), None, today=date(2026, 10, 7),
+                     picker=False)
+    assert "Holding period in progress" in body and "Sell / rebalance now" not in body
+    assert "Trade list" not in body and "first run of this period" in body
+    # choosing the same run in the local site's picker changes nothing
+    body = sell_body(site, latest, site.payload(latest), first, today=date(2026, 10, 7))
+    assert "Trade list" not in body
 
 
 def test_sell_page_rejects_bad_held_param(site):

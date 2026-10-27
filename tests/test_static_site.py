@@ -152,3 +152,23 @@ def test_successful_run_log_is_never_printed(tmp_path, capsys):
     build(tmp_path / "site", tmp_path / "public", PW, fetch=_yahoo, command=chatty,
           run_first=True, run_timeout=60, iterations=FAST)
     assert "SECRET-PICK" not in capsys.readouterr().out
+
+
+
+def test_not_ready_run_returns_3_and_keeps_the_last_good_site(tmp_path):
+    """v4.21: exit code 3 from the pipeline (Yahoo has not published yesterday's
+    closes) is not a failure: the site keeps the last good run and the
+    workflow retries later."""
+    from umushroom.static_site import NOT_READY_CODE
+    site, out = tmp_path / "site", tmp_path / "public"
+    assert build(site, out, PW, fetch=_yahoo, command=_fake_cmd(tmp_path),
+                 run_first=True, run_timeout=60, iterations=FAST) == 0
+    import time
+    time.sleep(1.1)
+
+    def not_ready(report, orders):
+        return [sys.executable, "-c", "raise SystemExit(3)"]
+    rc = build(site, out, PW, fetch=_yahoo, command=not_ready, run_first=True,
+               run_timeout=60, iterations=FAST)
+    assert rc == NOT_READY_CODE == 3
+    assert "last good" in _open((out / "index.html").read_text(), PW)
