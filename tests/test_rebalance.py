@@ -68,3 +68,70 @@ def test_next_review_skips_weekends():
     assert next_review("2026-10-09", 5) == date(2026, 10, 16)     # Fri -> next Fri
     assert next_review("2026-10-08", 1) == date(2026, 10, 9)
     assert next_review("2026-10-09", 1) == date(2026, 10, 12)     # Fri -> Mon
+
+
+
+# ------------------------------------------------------- v4.21 weekly cadence
+from umushroom.rebalance import (
+    cadence,
+    next_rebalance,
+    period_index,
+    period_start,
+    trade_day,
+)
+
+
+def test_trade_day_is_the_next_trading_day():
+    assert trade_day("2026-10-23") == date(2026, 10, 26)          # Friday -> Monday
+    assert trade_day("2026-10-19") == date(2026, 10, 20)
+    assert trade_day(date(2026, 10, 24)) == date(2026, 10, 26)    # Saturday -> Monday
+
+
+def test_periods_are_calendar_weeks_for_five_days():
+    week = [date(2026, 10, 26) + __import__("datetime").timedelta(days=i) for i in range(5)]
+    assert len({period_index(d, 5) for d in week}) == 1
+    assert period_index(date(2026, 11, 2), 5) == period_index(date(2026, 10, 30), 5) + 1
+    assert period_start(date(2026, 10, 28), 5) == date(2026, 10, 26)
+    with pytest.raises(ValueError):
+        period_index(date(2026, 10, 28), 0)
+
+
+def test_next_rebalance_is_the_first_day_of_the_next_period():
+    assert next_rebalance("2026-10-23", 5) == date(2026, 11, 2)   # Fri signals -> Mon book
+    assert next_rebalance("2026-10-19", 5) == date(2026, 10, 26)  # Mon signals -> Tue..Fri
+    assert next_rebalance("2026-10-22", 5) == date(2026, 10, 26)
+
+
+def test_cadence_rebalances_on_the_first_run_of_a_period_and_holds_after():
+    runs = [("20261019-221955", "2026-10-16"), ("20261020-080050", "2026-10-19"),
+            ("20261021-080257", "2026-10-19"), ("20261022-080441", "2026-10-20"),
+            ("20261023-080204", "2026-10-21"), ("20261026-070800", "2026-10-23"),
+            ("20261027-070313", "2026-10-23")]
+    # 10-19 evening run: signals of Fri 10-16 -> trades Mon 10-19: the first (only)
+    # run of that week, and nothing earlier to sell
+    c = cadence(runs, "20261019-221955", 5)
+    assert c.rebalance_now and c.held is None
+    # 10-20 run: signals of Mon 10-19 -> trades Tue 10-20 (same week): HOLD the
+    # 10-19 book -- the site must not order a new book every morning
+    c = cadence(runs, "20261020-080050", 5)
+    assert not c.rebalance_now and c.held == "20261019-221955"
+    assert c.next_rebalance == date(2026, 10, 26)
+    for stamp in ("20261021-080257", "20261022-080441", "20261023-080204"):
+        assert cadence(runs, stamp, 5).held == "20261019-221955"
+    # Monday 10-26 (signals of Fri 10-23): new period -> rebalance against last week's book
+    c = cadence(runs, "20261026-070800", 5)
+    assert c.rebalance_now and c.held == "20261019-221955"
+    assert c.period_start == date(2026, 10, 26) and c.next_rebalance == date(2026, 11, 2)
+    # Tuesday 10-27: hold Monday's book
+    c = cadence(runs, "20261027-070313", 5)
+    assert not c.rebalance_now and c.held == "20261026-070800"
+
+
+def test_cadence_uses_the_first_successful_run_when_monday_failed():
+    runs = [("20261019-221955", "2026-10-16"), ("20261027-090000", "2026-10-26"),
+            ("20261028-090000", "2026-10-27")]
+    c = cadence(runs, "20261027-090000", 5)          # Tuesday is this week's first run
+    assert c.rebalance_now and c.held == "20261019-221955"
+    assert cadence(runs, "20261028-090000", 5).held == "20261027-090000"
+    with pytest.raises(ValueError):
+        cadence(runs, "20261030-000000", 5)

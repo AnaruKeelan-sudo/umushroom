@@ -54,7 +54,7 @@ import numpy as np
 
 from umushroom import __version__
 from umushroom.macro import FBY, MacroResult, analyse, talking_points
-from umushroom.rebalance import DEFAULT_REBALANCE_DAYS, next_review, plan
+from umushroom.rebalance import DEFAULT_REBALANCE_DAYS, Cadence, cadence, plan
 from umushroom.report import (
     _price,
     _tile,
@@ -457,17 +457,29 @@ def _as_of(payload: dict) -> str:
     return str(payload.get("meta", {}).get("as_of", ""))[:10]
 
 
-def _default_held(site: Site, latest: str, latest_payload: dict) -> str | None:
-    """The run you most likely bought from: the newest earlier prediction
-    (based on an older close than the latest one)."""
-    cur = _as_of(latest_payload)
+def _cadence_for(site: Site, latest: str, latest_payload: dict) -> Cadence:
+    """v4.21: the weekly rule (rebalance.cadence) over the run history."""
+    days = int(latest_payload.get("meta", {}).get("rebalance_days")
+               or DEFAULT_REBALANCE_DAYS)
+    runs: list[tuple[str, str]] = []
     for r in site.runner.history():
-        if r["stamp"] == latest or not r["has_report"] or r.get("status") != "succeeded":
+        if not r["has_report"] or r.get("status") != "succeeded":
             continue
-        p = site.payload(r["stamp"])
-        if p is not None and _as_of(p) and _as_of(p) < cur:
-            return str(r["stamp"])
-    return None
+        p = latest_payload if r["stamp"] == latest else site.payload(r["stamp"])
+        if p is not None and _as_of(p):
+            runs.append((str(r["stamp"]), _as_of(p)))
+    if latest not in {s for s, _ in runs} and _as_of(latest_payload):
+        runs.append((latest, _as_of(latest_payload)))
+    return cadence(runs, latest, days)
+
+
+def _default_held(site: Site, latest: str, latest_payload: dict) -> str | None:
+    """The run whose orders you hold under the weekly rule: at a rebalance
+    point, the previous period's book; mid-period, this period's first run."""
+    try:
+        return _cadence_for(site, latest, latest_payload).held
+    except ValueError:
+        return None
 
 
 def _held_picker(site: Site, run: str, held: str | None) -> str:
@@ -489,19 +501,17 @@ def _held_picker(site: Site, run: str, held: str | None) -> str:
             f'<button type="submit">Show</button></form>')
 
 
-def _due_box(as_of: str, days: int, today: date, fresh: bool) -> str:
-    due = next_review(as_of, days)
-    when = due.strftime("%a %d %b %Y")
-    if fresh:
-        return ('<div class="due now"><b>Sell / rebalance now</b>New picks are ready. '
-                "Do the sells below first, then the buys.</div>")
-    if today >= due:
-        return (f'<div class="due now"><b>Rebalance due: {when}</b>The holding period has '
-                "ended. Press <b>Run now</b> for fresh picks, then follow this page.</div>")
-    left = int(np.busday_count(today, due))
-    return (f'<div class="due"><b>Next sell / rebalance check: {when}</b>'
-            f"{left} trading day{'s' if left != 1 else ''} to go. Until then the "
-            "strategy holds everything -- no sells.</div>")
+def _due_box(cad: Cadence, days: int, today: date) -> str:
+    when = cad.next_rebalance.strftime("%a %d %b %Y")
+    if cad.rebalance_now:
+        return (f'<div class="due now"><b>Sell / rebalance now</b>This run opens a new '
+                f"{days}-trading-day holding period (from {cad.period_start.strftime('%a %d %b')}"
+                f"). Do the sells below first, then the buys; then hold until {when}.</div>")
+    left = max(0, int(np.busday_count(today, cad.next_rebalance)))
+    return (f'<div class="due"><b>Holding period in progress -- next sell / rebalance: '
+            f"{when}</b>{left} trading day{'s' if left != 1 else ''} to go. The strategy "
+            "holds this period's book until then -- no sells, and today's picks on the "
+            "Stocks tab are for anyone entering now, not a signal to trade.</div>")
 
 
 def sell_body(site: Site, run: str, latest_payload: dict, held: str | None,
@@ -516,17 +526,24 @@ def sell_body(site: Site, run: str, latest_payload: dict, held: str | None,
              "There is no stop-loss or profit target -- none was tested, and an untested "
              "rule can quietly wipe out the measured alpha. This is the contest "
              "strategy's output, not financial advice.</p>")
+    cad = _cadence_for(site, run, latest_payload)
+    explicit = held is not None and held != cad.held      # the picker overrides
+    held = held or cad.held
     held_payload = site.payload(held) if held else None
     if held_payload is None:
-        return (intro + _due_box(_as_of(latest_payload), days, today, False)
+        return (intro + _due_box(cad, days, today)
                 + '<p class="note">Only one prediction so far, so there is nothing to '
                   "sell yet: buy today's orders (Stocks tab). After the next run this "
                   "page lists exactly what to sell.</p>")
+    if not cad.rebalance_now and not explicit:
+        return (intro + (_held_picker(site, run, held) if picker else "")
+                + _due_box(cad, days, today)
+                + f'<p class="note">Your book is the orders of {html.escape(_pretty(str(held)))} '
+                  f"(signals of {html.escape(_as_of(held_payload))}), the first run of "
+                  "this period. Nothing to do until the next period starts.</p>")
 
-    fresh = _as_of(latest_payload) > _as_of(held_payload)
     actions = plan(held_payload, latest_payload)
-    out = [intro, _held_picker(site, run, held) if picker else "",
-           _due_box(_as_of(held_payload), days, today, fresh)]
+    out = [intro, _held_picker(site, run, held) if picker else "", _due_box(cad, days, today)]
 
     gains: dict[str, float] = {}
     try:                                     # how each holding did since you bought

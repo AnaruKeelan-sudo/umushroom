@@ -166,6 +166,22 @@ model's IC is borderline (t +1.9 to +3.2) with no contest-window edge, so
 wide, significant margin (6-week active t +3.95 vs +2.07) and passed the
 7-check validation suite -- adopted (`model_type: gbm`).
 
+### v4.21: the live-run fixes (27 Oct 2026)
+
+The first live week exposed four operational defects (CHANGELOG 4.21.0):
+runs that used two-day-old signals, a sell tab that ordered a full turnover
+every day, a training set that drifted with the rolling data window, and
+an ETF book 72% in silver. Now: the pipeline refuses stale data (exit 3,
+the workflow retries at 11:40 UTC), the book is held for a whole rebalance
+period (weeks), `history_start` pins the first data date, `auto` needs
+three consecutive agreeing runs to switch, and the ETF sleeve is equal
+weight with the near-duplicate guard on.
+
+**How to trade it:** on the first run of each week (Monday, or the first
+successful run after), enter the orders on the Stocks/ETFs tabs and sell
+what the When-to-sell tab lists; on other days, hold. The orders shown
+mid-week are for anyone entering then, not a signal to re-trade.
+
 ### HTML report
 
 ```

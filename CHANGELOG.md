@@ -1,5 +1,58 @@
 # Changelog
 
+## 4.21.0 (2026-10-27) -- how the first live week went wrong, and the fixes
+Eight days of live runs (20-27 Oct) were reconstructed from the published
+site. The week's return was about -1.4% holding the first book for five
+days (the validated rule) and +0.4% following the daily orders, against
++0.5% for the equal-weight stock universe and -0.7% for world equities; the
+signal itself had a 2-sigma-bad week (its 10-16 picks -3.8% vs +0.2% for
+the rest). Four defects in HOW it ran, all fixed here:
+- STALE SIGNALS. The 06:20 UTC schedule ran before Yahoo published the
+  previous day's European closes: every Tue-Fri run built signals on the
+  close two days back (as_of lagged the run by two days; this morning 14 of
+  18 holdings had no Monday price at 07:10 UTC). `data.check_freshness`
+  now refuses data that does not reach the last trading day (exit code 3 =
+  "not ready", `require_fresh_data: true`); the workflow runs at 08:40 and
+  11:40 UTC and treats 3 as "keep the last good run, retry later", not as
+  a failure. UMushroom fills at the previous close whenever the orders are
+  entered, so a later run costs nothing.
+- DAILY CHURN. The sell tab compared each run with the previous day's and
+  ordered a full turnover every morning (27 Oct: sell 16, buy 13); the
+  strategy was validated holding picks for 5 trading days. `rebalance.py`
+  now defines periods on a fixed trading-day grid (weeks for 5 days): the
+  first run of a period is the book, later runs say HOLD with the date of
+  the next rebalance, and the orders page says which period its book is
+  for. The local site's picker still allows any comparison.
+- DRIFTING TRAINING SET. The rolling 10-year window starts one day later
+  each day, moving every training-sample date (every 5th day) and every
+  fold boundary: the 26 and 27 Oct runs shared 2 of 10 picks on IDENTICAL
+  data, and the ETF walk-forward IC t jittered 1.9 <-> 3.1 day to day,
+  flipping `auto` between core and model on 4 of 6 days. `history_start`
+  (period "start:YYYY-MM-DD") fixes the first date; `auto_confirm_runs: 3`
+  adds hysteresis (a ledger in .cache/selection_<sleeve>.csv; the raw rule
+  must agree on 3 consecutive runs before the state switches).
+- 72% SILVER. The 27 Oct ETF book put PHAG 25%, SLVR 22%, ISLN 25% -- the
+  factor weights loading one commodity exposure through three near-identical
+  lines. ETF sleeve back to `weighting: equal` (factor's edge was alpha t
+  0.54) and the near-duplicate guard ON at 0.90: its head-to-head showed
+  higher alpha and VaR 2.88% vs 2.86%, a tie that the rule now reads as a
+  tie (`selection.VAR_TOLERANCE` = 0.05pp).
+- `auto_trade_on: pass` -- an `auto` sleeve trades the model's picks only
+  on a contest-window PASS (active t >= 2 AND win rate > 50%). Under the
+  fixed history start the ETF picks had alpha -0.4%/yr, 6-week active t
+  -0.83, win 51% (WARN) with every weighting, and the v4.19 "not FAIL" gate
+  still traded them. The ETF sleeve now holds the core basket.
+- Headline numbers under the fixed start (2016-10-03 .. 2026-10-26, 21-day
+  folds): stocks (gbm, HRP) IC t +4.88, alpha +9.4%/yr (t 1.70), 6-week
+  active +1.84% (t +2.83), 70.6% of windows won -- PASS. ETFs (ridge,
+  guard 0.90) IC t +2.91, alpha -0.4%, 6-week active -0.47% (t -0.83),
+  51% -- WARN -> core basket. Two consecutive runs on the same data now
+  give identical orders.
+- 21 new tests (freshness, fixed-start fetch and cache key, cadence known
+  answers, sell-tab hold/rebalance, hysteresis, ledger, exit code 3 in the
+  CLI and the static site, VaR tolerance, the PASS gate, config, shipped
+  config).
+
 ## 4.20.0 (2026-10-19) -- data guard, near-duplicate guard, factor-risk weights, learner head-to-head
 Root-cause fixes for the ETF sleeve's bad 2026-10-19 run, each behind a
 pre-declared rule; the live strategy is unchanged until a rule says switch.

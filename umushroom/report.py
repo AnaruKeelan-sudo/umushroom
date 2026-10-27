@@ -25,7 +25,7 @@ import pandas as pd
 
 from umushroom.montecarlo import MonteCarloResult, bootstrap_annual_alpha, combine_sleeves
 from umushroom.purged_backtest import PurgedWalkForwardResult
-from umushroom.rebalance import DEFAULT_REBALANCE_DAYS, next_review
+from umushroom.rebalance import DEFAULT_REBALANCE_DAYS, next_rebalance, trade_day
 from umushroom.risk import MIN_OBS, backtest_var, var_es
 from umushroom.window import WindowResult
 
@@ -991,9 +991,9 @@ def _tiles(payload: dict) -> str:
         try:
             days = int(payload["meta"].get("rebalance_days") or DEFAULT_REBALANCE_DAYS)
             tiles.append(_tile("Next sell / rebalance check",
-                               next_review(as_of, days).strftime("%a %d %b"),
-                               f"sell anything that drops out of the picks "
-                               f"({days} trading days after {as_of})"))
+                               next_rebalance(as_of, days).strftime("%a %d %b"),
+                               f"first run of the next {days}-trading-day period; "
+                               f"hold this period's book until then"))
         except ValueError:
             pass
     wk = (payload.get("risk") or {}).get("weekly")
@@ -1137,6 +1137,24 @@ def _risk_section(payload: dict) -> str:
     return "".join(out)
 
 
+def _period_note(payload: dict) -> str:
+    """v4.21: the book is held for a whole rebalance period; say so where
+    the orders are, so a daily visitor does not trade daily."""
+    as_of = str(payload["meta"].get("as_of") or "")
+    if not as_of:
+        return ""
+    try:
+        days = int(payload["meta"].get("rebalance_days") or DEFAULT_REBALANCE_DAYS)
+        start, nxt = trade_day(as_of), next_rebalance(as_of, days)
+    except ValueError:
+        return ""
+    return (f'<p class="note"><b>Holding period:</b> these orders are the book for the '
+            f"{days}-trading-day period that starts {start.strftime('%a %d %b')} "
+            f"(signals of {as_of}); the next rebalance is the first run on or after "
+            f"{nxt.strftime('%a %d %b')}. If you already hold this period's book, do "
+            "not re-trade it -- see <b>When to sell</b>.</p>")
+
+
 def section_bodies(payload: dict) -> dict[str, str]:
     """The report split into self-contained sections (one per website tab)."""
     ccy = payload["meta"].get("base_currency", "")
@@ -1146,6 +1164,7 @@ def section_bodies(payload: dict) -> dict[str, str]:
               ('<p class="note">Enter these on UMushroom. Check each local price against '
                "UMushroom's before buying; rows with \"Priced from\" use a substitute "
                "Yahoo symbol.</p>"),
+              _period_note(payload),
               _orders_table(payload["orders"], ccy)]
     if payload["top"]:
         stocks += ["<h2>Top-ranked stocks</h2>",
