@@ -211,3 +211,10 @@ def test_correlation_filter_rejects_bad_arguments():
         correlation_filter(px, len(px) - 1, 1.5)
     with pytest.raises(ValueError):
         correlation_filter(px, len(px), 0.9)
+
+
+
+def test_var_within_tolerance_is_not_worse():
+    """2.88% vs 2.86% is the same number (VAR_TOLERANCE = 0.05pp)."""
+    assert decide_cap(-0.0044, 0.0021, 0.0286, 0.0288).adopt          # the ETF guard case
+    assert not decide_cap(-0.0044, 0.0021, 0.0286, 0.0294).adopt      # +0.08pp: worse

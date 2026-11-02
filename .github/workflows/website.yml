@@ -11,8 +11,14 @@ name: Website
 
 on:
   schedule:
-    # Weekdays 06:20 UTC = 07:20 London in summer, 06:20 in winter
-    - cron: "20 6 * * 1-5"
+    # v4.21: two weekday slots. At 06:20 UTC Yahoo had not yet published the
+    # previous day's European closes, so every Tue-Fri run of 20-27 Oct 2026
+    # used two-day-old signals. The pipeline now refuses stale data (exit 3,
+    # "not ready"); the first slot that finds yesterday's closes publishes,
+    # the other keeps the last good run. UMushroom fills at the previous
+    # close whenever the orders are entered, so a later run costs nothing.
+    - cron: "40 8 * * 1-5"     # 08:40 UTC = 09:40 London (summer) / 08:40 (winter)
+    - cron: "40 11 * * 1-5"    # 11:40 UTC = 12:40 London (summer) / 11:40 (winter)
   workflow_dispatch:
     inputs:
       validate:
@@ -71,7 +77,12 @@ jobs:
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/workflows/website.yml"
           code=$?
           if [ "$code" = "2" ]; then exit 2; fi        # setup error: nothing to publish
-          echo "run_ok=$([ "$code" = "0" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          if [ "$code" = "3" ]; then
+            echo "::notice::Data not ready: Yahoo has not published yesterday's closes yet. The site keeps the last good run; the later slot retries."
+            echo "run_ok=true" >> "$GITHUB_OUTPUT"      # not a failure: nothing to email
+          else
+            echo "run_ok=$([ "$code" = "0" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Save past runs and the price cache
         if: always()

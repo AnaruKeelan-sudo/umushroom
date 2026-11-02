@@ -35,6 +35,10 @@ import numpy as np
 import pandas as pd
 
 ALPHA_RETENTION = 0.75
+# v4.21: two weekly VaRs within this are the same number (0.05 pp). The ETF
+# near-duplicate guard was rejected on 2026-10-19 for "raising" VaR from
+# 2.86% to 2.88% while its alpha was higher -- a tie read as a loss.
+VAR_TOLERANCE = 0.0005
 # v4.20: trailing window and minimum overlap for the near-duplicate guard
 CORR_LOOKBACK_DAYS = 252
 MIN_CORR_OBS = 60
@@ -144,8 +148,9 @@ class CapVerdict:
 def decide_cap(alpha_uncapped: float, alpha_capped: float,
                var_uncapped: float, var_capped: float,
                retention: float = ALPHA_RETENTION) -> CapVerdict:
-    """The pre-declared rule. VaRs are positive loss fractions."""
-    if var_capped > var_uncapped + 1e-12:
+    """The pre-declared rule. VaRs are positive loss fractions; a difference
+    within VAR_TOLERANCE counts as unchanged."""
+    if var_capped > var_uncapped + VAR_TOLERANCE:
         return CapVerdict(False, f"the cap made weekly risk WORSE (VaR {var_capped:.2%} "
                                  f"vs {var_uncapped:.2%})")
     if alpha_capped >= alpha_uncapped:

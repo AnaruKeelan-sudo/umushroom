@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 import yaml
@@ -24,6 +25,7 @@ from umushroom.universe import SUPPORTED_BASE_CURRENCIES, resolve_universe
 FRENCH_REGIONS = ("US", "Developed", "Europe")
 EQUITY_SLEEVE = "equity"
 SELECTION_MODES = ("model", "all", "auto")
+AUTO_TRADE_ON = ("pass", "warn")     # contest-window verdict needed to trade the model
 WEIGHTINGS = ("equal", "hrp", "factor")
 GROUP_BY_OPTIONS = ("exchange", "asset_class")
 # UMushroom UK Stage 1 runs 12 Oct - 22 Nov 2026: six weeks = 30 trading days.
@@ -142,6 +144,20 @@ class StrategyConfig:
     # weighting scheme of the stock sleeve: equal | hrp | factor (None = the
     # --weighting flag, default equal). Set here so the GitHub run uses it too.
     weighting: str | None = None
+    # ---- v4.21 ----
+    # fetch prices from this FIXED date instead of a rolling lookback_period,
+    # so training-sample dates and fold boundaries do not drift daily
+    history_start: str | None = None
+    # refuse to run when the data does not reach the last trading day
+    require_fresh_data: bool = False
+    # `selection: auto` switches between model and core only after the raw
+    # rule has given the same answer on this many consecutive runs
+    auto_confirm_runs: int = 1
+    # `selection: auto` trades the model's picks only when the contest-window
+    # verdict is at least this: "pass" (active t >= 2 AND win rate > 50%) or
+    # "warn" (merely not FAIL -- the v4.19 rule, which let the ETF sleeve
+    # trade picks with negative alpha on a 51% win rate)
+    auto_trade_on: str = "pass"
     # data.py: refuse to run (and to cache) when Yahoo serves less than this
     # share of the universe -- a rate-limited download must never be traded
     max_missing_fraction: float = MAX_MISSING_FRACTION
@@ -251,6 +267,16 @@ def _validate(cfg: StrategyConfig) -> None:
         errors.append("max_missing_fraction must be between 0 and 1")
     if cfg.weighting is not None and cfg.weighting not in WEIGHTINGS:
         errors.append(f"weighting must be one of {WEIGHTINGS}, got {cfg.weighting!r}")
+    if cfg.history_start is not None:
+        try:
+            date.fromisoformat(cfg.history_start)
+        except ValueError:
+            errors.append(f"history_start must be YYYY-MM-DD, got {cfg.history_start!r}")
+    if cfg.auto_confirm_runs < 1:
+        errors.append("auto_confirm_runs must be >= 1")
+    if cfg.auto_trade_on not in AUTO_TRADE_ON:
+        errors.append(f"auto_trade_on must be one of {AUTO_TRADE_ON}, "
+                      f"got {cfg.auto_trade_on!r}")
     if cfg.forward_return_days > cfg.contest_window_days:
         errors.append(f"forward_return_days ({cfg.forward_return_days}) is longer than "
                       f"the contest window ({cfg.contest_window_days} trading days): "
@@ -534,6 +560,11 @@ def load_config(path: str | Path = "config.yaml") -> StrategyConfig:
                                                MAX_MISSING_FRACTION)),
             weighting=(None if raw.get("weighting") in (None, "")
                        else str(raw["weighting"])),
+            history_start=(None if raw.get("history_start") in (None, "")
+                           else str(raw["history_start"])),
+            require_fresh_data=_to_bool(raw.get("require_fresh_data", False)),
+            auto_confirm_runs=int(raw.get("auto_confirm_runs", 1)),
+            auto_trade_on=str(raw.get("auto_trade_on", "pass")).lower(),
         )
     except (TypeError, ValueError, KeyError) as e:
         raise ConfigError(f"Config file {path} has a field of the wrong type: {e}") from e
@@ -541,6 +572,12 @@ def load_config(path: str | Path = "config.yaml") -> StrategyConfig:
 
 def sleeve_horizon(cfg: StrategyConfig, sleeve: SleeveConfig) -> int:
     return sleeve.forward_return_days or cfg.forward_return_days
+
+
+def data_period(cfg: StrategyConfig) -> str:
+    """What to ask the data layer for: a fixed first date when configured
+    (v4.21), else the rolling lookback period."""
+    return f"start:{cfg.history_start}" if cfg.history_start else cfg.lookback_period
 
 
 def sleeve_model_type(cfg: StrategyConfig, sleeve: SleeveConfig) -> str:

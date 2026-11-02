@@ -274,7 +274,7 @@ def test_shipped_config_sleeves_are_valid():
     # v4.20 (2026-10-19 head-to-heads): factor-risk weights for ETFs, HRP for
     # stocks; learner ridge and the near-duplicate guard off until their
     # rules say otherwise (see config.yaml for the numbers)
-    assert names["etf"].selection == "auto" and names["etf"].weighting == "factor"
+    assert names["etf"].selection == "auto" and names["etf"].weighting == "equal"
     assert names["equity"].weighting == "hrp" and cfg.weighting == "hrp"
     # gbm: won the learner head-to-head (6-week active t +3.95) and passed
     # the 7-check validation suite on 2026-10-19 -- for STOCKS; the ETF sleeve
@@ -307,7 +307,7 @@ def test_shipped_config_etf_sleeve_is_a_model_sleeve_over_the_universe():
     """v4.19: the ETF sleeve ranks the whole UMushroom ETF universe with the
     ETF feature set and falls back to the 13 core ETFs under `auto`."""
     etf = next(s for s in load_config(REPO_CONFIG).all_sleeves if s.name == "etf")
-    assert etf.selection == "auto" and etf.weighting == "factor"
+    assert etf.selection == "auto" and etf.weighting == "equal"
     assert etf.feature_set == "etf" and etf.group_by == "asset_class"
     assert len(etf.core_tickers) == 13 and set(etf.core_tickers) <= set(etf.tickers)
     assert len(etf.tickers) > 1000 and not etf.universe_missing
@@ -570,3 +570,38 @@ def test_top_level_weighting_sets_the_stock_sleeve(tmp_path):
     assert load_config(_write(tmp_path, VALID_YAML)).all_sleeves[0].weighting is None
     with pytest.raises(ConfigError):
         load_config(_write(tmp_path, VALID_YAML + "weighting: markowitz\n"))
+
+
+
+# ------------------------------------------------------------- v4.21 fields
+from umushroom.config import data_period
+
+
+def test_v421_fields_parse_validate_and_default_off(tmp_path):
+    cfg = load_config(_write(tmp_path, VALID_YAML))
+    assert cfg.history_start is None and not cfg.require_fresh_data
+    assert cfg.auto_confirm_runs == 1 and data_period(cfg) == "2y"
+    cfg = load_config(_write(tmp_path, VALID_YAML + textwrap.dedent("""\
+        history_start: "2016-10-01"
+        require_fresh_data: true
+        auto_confirm_runs: 3
+    """)))
+    assert data_period(cfg) == "start:2016-10-01" and cfg.require_fresh_data
+    assert cfg.auto_confirm_runs == 3
+    for bad in ("history_start: 2016/10/01\n", "auto_confirm_runs: 0\n",
+                "auto_trade_on: maybe\n"):
+        with pytest.raises(ConfigError):
+            load_config(_write(tmp_path, VALID_YAML + bad))
+    assert load_config(_write(tmp_path, VALID_YAML)).auto_trade_on == "pass"
+    assert load_config(_write(tmp_path, VALID_YAML + "auto_trade_on: WARN\n")).auto_trade_on == "warn"
+
+
+def test_shipped_config_v421_settings():
+    cfg = load_config(REPO_CONFIG)
+    assert cfg.history_start == "2016-10-01" and cfg.require_fresh_data
+    assert cfg.auto_confirm_runs == 3 and cfg.auto_trade_on == "pass"
+    etf = next(s for s in cfg.all_sleeves if s.name == "etf")
+    # 2026-10-27: factor weights put 72% of the live ETF book in three silver
+    # ETPs -> equal weight again, with the near-duplicate guard on
+    assert etf.weighting == "equal" and sleeve_pick_correlation(cfg, etf) == 0.9
+    assert sleeve_model_type(cfg, etf) == "ridge"

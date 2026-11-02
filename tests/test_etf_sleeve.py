@@ -16,7 +16,7 @@ from umushroom import data as data_mod
 from umushroom.config import SleeveConfig
 from umushroom.purged_backtest import PurgedWalkForwardResult
 from umushroom.report import section_bodies
-from umushroom.window import FAIL, PASS, WindowResult
+from umushroom.window import FAIL, PASS, WARN, WindowResult
 
 STOCKS = [f"U{i}" for i in range(8)] + [f"K{i}.L" for i in range(8)]
 CORE = ["IWDA.L", "SGLD.L", "ISF.L"]
@@ -242,10 +242,16 @@ def _pwf(ic_t: float) -> PurgedWalkForwardResult:
 def _window(verdict: str) -> WindowResult:
     idx = pd.bdate_range("2024-01-01", periods=20, freq="7D")
     rng = np.random.default_rng(1)
-    # a constant active return has zero variance (t undefined): add jitter
-    s = pd.Series((0.03 if verdict == PASS else -0.03) + rng.normal(0, 0.002, 20), index=idx)
+    # a constant active return has zero variance (t undefined): add jitter.
+    # WARN = wins more than half the windows but with no significant t
+    level = {PASS: 0.03, FAIL: -0.03, WARN: 0.0}[verdict]
+    s = pd.Series(level + rng.normal(0, 0.02, 20), index=idx)
+    if verdict == WARN:
+        s = s.abs() * np.where(np.arange(20) % 3 == 0, -1, 1)     # 2 wins in 3, t small
     b = pd.Series(0.0, index=idx)
-    return WindowResult(6, 30, s, b, s.iloc[::6], b.iloc[::6])
+    w = WindowResult(6, 30, s, b, s.iloc[::6], b.iloc[::6])
+    assert w.verdict == verdict, (verdict, w.verdict, w.active_tstat, w.win_rate)
+    return w
 
 
 def _sleeve(selection: str) -> SleeveConfig:
@@ -269,6 +275,11 @@ def test_decide_selection_rule():
     assert not use and "did not beat the benchmark" in why
     use, why = cli.decide_selection(_sleeve("auto"), strong, _window(PASS))
     assert use and "trading the model's top 1" in why
+    # v4.21: a WARN verdict trades only under the permissive v4.19 gate
+    use, why = cli.decide_selection(_sleeve("auto"), strong, _window(WARN), trade_on="pass")
+    assert not use and "needs PASS" in why
+    use, _ = cli.decide_selection(_sleeve("auto"), strong, _window(WARN), trade_on="warn")
+    assert use
 
 
 @pytest.mark.parametrize("verdict", [PASS, FAIL])
@@ -414,3 +425,60 @@ def test_auto_fallback_basket_is_equal_weight_even_with_factor_weighting(
     assert etf["target_weight"].round(4).nunique() == 1
     s = next(x for x in _payload(report)["sleeves"] if x["name"] == "etf")
     assert s["weighting"] == "factor" and s["factor_risk"] is None
+
+
+
+# ------------------------------------------------- v4.21: hysteresis, exit 3
+
+def test_sticky_decision_needs_consecutive_agreement():
+    from umushroom.cli import sticky_decision
+    assert sticky_decision(None, [True], 3) == (True, "")                # first ever
+    assert sticky_decision(False, [True, False, True], 3)[0] is False     # 1 of 3
+    assert sticky_decision(False, [False, True, True], 3)[0] is False     # 2 of 3
+    use, note = sticky_decision(False, [True, True, True], 3)
+    assert use and "confirmed on 3" in note
+    assert sticky_decision(True, [True, False], 3)[0] is True             # keep model
+    assert sticky_decision(False, [True], 1) == (True, "")                # no hysteresis
+    # the live 20-27 Oct sequence of raw verdicts: core, model, core, core, model, model
+    raw = [False, True, False, False, True, True]
+    state: bool | None = None
+    used = []
+    for i in range(len(raw)):
+        state, _ = sticky_decision(state, raw[: i + 1], 3)
+        used.append(state)
+    assert used == [False] * 6                                            # never flipped
+
+
+def test_selection_ledger_round_trip_and_same_day_replacement(tmp_path):
+    from datetime import date as _d
+
+    from umushroom.cli import append_selection_ledger, read_selection_ledger
+    p = tmp_path / "c" / "selection_etf.csv"
+    append_selection_ledger(p, _d(2026, 10, 20), False, False)
+    append_selection_ledger(p, _d(2026, 10, 21), True, False)
+    append_selection_ledger(p, _d(2026, 10, 21), True, True)               # re-run replaces
+    rows = read_selection_ledger(p)
+    assert [(r["run_date"].isoformat(), r["raw_use_model"], r["used_model"]) for r in rows] == [
+        ("2026-10-20", False, False), ("2026-10-21", True, True)]
+    assert read_selection_ledger(tmp_path / "missing.csv") == []
+
+
+def test_auto_decision_is_sticky_across_runs(tmp_path, monkeypatch, capsys):
+    """Three runs on the same data with auto_confirm_runs: 2 -- the ledger
+    carries the state, and the decision text says what it is waiting for."""
+    cfg = _config(tmp_path, selection="auto")
+    cfg.write_text(cfg.read_text() + "auto_confirm_runs: 2\n")
+    for _ in range(2):
+        rc, _o, _r = _run(monkeypatch, cfg, tmp_path, _fetch_factory(seed=5))
+        out = capsys.readouterr().out
+        assert rc == 0, out
+    ledger = (tmp_path / ".cache" / "selection_etf.csv").read_text().splitlines()
+    assert ledger[0] == "run_date,raw_use_model,used_model" and len(ledger) == 2  # same day
+
+
+def test_stale_data_exits_3_and_prints_not_ready(tmp_path, monkeypatch, capsys):
+    cfg = _config(tmp_path)
+    cfg.write_text(cfg.read_text() + "require_fresh_data: true\n")
+    rc, _o, _r = _run(monkeypatch, cfg, tmp_path, _fetch_factory(seed=5))   # data ends 2026-03
+    err = capsys.readouterr().err
+    assert rc == 3 and "NOT READY" in err and "has already closed" in err

@@ -43,11 +43,14 @@ from umushroom.web import (
     _NAV_CSS,
     Runner,
     Site,
+    _days,
     _default_held,
     _pretty,
     default_command,
     macro_body,
+    record_body,
     sell_body,
+    tracked_run,
     tracker_body,
 )
 
@@ -122,8 +125,18 @@ def build_pages(site: Site, run_url: str | None = None,
             held = _default_held(site, latest, payload)
             body = sell_body(site, latest, payload, held, today=today, picker=False)
         elif key == "tracker":
+            # v4.21: score the book the team HOLDS (the period's first run), not
+            # whatever ran this morning, and the week-by-week record under it
             try:
-                body = tracker_body(site.tracked(latest, payload, refresh=True), ccy)
+                shown = tracked_run(site, latest, payload)
+                shown_payload = payload if shown == latest else (site.payload(shown) or payload)
+                label = ("" if shown == latest else
+                         f"Your book is the orders of {html.escape(_pretty(shown))}, the "
+                         "first run of this holding period. ")
+                body = (tracker_body(site.tracked(shown, shown_payload, refresh=True), ccy,
+                                     label)
+                        + record_body(site.recorded(latest, payload, refresh=True),
+                                      _days(payload)))
             except Exception as e:  # noqa: BLE001 -- network errors vary
                 body = f'<p class="note">Could not get prices: {html.escape(str(e))}</p>'
         elif key == "macro":
@@ -297,6 +310,12 @@ def write_site(pages: dict[str, str], out: Path, password: str, salt: bytes,
     (out / "robots.txt").write_text("User-agent: *\nDisallow: /\n")
 
 
+# v4.21: the pipeline exits 3 when Yahoo has not published yesterday's closes
+# yet (data.check_freshness); the workflow then keeps the last good run and a
+# later slot retries, instead of publishing a run on stale signals
+NOT_READY_CODE = 3
+
+
 def build(site_dir: Path, out: Path, password: str, run_url: str | None = None,
           fetch: FetchFn = yahoo_closes,
           command: Callable[[Path, Path], list[str]] | None = None,
@@ -320,8 +339,12 @@ def build(site_dir: Path, out: Path, password: str, run_url: str | None = None,
     prune(runner)
     site = Site(runner, fetch)
     write_site(build_pages(site, run_url), out, password, site_salt(site_dir), iterations)
-    print(f"Site written to {out} ({'run OK' if ok else 'RUN FAILED -- showing last good'})")
-    return 0 if ok else 1
+    not_ready = (not ok and run_first
+                 and runner.history()[0].get("returncode") == NOT_READY_CODE)
+    state = ("run OK" if ok else "DATA NOT READY -- showing last good" if not_ready
+             else "RUN FAILED -- showing last good")
+    print(f"Site written to {out} ({state})")
+    return 0 if ok else NOT_READY_CODE if not_ready else 1
 
 
 def main(argv: list[str] | None = None) -> int:

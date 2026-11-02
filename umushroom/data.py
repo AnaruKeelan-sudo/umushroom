@@ -27,9 +27,10 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 
-from umushroom.exceptions import DataError, InsufficientHistoryError
+from umushroom.exceptions import DataError, InsufficientHistoryError, StaleDataError
 from umushroom.logging_config import get_logger
 from umushroom.universe import Listing, required_fx_tickers, resolve_universe
 
@@ -73,20 +74,32 @@ def _cache_is_fresh(path: Path, max_age_hours: float) -> bool:
     return age_hours < max_age_hours
 
 
+START_PREFIX = "start:"     # period "start:2016-10-01" = a FIXED first date
+
+
 def _yf_download(symbols: list[str], period: str
                  ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
     """ONE yfinance call: (closes, volumes). A symbol Yahoo could not serve
     (unknown ticker, or rate-limited) is an all-NaN column or absent --
     yfinance logs it but does not raise, so callers must inspect the result
-    (see missing_symbols)."""
+    (see missing_symbols).
+
+    `period` is a Yahoo period ("10y") or "start:YYYY-MM-DD" (v4.21). A
+    rolling period starts one day later every day, which moves every
+    training-sample date and every walk-forward fold boundary: the live
+    picks of 2026-10-26 and 10-27 shared 2 of 10 names on identical data.
+    A fixed first date keeps them put until the data itself changes."""
     # Imported lazily so the whole offline test suite (and any library
     # use that passes its own prices) never needs yfinance importable.
     import yfinance as yf
 
-    raw = yf.download(
-        symbols, period=period, interval="1d",
-        auto_adjust=True, progress=False, threads=True,
-    )
+    kwargs: dict = {"interval": "1d", "auto_adjust": True, "progress": False,
+                    "threads": True}
+    if period.startswith(START_PREFIX):
+        kwargs["start"] = period[len(START_PREFIX):]
+    else:
+        kwargs["period"] = period
+    raw = yf.download(symbols, **kwargs)
     if raw is None or raw.empty:
         raise DataError("yfinance returned an empty result")
     closes = raw.get("Close", raw) if isinstance(raw, pd.DataFrame) else raw
@@ -408,6 +421,28 @@ def snapshot_fetcher(path: str | Path | None = None) -> SnapshotFetcher | None:
     return SnapshotFetcher(p)
 
 
+def last_trading_day_before(today: date) -> date:
+    """The last weekday strictly before `today` (weekends only; a market
+    holiday on that day is reported as missing data, which is the safe
+    direction: the run waits instead of trading on an older close)."""
+    return np.busday_offset(np.datetime64(today), -1, roll="forward").astype(date)
+
+
+def check_freshness(last_date: date, today: date) -> None:
+    """Raise StaleDataError unless the data reaches the last trading day
+    before `today`. The 2026-10-21..27 GitHub runs each worked from the
+    close two days back because Yahoo had not yet published the previous
+    day's European closes at 07:00 UTC; the validation suite puts the cost
+    of a one-day execution delay at about half the edge."""
+    expected = last_trading_day_before(today)
+    if last_date < expected:
+        raise StaleDataError(
+            f"the latest close in the data is {last_date}, but {expected} has already "
+            f"closed. Yahoo has not published it yet (or every market was shut that "
+            f"day). Refusing to build signals on stale prices -- run again later, or "
+            f"set require_fresh_data: false to override.")
+
+
 def drop_incomplete_last_bar(data: pd.DataFrame, today: date) -> pd.DataFrame:
     """Drop any bar dated `today` or later.
 
@@ -503,6 +538,7 @@ def get_market_data(
     ragged: bool = False,
     yahoo_symbols: dict[str, str] | None = None,
     max_missing_fraction: float = MAX_MISSING_FRACTION,
+    require_fresh: bool = False,
 ) -> MarketData:
     """Fetch, validate and currency-convert the full universe.
 
@@ -605,6 +641,9 @@ def get_market_data(
         raise InsufficientHistoryError(
             f"Only {len(prices)} days remain after FX alignment; "
             f"need {min_history_days}")
+
+    if require_fresh:
+        check_freshness(prices.index[-1].date(), today or datetime.now(LOCAL_TZ).date())
 
     raw_last = equities.reindex(index=prices.index, columns=prices.columns).iloc[-1]
     stale = frozenset(raw_last[raw_last.isna()].index)
