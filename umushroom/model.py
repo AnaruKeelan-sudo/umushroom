@@ -85,6 +85,25 @@ GBM_LEARNING_RATE = 0.05
 GBM_LEAVES = 15
 GBM_MIN_LEAF = 100
 GBM_L2 = 1.0
+# v4.23: histogram gradient boosting bins every feature into at most 255
+# levels. Above 200,000 training rows scikit-learn chooses the bin edges from
+# a SEEDED random subsample of the rows, so with the live stock sleeve
+# (244,000 rows on 2026-11-02) the trees -- and 2-3 of the 10 live picks,
+# and most weights -- changed with `random_seed`. The features are centred
+# percentile ranks in [-0.5, 0.5]; snapping them to 255 equally spaced levels
+# first leaves at most 255 distinct values per feature, which scikit-learn
+# then uses as the bins themselves: identical for every seed and subsample,
+# and the same 255-level resolution the learner had anyway.
+GBM_BINS = 255
+GBM_BIN_MODES: tuple[str, ...] = ("fixed", "subsample")
+
+
+def quantize_ranks(X: pd.DataFrame, levels: int = GBM_BINS) -> pd.DataFrame:
+    """Snap centred-rank features in [-0.5, 0.5] to `levels` equally spaced
+    values (NaN stays NaN). Idempotent."""
+    v = np.clip(X.to_numpy(dtype=float), -0.5, 0.5)
+    q = np.round((v + 0.5) * (levels - 1)) / (levels - 1) - 0.5
+    return pd.DataFrame(q, index=X.index, columns=X.columns)
 
 
 def _row_dates(X: pd.DataFrame) -> pd.Index:
@@ -109,17 +128,20 @@ def mean_date_ic(preds: pd.Series, y: pd.Series) -> float:
 class RankingModel:
     def __init__(self, alpha: float = 1.0, random_seed: int = 42,
                  n_cv_splits: int = 5, model_type: str = "ridge",
-                 purge_dates: int = 1):
+                 purge_dates: int = 1, gbm_bins: str = "subsample"):
         if model_type not in MODEL_TYPES:
             raise ValueError(f"model_type must be one of {MODEL_TYPES}, "
                              f"got {model_type!r}")
         if purge_dates < 0:
             raise ValueError("purge_dates must be >= 0")
+        if gbm_bins not in GBM_BIN_MODES:
+            raise ValueError(f"gbm_bins must be one of {GBM_BIN_MODES}, got {gbm_bins!r}")
         self.alpha = alpha
         self.random_seed = random_seed
         self.n_cv_splits = n_cv_splits
         self.model_type = model_type
         self.purge_dates = purge_dates
+        self.gbm_bins = gbm_bins
         self._model = self._make_estimator()
         self._is_fitted = False
         self._feature_names: list[str] | None = None
@@ -147,12 +169,18 @@ class RankingModel:
             alpha=MLP_L2, batch_size=MLP_BATCH, learning_rate_init=MLP_LEARNING_RATE,
             max_iter=MLP_MAX_EPOCHS, shuffle=True, random_state=self.random_seed)
 
+    def _prep(self, X: pd.DataFrame) -> pd.DataFrame:
+        """v4.23: the gradient-boosting learner sees seed-independent bins."""
+        if self.model_type == "gbm" and self.gbm_bins == "fixed":
+            return quantize_ranks(X)
+        return X
+
     def _fit_estimator(self, est, X: pd.DataFrame, y: pd.Series
                        ) -> dict[str, float | str]:
         """Fit one estimator. For the MLP this is the early-stopping loop
         judged on the latest block of DATES (see module docstring)."""
         if self.model_type != "mlp":
-            est.fit(X, y)
+            est.fit(self._prep(X), y)
             return {}
         dates = _row_dates(X)
         unique = pd.Index(sorted(pd.Index(dates).unique()))
@@ -224,7 +252,8 @@ class RankingModel:
             te_mask = row_dates.isin(unique_dates[te_d])
             fold_model = self._make_estimator()
             self._fit_estimator(fold_model, X[tr_mask], y[tr_mask])
-            preds = pd.Series(fold_model.predict(X[te_mask]), index=X.index[te_mask])
+            preds = pd.Series(fold_model.predict(self._prep(X[te_mask])),
+                              index=X.index[te_mask])
             y_te = y[te_mask]
             fold_rmse.append(float(np.sqrt(mean_squared_error(y_te, preds))))
             for d in unique_dates[te_d]:
@@ -278,7 +307,7 @@ class RankingModel:
                 f"Feature columns at predict time {list(X.columns)} don't "
                 f"match training-time columns {self._feature_names}"
             )
-        preds = self._model.predict(X)
+        preds = self._model.predict(self._prep(X))
         return pd.Series(preds, index=X.index, name="predicted_return")
 
     @property
@@ -326,6 +355,7 @@ class RankingModel:
             "random_seed": self.random_seed,
             "model_type": self.model_type,
             "purge_dates": self.purge_dates,
+            "gbm_bins": self.gbm_bins,
             "feature_names": self._feature_names,
             "cv_rmse_mean": self._cv_rmse_mean,
             "cv_rmse_std": self._cv_rmse_std,
@@ -340,7 +370,8 @@ class RankingModel:
         meta = json.loads(path.with_suffix(".meta.json").read_text())
         instance = cls(alpha=meta["alpha"], random_seed=meta["random_seed"],
                        model_type=meta.get("model_type", "ridge"),
-                       purge_dates=int(meta.get("purge_dates", 1)))
+                       purge_dates=int(meta.get("purge_dates", 1)),
+                       gbm_bins=str(meta.get("gbm_bins", "subsample")))
         instance._model = joblib.load(path.with_suffix(".joblib"))
         instance._feature_names = meta["feature_names"]
         instance._cv_rmse_mean = meta.get("cv_rmse_mean")

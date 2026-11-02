@@ -605,3 +605,11 @@ def test_shipped_config_v421_settings():
     # ETPs -> equal weight again, with the near-duplicate guard on
     assert etf.weighting == "equal" and sleeve_pick_correlation(cfg, etf) == 0.9
     assert sleeve_model_type(cfg, etf) == "ridge"
+
+
+def test_gbm_bins_is_parsed_and_validated(tmp_path):
+    """v4.23: the gradient-boosting bin mode; default = the old seeded subsample."""
+    assert load_config(_write(tmp_path, VALID_YAML)).gbm_bins == "subsample"
+    assert load_config(_write(tmp_path, VALID_YAML + "\ngbm_bins: fixed\n")).gbm_bins == "fixed"
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, VALID_YAML + "\ngbm_bins: sometimes\n"))

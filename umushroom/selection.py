@@ -46,6 +46,17 @@ MIN_CORR_OBS = 60
 SimilarFn = Callable[[str, list[str]], bool]
 
 
+def rank_order(preds: pd.Series) -> list[str]:
+    """Tickers best first. v4.22: a STABLE sort over an alphabetically sorted
+    index, so two equal scores always come out in the same order (ticker
+    order) rather than in whatever order the unstable default sort left
+    them -- the one place on the path from scores to orders where the
+    result could otherwise depend on memory layout."""
+    if preds.empty:
+        return []
+    return preds.sort_index().sort_values(ascending=False, kind="mergesort").index.tolist()
+
+
 def _sector(t: str, sectors: Mapping[str, str]) -> str:
     s = sectors.get(t)
     return s if s else f"?{t}"

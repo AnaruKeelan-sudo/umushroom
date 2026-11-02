@@ -26,6 +26,7 @@ from umushroom.exceptions import InsufficientHistoryError
 from umushroom.features import MIN_BARS_REQUIRED, build_feature_panel
 from umushroom.logging_config import get_logger
 from umushroom.model import RankingModel
+from umushroom.selection import rank_order
 
 logger = get_logger("backtest")
 
@@ -101,7 +102,7 @@ def run_backtest(
             continue
 
         preds = model.predict(feats)
-        picks = preds.sort_values(ascending=False).head(top_n).index.tolist()
+        picks = rank_order(preds)[:top_n]
 
         fwd_ratio = data.iloc[idx + rebalance_days][picks] / data.iloc[idx][picks]
         strategy_period_return = float((fwd_ratio - 1).mean())

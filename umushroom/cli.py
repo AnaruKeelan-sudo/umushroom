@@ -49,7 +49,7 @@ from umushroom.factor_regression import (
 from umushroom.factor_risk import factor_weight
 from umushroom.features import hierarchical_groups
 from umushroom.logging_config import configure_logging, get_logger
-from umushroom.model import MODEL_TYPES, RankingModel
+from umushroom.model import GBM_BIN_MODES, MODEL_TYPES, RankingModel
 from umushroom.montecarlo import combine_sleeves, simulate
 from umushroom.portfolio_construction import hrp_weight
 from umushroom.prediction_log import evaluate_latest_predictions, log_predictions
@@ -148,6 +148,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="v4.20: head-to-head of the near-duplicate guard, e.g. etf:0.9,0.95 "
              "(max trailing return correlation between two picks) vs. no guard. "
              "Same rule as --compare-weighting.")
+    parser.add_argument(
+        "--compare-gbm-bins", metavar="SLEEVE:MODE,MODE", default=None,
+        help="v4.23: head-to-head of the gradient-boosting bin edges, e.g. "
+             "equity:fixed,subsample (seed-independent bins vs. scikit-learn's seeded "
+             "subsample). Same rule as --compare-model.")
     parser.add_argument(
         "--compare-baseline", action="store_true",
         help="Also run the v4.3 equity setup on the same data and print a "
@@ -499,7 +504,8 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
         dollar_volume=dvol, feature_set=sleeve.feature_set)
     purge_dates = math.ceil(horizon / cfg.rebalance_days)
     model = RankingModel(alpha=cfg.model_alpha, random_seed=cfg.random_seed,
-                         model_type=model_type, purge_dates=purge_dates)
+                         model_type=model_type, purge_dates=purge_dates,
+                         gbm_bins=cfg.gbm_bins)
     cv_stats = model.cross_validate(X, y, purge_dates=purge_dates)
     model.fit(X, y)
     print(f"\n--- Feature importance ({model.importance_label}) ---")
@@ -556,7 +562,8 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
                                  [int(d) for d in days.split(",") if d.strip()])
         for flag, fn in (("compare_model", compare_models),
                          ("compare_weighting", compare_weightings),
-                         ("compare_dedup", compare_dedup)):
+                         ("compare_dedup", compare_dedup),
+                         ("compare_gbm_bins", compare_gbm_bins)):
             spec = getattr(args, flag, None)
             if spec:
                 name, _, items = str(spec).partition(":")
@@ -794,6 +801,7 @@ def _walk_forward_kwargs(cfg: StrategyConfig, sleeve: SleeveConfig,
         "max_per_sector": cap_n,
         "feature_set": sleeve.feature_set,
         "model_type": sleeve_model_type(cfg, sleeve),
+        "gbm_bins": cfg.gbm_bins,
         "max_pick_correlation": sleeve_pick_correlation(cfg, sleeve),
         "weight_fn": weight_fn,
     }
@@ -1189,6 +1197,30 @@ def compare_models(cfg: StrategyConfig, sleeve: SleeveConfig, prices: pd.DataFra
     if best:
         print(f"To adopt it, set model_type: {best} under sleeves.{sleeve.name} "
               f"(or at the top level for the stock sleeve) in config.yaml.")
+    return best
+
+
+def compare_gbm_bins(cfg: StrategyConfig, sleeve: SleeveConfig, prices: pd.DataFrame,
+                     wf: dict[str, Any], groups: dict[str, str] | None,
+                     modes: list[str]) -> str | None:
+    """`--compare-gbm-bins SLEEVE:fixed,subsample` (v4.23). Rule, declared
+    before the first result was seen: fixed bins are a correctness fix (the
+    orders stop depending on `random_seed`), so they are adopted unless they
+    cost skill -- the learner rule decides, with "fixed" as the simpler
+    setting (ties go to it)."""
+    bad = [m for m in modes if m not in GBM_BIN_MODES]
+    if bad:
+        print(f"\nBin-mode comparison refused: unknown mode(s) {bad}; "
+              f"choose from {GBM_BIN_MODES}.")
+        return None
+    if sleeve_model_type(cfg, sleeve) != "gbm":
+        print(f"\nBin-mode comparison skipped: sleeve '{sleeve.name}' does not use gbm.")
+        return None
+    variants = {m: {"gbm_bins": m} for m in dict.fromkeys(modes)}
+    best = compare_variants(cfg, sleeve, prices, wf, "GBM bins", variants, cfg.gbm_bins,
+                            SKILL_RULE, simplicity=["fixed", "subsample"])
+    if best:
+        print(f"To adopt it, set gbm_bins: {best} in config.yaml.")
     return best
 
 

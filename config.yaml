@@ -773,6 +773,20 @@ starting_balance: 100000        # contest virtual capital (in base_currency)
 # (VaR 3.99% vs 3.16%); HRP below brings that back down.
 # Re-check any time: `python -m umushroom.cli --config config.yaml --validate`.
 model_type: "gbm"
+# v4.23 (2026-11-02): gradient-boosting bin edges. scikit-learn bins every
+# factor into 255 levels; above 200,000 training rows it picks the edges from
+# a SEEDED random subsample, and the live stock fit has 244,000 rows -- so
+# the trees, 2-3 of the 10 picks and most weights changed with random_seed
+# (seeds 42-45 shared only 7 of 10 names). "fixed" snaps the rank features to
+# 255 levels first (model.quantize_ranks): the same resolution, identical for
+# every seed -- verified: seeds 42 and 43 now give identical orders.
+#   python -m umushroom.cli --config config.yaml --compare-gbm-bins equity:fixed,subsample
+#   (30-day folds, 2016-10-03 .. 2026-10-30; rule declared first: learner rule)
+#   fixed      IC t +6.09  6-week active +1.82% (t +3.03)  win 75%  alpha +16.0%/yr  VaR95/wk 3.12%
+#   subsample  IC t +6.21  6-week active +1.88% (t +2.54)  win 63%  alpha +17.3%/yr  VaR95/wk 3.51%
+#   -> fixed wins the rule (highest contest-window active t) AND removes the
+#   seed dependence. "subsample" = the pre-4.23 behaviour.
+gbm_bins: "fixed"
 # Weighting of the stock sleeve: equal | hrp | factor (the walk-forward scores
 # the same scheme, capped at 2x equal weight like live orders).
 #   python -m umushroom.cli --config config.yaml --compare-weighting equity:equal,hrp,factor

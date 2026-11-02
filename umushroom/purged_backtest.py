@@ -64,7 +64,7 @@ from umushroom.features import (
 from umushroom.logging_config import get_logger
 from umushroom.model import RankingModel
 from umushroom.portfolio_construction import cap_weights, equal_weight
-from umushroom.selection import capped_top, correlation_filter
+from umushroom.selection import capped_top, correlation_filter, rank_order
 
 # v4.20: (prices, picks, as_of_idx) -> weights. The backtest scores every
 # period with the SAME weighting scheme the live run trades (HRP or factor
@@ -250,6 +250,7 @@ def run_purged_walk_forward(
     random_seed: int,
     target: str = "rank",
     groups: dict[str, str] | None = None,
+    gbm_bins: str = "subsample",
     dollar_volume: pd.DataFrame | None = None,
     entry_delay_days: int = 0,
     shuffle_seed: int | None = None,
@@ -358,7 +359,8 @@ def run_purged_walk_forward(
 
         model = RankingModel(alpha=model_alpha, random_seed=random_seed,
                              model_type=model_type,
-                             purge_dates=math.ceil(forward_return_days / rebalance_days))
+                             purge_dates=math.ceil(forward_return_days / rebalance_days),
+                             gbm_bins=gbm_bins)
         model.fit(X_train, y_train)
 
         fold_id += 1
@@ -380,7 +382,7 @@ def run_purged_walk_forward(
             preds, realized = preds[ok], realized[ok]
             if len(preds) < top_n:
                 continue
-            ranked = preds.sort_values(ascending=False)
+            ranked = preds.reindex(rank_order(preds))       # best first, ties by ticker
             too_similar = (correlation_filter(data, idx, max_pick_correlation)
                            if max_pick_correlation else None)
             picks = capped_top(ranked.index, top_n, sectors, max_per_sector, too_similar)
