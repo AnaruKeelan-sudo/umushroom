@@ -285,6 +285,9 @@ config.yaml       # Your contest's parameters — edit this, not the code
   data size -- see `model.py`'s docstring.
 
 
+Every instrument in the tables has a **Buy / sell** link to its page on UMushroom (v4.24),
+so an order can be entered straight from the Stocks, ETFs, When to sell and Tracker tabs.
+
 ## Nothing on the path to the orders is random (v4.23)
 
 The orders are a deterministic function of the price data and `config.yaml`: two runs on

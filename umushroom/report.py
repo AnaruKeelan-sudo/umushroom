@@ -636,16 +636,16 @@ def _price(v: float) -> str:
 
 
 def _orders_table(orders: list[dict], ccy: str) -> str:
-    head = ["Sleeve", "Ticker", "Name", "Sector", "Shares", "Price (local)", "Value " + ccy,
-            "Portfolio %", "1M", "3M", "12M", "Volatility", "Priced from"]
+    head = ["Sleeve", "Ticker", "Trade", "Name", "Sector", "Shares", "Price (local)",
+            "Value " + ccy, "Portfolio %", "1M", "3M", "12M", "Volatility", "Priced from"]
     rows = []
     for o in orders:
         lp = o.get("local_price")
         price = ("n/a" if lp is None else
                  f"{_price(lp)} {o.get('listing_currency') or ''}".strip())
         shares = o.get("shares")
-        rows.append([o.get("sleeve", ""), o["ticker"], o.get("name") or "",
-                     o.get("sector") or "",
+        rows.append([o.get("sleeve", ""), o["ticker"], trade_link(o.get("url")),
+                     o.get("name") or "", o.get("sector") or "",
                      "" if shares is None else f"{shares:g}", price,
                      _num(o.get("allocated_value"), 0),
                      "n/a" if o.get("portfolio_weight") is None
@@ -657,10 +657,10 @@ def _orders_table(orders: list[dict], ccy: str) -> str:
 
 
 def _top_table(top: list[dict]) -> str:
-    head = ["Rank", "Ticker", "Name", "Sector", "Exchange", "Better than", "In portfolio",
-            "1M", "3M", "12M", "Volatility"]
-    rows = [[str(t.get("rank", "")), t["ticker"], t.get("name") or "",
-             t.get("sector") or "", t.get("exchange") or "",
+    head = ["Rank", "Ticker", "Trade", "Name", "Sector", "Exchange", "Better than",
+            "In portfolio", "1M", "3M", "12M", "Volatility"]
+    rows = [[str(t.get("rank", "")), t["ticker"], trade_link(t.get("url")),
+             t.get("name") or "", t.get("sector") or "", t.get("exchange") or "",
              "n/a" if t.get("rank_pct") is None else f"{t['rank_pct']:.0%} of universe",
              "yes" if t.get("held") else "", _pct(t.get("ret_1m")), _pct(t.get("ret_3m")),
              _pct(t.get("ret_12m")),
@@ -668,10 +668,23 @@ def _top_table(top: list[dict]) -> str:
     return _plain_table(head, rows)
 
 
+class Raw(str):
+    """A table cell that is already HTML (a link); everything else is escaped."""
+
+
+def trade_link(url: object) -> Raw:
+    """v4.24: the instrument's buy / sell page on UMushroom, opened in a new
+    tab; an empty cell when the universe files know no page for it."""
+    if not url or not isinstance(url, str):
+        return Raw("")
+    return Raw(f'<a class="trade" href="{_esc(url)}" target="_blank" rel="noopener">'
+               "Buy / sell</a>")
+
+
 def _plain_table(head: list[str], rows: list[list[str]]) -> str:
     th = "".join(f"<th>{_esc(h)}</th>" for h in head)
-    trs = "".join("<tr>" + "".join(f"<td>{_esc(c)}</td>" for c in r) + "</tr>"
-                  for r in rows)
+    trs = "".join("<tr>" + "".join(f"<td>{c if isinstance(c, Raw) else _esc(c)}</td>"
+                                   for c in r) + "</tr>" for r in rows)
     return (f'<div class="scroll"><table class="data"><thead><tr>{th}</tr></thead>'
             f'<tbody>{trs}</tbody></table></div>')
 
@@ -775,8 +788,8 @@ SECTIONS: list[tuple[str, str]] = [
 
 
 def _etf_orders_table(orders: list[dict], ccy: str) -> str:
-    head = ["Ticker", "UMushroom", "Name", "Asset class", "Shares", "Price (local)",
-            "Value " + ccy, "Portfolio %", "1M", "3M", "12M", "Volatility"]
+    head = ["Ticker", "Trade", "UMushroom", "Name", "Asset class", "Shares",
+            "Price (local)", "Value " + ccy, "Portfolio %", "1M", "3M", "12M", "Volatility"]
     rows = []
     for o in orders:
         lp = o.get("local_price")
@@ -786,7 +799,8 @@ def _etf_orders_table(orders: list[dict], ccy: str) -> str:
         um = o.get("umushroom_symbol") or ""
         if o.get("umushroom_currency"):
             um = f"{um} ({o['umushroom_currency']})".strip()
-        rows.append([o["ticker"], um, o.get("name") or "", o.get("sector") or "",
+        rows.append([o["ticker"], trade_link(o.get("url")), um, o.get("name") or "",
+                     o.get("sector") or "",
                      "" if shares is None else f"{shares:g}", price,
                      _num(o.get("allocated_value"), 0),
                      "n/a" if o.get("portfolio_weight") is None
@@ -797,9 +811,10 @@ def _etf_orders_table(orders: list[dict], ccy: str) -> str:
 
 
 def _etf_top_table(top: list[dict]) -> str:
-    head = ["Rank", "Ticker", "UMushroom", "Name", "Asset class", "Currency",
+    head = ["Rank", "Ticker", "Trade", "UMushroom", "Name", "Asset class", "Currency",
             "Better than", "In portfolio", "1M", "3M", "12M", "Volatility"]
-    rows = [[str(t.get("rank", "")), t["ticker"], t.get("umushroom_symbol") or "",
+    rows = [[str(t.get("rank", "")), t["ticker"], trade_link(t.get("url")),
+             t.get("umushroom_symbol") or "",
              t.get("name") or "", t.get("asset_class") or "", t.get("currency") or "",
              "n/a" if t.get("rank_pct") is None else f"{t['rank_pct']:.0%} of universe",
              "yes" if t.get("held") else "", _pct(t.get("ret_1m")), _pct(t.get("ret_3m")),
@@ -1317,6 +1332,10 @@ table.data{background:var(--surface-1);border:1px solid var(--border)}
 ul.checks{list-style:none;padding:0;margin:8px 0 0;font-size:13px}ul.checks li{margin:6px 0}
 .badge{display:inline-block;font-size:11px;font-weight:700;padding:1px 6px;border-radius:4px;
  border:1px solid currentColor}
+a.trade{display:inline-block;font-size:12px;font-weight:600;padding:2px 9px;border-radius:999px;
+ background:var(--accent-soft,rgba(42,120,214,.14));color:var(--series-1);text-decoration:none;
+ white-space:nowrap}
+a.trade:hover{background:var(--series-1);color:#fff}
 .badge.pass{color:var(--good)}.badge.warn{color:var(--warn)}.badge.fail{color:var(--bad)}
 .notes li{margin:6px 0;color:var(--text-secondary)}
 """

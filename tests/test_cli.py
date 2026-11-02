@@ -363,10 +363,14 @@ def test_cli_report_writes_dashboard_with_monte_carlo(tmp_path, monkeypatch, cap
         purged_embargo_days: 5
         purged_min_train_days: 504
         prediction_log_path: "{tmp_path / 'pred.csv'}"
+        sector_file: "sectors.csv"
         sleeves:
           crypto: {{weight: 0.1, selection: all, weighting: equal, fractional: true,
                     tickers: {crypto}}}
     """))
+    # v4.24: the universe file's urlName gives every stock its UMushroom page
+    (tmp_path / "sectors.csv").write_text("yahoo,sector,urlName\n" + "\n".join(
+        f"{t},technology,{t.lower().replace('.', '-')}-co" for t in stocks))
     real = data_mod.get_market_data
     monkeypatch.setattr(data_mod, "get_market_data",
                         lambda **kw: real(**kw, fetcher=_fake_fetcher_7day))
@@ -384,6 +388,11 @@ def test_cli_report_writes_dashboard_with_monte_carlo(tmp_path, monkeypatch, cap
     assert len(data["mc"]["weeks"]) == 7                  # week 0..6
     assert {s["name"] for s in data["sleeves"]} == {"equity", "crypto"}
     assert data["deciles"] and data["top"]
+    stock_rows = [o for o in data["orders"] if o["sleeve"] == "equity"]
+    assert stock_rows and all(o["url"].startswith("https://umushroom.com/en/equity/")
+                              for o in stock_rows)
+    assert all(t["url"] for t in data["top"])
+    assert 'class="trade"' in html and "Buy / sell" in html
 
 
 def test_cli_compare_sector_cap_prints_verdict(tmp_path, monkeypatch, capsys):

@@ -74,7 +74,7 @@ from umushroom.selection import (
     decide_cap,
     top_sector_share,
 )
-from umushroom.universe import check_concentration
+from umushroom.universe import check_concentration, instrument_url
 from umushroom.validation import ValidationReport, decile_returns, run_validation
 from umushroom.window import (
     FAIL,
@@ -337,6 +337,10 @@ def _write_report(cfg: StrategyConfig, args: argparse.Namespace,
                                    for t in orders.index]
     orders["portfolio_weight"] = orders["allocated_value"] / cfg.starting_balance
 
+    def url(t: str) -> str:              # v4.24: the buy / sell page on UMushroom
+        return instrument_url(etf_meta.get(t), meta_rows.get(t))
+    orders["url"] = [url(t) for t in orders.index]
+
     top = pd.DataFrame()
     eq_alloc = next((a for s, a in allocations if s.name == EQUITY_SLEEVE), None)
     if eq_alloc is not None:
@@ -349,6 +353,7 @@ def _write_report(cfg: StrategyConfig, args: argparse.Namespace,
         top["sector"] = [meta(t, "sector").replace("-", " ") for t in top.index]
         top["exchange"] = [market.listings[t].exchange for t in top.index]
         top["held"] = [1 if t in eq_alloc.orders.index else 0 for t in top.index]
+        top["url"] = [url(t) for t in top.index]
         top = top.join(stock_snapshot(market.prices, list(top.index)))
 
     # v4.19: the ETF sleeve's own ranking table (top 25), with asset class
@@ -369,6 +374,7 @@ def _write_report(cfg: StrategyConfig, args: argparse.Namespace,
                                  for t in tb.index]
         tb["currency"] = [market.listings[t].currency for t in tb.index]
         tb["held"] = [1 if t in al.orders.index else 0 for t in tb.index]
+        tb["url"] = [url(t) for t in tb.index]
         top_etfs[sl.name] = tb.join(stock_snapshot(market.prices, list(tb.index)))
 
     deciles = None

@@ -1,5 +1,19 @@
 # Changelog
 
+## 4.24.0 (2026-11-02) -- a buy / sell link next to every instrument
+- Every table that lists an instrument (today's orders, top-ranked stocks,
+  the ETF orders and ranking, the sell tab's trade list, the Tracker's
+  holdings) gets a **Trade** column with a "Buy / sell" link to the
+  instrument's own page on UMushroom, opened in a new tab. The links are the
+  platform's published pages: `/en/equity/<urlName>` from
+  umushroom_universe_mapped.csv and `/en/etf/<url_name>` from the ETF
+  universe file (both scraped from UMushroom's sitemaps), built by
+  `universe.instrument_url`; an instrument the universe files do not know
+  simply has no link. Carried in the report payload as `url`, so the
+  website and the stored full reports show it too.
+- 4 new tests (the URL patterns, the tables and escaping, the payload lookup
+  and the Tracker).
+
 ## 4.23.0 (2026-11-02) -- nothing on the path to the orders is random
 An audit of the model-to-orders path ("check that no allocation is randomly
 done"), with the one real finding fixed behind a pre-declared head-to-head:

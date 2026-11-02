@@ -163,6 +163,7 @@ def test_write_then_load_universe_exposes_tickers_groups_and_overrides(tmp_path)
     # a USD line on London needs an override; a pence line does not
     assert uni.currency_overrides == {"IWDA.L": "USD"}
     assert uni.meta["IWDA.L"]["umushroom_symbol"] == "IWDA"
+    assert uni.meta["IWDA.L"]["url_name"] == "x"          # v4.24: its page on UMushroom
     assert uni.status_counts == {"ok": 2, "no_candidates": 1}
     assert "2 tradeable of 3" in uni.summary()
 
