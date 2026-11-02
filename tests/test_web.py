@@ -207,10 +207,18 @@ def test_tracker_caches_prices_and_refresh_refetches(site):
     _run_once(runner, base)
     _get(base + "/tracker")
     _get(base + "/tracker")
-    assert len(runner.yahoo.calls) == 1
+    assert len(runner.yahoo.calls) == 2      # one for the run, one for the record
     stamp = runner.latest_report()
     _get(f"{base}/tracker?run={stamp}&refresh=1")
-    assert len(runner.yahoo.calls) == 2
+    assert len(runner.yahoo.calls) == 4
+
+
+def test_tracker_has_the_week_by_week_record(site):
+    runner, base = site
+    _run_once(runner, base)
+    _, body = _get(base + "/tracker")
+    assert "Week by week" in body and "so far, to 2026-10-06" in body
+    assert "+10.00%" in body                     # this week's book so far
 
 
 def test_tracker_survives_download_failure(tmp_path):

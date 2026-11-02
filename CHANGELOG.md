@@ -48,10 +48,25 @@ the rest). Four defects in HOW it ran, all fixed here:
   guard 0.90) IC t +2.91, alpha -0.4%, 6-week active -0.47% (t -0.83),
   51% -- WARN -> core basket. Two consecutive runs on the same data now
   give identical orders.
-- 21 new tests (freshness, fixed-start fetch and cache key, cadence known
-  answers, sell-tab hold/rebalance, hysteresis, ledger, exit code 3 in the
-  CLI and the static site, VaR tolerance, the PASS gate, config, shipped
-  config).
+- TRACKER READ "0 / 21 UP" (2026-11-02). The published Tracker tab scored
+  the run that had just been published against the latest close -- which
+  IS that run's prediction close -- so every holding showed +0.00% and the
+  tiles said "Up / down 0 / 21", as if every pick had failed. It also
+  tracked whatever ran that morning, not the book the team holds.
+  `tracker.py`: `TrackerResult.newer` says whether any close after the
+  prediction exists (the page now says "no close newer than <date> yet"
+  instead of 0 / N); `track(until=...)` scores a book to the close the next
+  book was bought at; `record()` scores every book of the weekly rule
+  (`rebalance.books`) with one download, against IWDA.L (MSCI World) over
+  the same closes. The static site's Tracker shows the book you hold
+  (`web.tracked_run`: this period's first run, or the latest run when it
+  opens a new period) and a "Week by week" table under it; the local site
+  keeps its run picker and gains the same table.
+- 29 new tests (freshness, fixed-start fetch and cache key, cadence known
+  answers, books, sell-tab hold/rebalance, hysteresis, ledger, exit code 3
+  in the CLI and the static site, VaR tolerance, the PASS gate, config,
+  shipped config, the tracker's `until`/`newer`/record and the static
+  site's held book, record and "no close yet").
 
 ## 4.20.0 (2026-10-19) -- data guard, near-duplicate guard, factor-risk weights, learner head-to-head
 Root-cause fixes for the ETF sleeve's bad 2026-10-19 run, each behind a

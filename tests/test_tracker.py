@@ -84,3 +84,45 @@ def test_no_orders_and_no_data():
     res = track(_payload([{"ticker": "A", "local_price": 1.0, "allocated_value": 1.0}]),
                 _fetch(pd.DataFrame()))
     assert res.priced == [] and res.change is None
+
+
+# ------------------------------------------------- v4.21: books and the record
+
+def test_until_caps_the_path_at_the_next_books_close():
+    closes = pd.DataFrame({"A": [100.0, 100.0, 120.0, 90.0]}, index=DAYS)
+    res = track(_payload([{"ticker": "A", "local_price": 100.0, "allocated_value": 100.0}]),
+                _fetch(closes), until="2026-10-05")
+    assert res.positions[0].change == pytest.approx(0.20)       # not the later 90
+    assert res.positions[0].last_date == "2026-10-05" and res.until == "2026-10-05"
+    assert res.newer and res.up == 1
+
+
+def test_no_close_after_the_prediction_is_not_a_result():
+    """The morning a run is published, its latest close IS the prediction
+    close: every change is 0.00% -- the site must not call that 0 of N up."""
+    closes = pd.DataFrame({"A": [100.0, 110.0]}, index=DAYS[:2])
+    res = track(_payload([{"ticker": "A", "local_price": 110.0, "allocated_value": 100.0}]),
+                _fetch(closes))
+    assert res.positions[0].change == 0.0 and res.up == 0
+    assert res.last_date == "2026-10-02" and not res.newer
+
+
+def test_record_scores_each_book_to_the_next_one_against_the_benchmark():
+    from umushroom.tracker import record
+    closes = pd.DataFrame({"A": [100.0, 100.0, 110.0, 121.0], "B": [50.0, 50.0, 40.0, 60.0],
+                           "IWDA.L": [10.0, 10.0, 10.5, 10.5]}, index=DAYS)
+    f = _fetch(closes)
+    week1 = _payload([{"ticker": "A", "local_price": 100.0, "allocated_value": 300.0},
+                      {"ticker": "B", "local_price": 50.0, "allocated_value": 100.0}],
+                     as_of="2026-10-02")
+    week2 = _payload([{"ticker": "A", "local_price": 110.0, "allocated_value": 100.0}],
+                     as_of="2026-10-05")
+    rows = record([("r1", week1, "2026-10-05"), ("r2", week2, None)], f)
+    assert len(f.calls) == 1 and f.calls[0][0] == ("A", "B", "IWDA.L")   # one download
+    r1, r2 = rows
+    assert r1.change == pytest.approx((300 * 1.1 + 100 * 0.8) / 400 - 1)  # +2.5%
+    assert r1.up == 1 and r1.n == 2 and r1.until == "2026-10-05"
+    assert r1.benchmark == pytest.approx(0.05) and r1.active == pytest.approx(0.025 - 0.05)
+    assert r2.change == pytest.approx(0.10) and r2.until is None
+    assert r2.benchmark == pytest.approx(0.0) and r2.last_date == "2026-10-06"
+    assert record([], f) == []

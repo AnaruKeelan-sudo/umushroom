@@ -172,3 +172,71 @@ def test_not_ready_run_returns_3_and_keeps_the_last_good_site(tmp_path):
                run_timeout=60, iterations=FAST)
     assert rc == NOT_READY_CODE == 3
     assert "last good" in _open((out / "index.html").read_text(), PW)
+
+
+# ------------------------------------------------- v4.21: the Tracker's book
+
+def _cmd_with_dates(tmp_path, dates):
+    """A fake pipeline whose report's as_of advances on every run."""
+    from tests.test_web import _report_html
+    it = iter(dates)
+
+    def make(report, orders):
+        src = tmp_path / f"src_{report.stem}.html"
+        src.write_text(_report_html(next(it)))
+        return [sys.executable, "-c",
+                f"import shutil;shutil.copy({str(src)!r},{str(report)!r})"]
+    return make
+
+
+def _yahoo_weeks(symbols, start):
+    import pandas as pd
+    days = pd.to_datetime(["2026-10-02", "2026-10-09", "2026-10-12"])
+    frame = pd.DataFrame({"AAA.L": [1000.0, 1100.0, 1210.0],
+                          "IWDA.L": [100.0, 102.0, 103.0]}, index=days)
+    return frame[[s for s in symbols if s in frame.columns]]
+
+
+def _build_twice(tmp_path, dates, fetch):
+    import time
+    site, out = tmp_path / "site", tmp_path / "public"
+    cmd = _cmd_with_dates(tmp_path, dates)
+    for i in range(2):
+        if i:
+            time.sleep(1.1)                               # a distinct run stamp
+        assert build(site, out, PW, fetch=fetch, command=cmd, run_first=True,
+                     run_timeout=60, iterations=FAST) == 0
+    return _open((out / "tracker.html").read_text(), PW)
+
+
+def test_tracker_scores_the_new_book_and_the_week_by_week_record(tmp_path):
+    # Fri 2 Oct signals -> week of 5 Oct; Fri 9 Oct signals -> a new week
+    tracker = _build_twice(tmp_path, ["2026-10-02", "2026-10-09"], _yahoo_weeks)
+    assert "close on 2026-10-09" in tracker and "+10.00%" in tracker   # 1100 -> 1210
+    assert "Week by week" in tracker
+    # the first week's book: 2 Oct -> 9 Oct +10%, MSCI World +2%, so +8% active
+    assert "+2.00%" in tracker and "+8.00%" in tracker and "1 of 1" in tracker
+    assert "so far, to 2026-10-12" in tracker
+
+
+def test_tracker_mid_week_scores_the_book_you_hold_not_this_mornings_run(tmp_path):
+    # Mon 5 Oct signals trade on Tue 6 Oct: the same week as the 2 Oct book
+    tracker = _build_twice(tmp_path, ["2026-10-02", "2026-10-05"], _yahoo_weeks)
+    assert "Your book is the orders of" in tracker and "close on 2026-10-02" in tracker
+    assert "+21.00%" in tracker                                   # 1000 -> 1210
+
+
+def test_tracker_says_no_close_yet_instead_of_zero_up(tmp_path):
+    """The live site read 'Up / down 0 / 21' every morning: the latest close
+    was the prediction close itself."""
+    import pandas as pd
+
+    def flat(symbols, start):
+        days = pd.to_datetime(["2026-10-01", "2026-10-02"])
+        return pd.DataFrame({s: [990.0, 1000.0] for s in symbols}, index=days)
+    out = tmp_path / "public"
+    assert build(tmp_path / "site", out, PW, fetch=flat, command=_fake_cmd(tmp_path),
+                 run_first=True, run_timeout=60, iterations=FAST) == 0
+    tracker = _open((out / "tracker.html").read_text(), PW)
+    assert "No close newer than 2026-10-02 yet" in tracker and "no close yet" in tracker
+    assert "0 / 1" not in tracker and ">Up / down</div>" not in tracker   # no tile

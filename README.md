@@ -292,7 +292,8 @@ python -m umushroom.web
 ```
 
 Opens http://127.0.0.1:8000 with a tab per section: **Overview**, **Stocks**, **When to sell**,
-**Tracker** (each pick's price now vs. at prediction), **Graphs**,
+**Tracker** (the book you hold since its prediction, and a week-by-week record of every
+book against MSCI World), **Graphs**,
 **Monte Carlo**, **Risk (VaR)**, **Macro**, **Checks** and **History**, plus a **Run now** button. Add `--daily 07:30` to run automatically every weekday.
 Stop it with Ctrl+C. Nothing leaves your computer.
 

@@ -133,6 +133,36 @@ def cadence(runs: Iterable[tuple[str, str]], latest: str,
     return Cadence(held, True, start, nxt)
 
 
+@dataclass(frozen=True)
+class Book:
+    """One holding period's book: the first run of the period, held from
+    the close its signals were built on until the next book's close."""
+    stamp: str
+    as_of: str
+    period_start: date
+    until: str | None         # the next book's as_of; None while still held
+
+
+def books(runs: Iterable[tuple[str, str]],
+          rebalance_days: int = DEFAULT_REBALANCE_DAYS) -> list[Book]:
+    """The weekly rule's books over a run history, oldest first: the first
+    successful run of every period (the run `cadence` holds). Each book is
+    scored from its own as_of close to the next book's as_of close -- the
+    close at which the team swaps one book for the next (the Tracker's
+    week-by-week record)."""
+    first: dict[int, tuple[str, str]] = {}
+    for stamp, as_of in runs:
+        k = period_index(trade_day(as_of), rebalance_days)
+        if k not in first or stamp < first[k][0]:
+            first[k] = (stamp, as_of)
+    ordered = [first[k] for k in sorted(first)]
+    out: list[Book] = []
+    for i, (stamp, as_of) in enumerate(ordered):
+        nxt = ordered[i + 1][1] if i + 1 < len(ordered) else None
+        out.append(Book(stamp, as_of, period_start(trade_day(as_of), rebalance_days), nxt))
+    return out
+
+
 def _num(v: object) -> float:
     try:
         f = float(v)  # type: ignore[arg-type]

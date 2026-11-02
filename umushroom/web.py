@@ -54,7 +54,7 @@ import numpy as np
 
 from umushroom import __version__
 from umushroom.macro import FBY, MacroResult, analyse, talking_points
-from umushroom.rebalance import DEFAULT_REBALANCE_DAYS, Cadence, cadence, plan
+from umushroom.rebalance import DEFAULT_REBALANCE_DAYS, Cadence, books, cadence, plan
 from umushroom.report import (
     _price,
     _tile,
@@ -63,7 +63,15 @@ from umushroom.report import (
     render_page,
     section_bodies,
 )
-from umushroom.tracker import FetchFn, TrackerResult, track, yahoo_closes
+from umushroom.tracker import (
+    BENCHMARK,
+    FetchFn,
+    RecordRow,
+    TrackerResult,
+    record,
+    track,
+    yahoo_closes,
+)
 
 STAMP_RE = re.compile(r"^\d{8}-\d{6}$")
 RUN_HEADER = "X-UMushroom-Run"
@@ -385,18 +393,26 @@ def _run_picker(runner: Runner, run: str, action: str) -> str:
             f'<a href="{action}?run={run}&amp;refresh=1">Refresh prices</a></form>')
 
 
-def tracker_body(res: TrackerResult, ccy: str) -> str:
-    out = [(f'<h2>Since the prediction</h2><p class="note">Each pick\'s latest close '
-            f"compared with its close on {html.escape(res.as_of)}, when the model chose "
-            f"it. Values are approximate: they ignore currency moves since then.</p>")]
+def tracker_body(res: TrackerResult, ccy: str, label: str = "") -> str:
+    out = [(f'<h2>Since the prediction</h2><p class="note">{label}Each pick\'s latest '
+            f"close compared with its close on {html.escape(res.as_of)}, when the model "
+            f"chose it. Values are approximate: they ignore currency moves since then.</p>")]
     priced = res.priced
     if not res.positions:
         return out[0] + '<p class="note">This run has no orders.</p>'
     if not priced:
         out.append('<p class="note">No prices found yet (Yahoo had nothing newer, or '
                    "the download failed). Try <b>Refresh prices</b> later.</p>")
+    elif not res.newer:
+        # v4.21: on the morning a run is published its latest close IS the
+        # prediction close -- every change is 0.00%, which the site used to
+        # show as "Up / down 0 / 21" as if the picks had all failed
+        out.append(f'<div class="due"><b>No close newer than {html.escape(res.as_of)} '
+                   "yet</b>Every holding still shows the price the model chose it at, so "
+                   "there is nothing to score: the first reading comes after the next "
+                   "close. Earlier books are scored week by week below.</div>")
     else:
-        up = sum(p.change > 0 for p in priced if p.change is not None)
+        up = res.up
         best = max(priced, key=lambda p: p.change or 0.0)
         worst = min(priced, key=lambda p: p.change or 0.0)
         last = max((p.last_date or "") for p in priced)
@@ -447,6 +463,55 @@ def tracker_body(res: TrackerResult, ccy: str) -> str:
     return "".join(out)
 
 
+def record_body(rows: list[RecordRow], days: int, benchmark: str = BENCHMARK) -> str:
+    """v4.21: the live track record -- one holding period's book per row,
+    scored to the close the next book was bought at, against the benchmark
+    over exactly the same closes."""
+    out = [(f'<h2>Week by week</h2><p class="note">Every holding period\'s book under '
+            f"the {days}-trading-day rule (the first run of the period), scored from the "
+            "close its signals were built on to the close the next book was bought at; "
+            f"the current book is scored so far. {html.escape(benchmark)} (MSCI World) "
+            "is scored over the same closes. Currency moves are ignored.</p>")]
+    if not rows:
+        return out[0] + '<p class="note">No books yet.</p>'
+    done = [r for r in rows if r.until and r.change is not None]
+    if done:
+        act = [r.active for r in done if r.active is not None]
+        beat = sum(1 for a in act if a > 0)
+        out.append('<section class="tiles">' + "".join([
+            _tile("Weeks scored", str(len(done)), "completed holding periods"),
+            _tile("Beat MSCI World", f"{beat} of {len(act)}" if act else "n/a", "weeks"),
+            _tile("Average week", f"{float(np.mean([r.change for r in done])):+.2%}",
+                  "the book, before currency"),
+            _tile("Average vs world", f"{float(np.mean(act)):+.2%}" if act else "n/a",
+                  "per week"),
+        ]) + "</section>")
+    head = ["Book", "Signals of", "Held until", "Book", "Up / down", "MSCI World",
+            "Book minus world"]
+    trs = []
+    for r in reversed(rows):                        # newest first
+        scored = bool(r.until) or bool(r.last_date and r.last_date > r.as_of[:10])
+        until = r.until or (f"so far, to {r.last_date}" if scored else "so far")
+        if r.change is None:
+            chg, ud, bench, act_s = "no prices", "", "", ""
+        elif not scored:
+            chg, ud, bench, act_s = "no close yet", "", "", ""
+        else:
+            chg, ud = f"{r.change:+.2%}", f"{r.up} / {r.n - r.up}"
+            bench = "n/a" if r.benchmark is None else f"{r.benchmark:+.2%}"
+            act_s = "n/a" if r.active is None else f"{r.active:+.2%}"
+        trs.append(
+            f"<tr><td>{html.escape(_pretty(r.stamp))}</td><td>{html.escape(r.as_of[:10])}"
+            f"</td><td>{html.escape(until)}</td>"
+            f'<td class="{_cls(r.change if scored else None)}">{chg}</td><td>{ud}</td>'
+            f'<td class="{_cls(r.benchmark if scored else None)}">{bench}</td>'
+            f'<td class="{_cls(r.active if scored else None)}">{act_s}</td></tr>')
+    th = "".join(f"<th>{html.escape(h)}</th>" for h in head)
+    out.append(f'<div class="scroll"><table class="data"><thead><tr>{th}</tr></thead>'
+               f'<tbody>{"".join(trs)}</tbody></table></div>')
+    return "".join(out)
+
+
 # --------------------------------------------------------- when to sell
 
 _ACT_CLASS = {"SELL ALL": "act-sell", "SELL": "act-sell", "BUY NEW": "act-buy",
@@ -457,10 +522,12 @@ def _as_of(payload: dict) -> str:
     return str(payload.get("meta", {}).get("as_of", ""))[:10]
 
 
-def _cadence_for(site: Site, latest: str, latest_payload: dict) -> Cadence:
-    """v4.21: the weekly rule (rebalance.cadence) over the run history."""
-    days = int(latest_payload.get("meta", {}).get("rebalance_days")
-               or DEFAULT_REBALANCE_DAYS)
+def _days(payload: dict) -> int:
+    return int(payload.get("meta", {}).get("rebalance_days") or DEFAULT_REBALANCE_DAYS)
+
+
+def _runs_for(site: Site, latest: str, latest_payload: dict) -> list[tuple[str, str]]:
+    """(stamp, as_of) of every successful run with a report, the latest included."""
     runs: list[tuple[str, str]] = []
     for r in site.runner.history():
         if not r["has_report"] or r.get("status") != "succeeded":
@@ -470,7 +537,22 @@ def _cadence_for(site: Site, latest: str, latest_payload: dict) -> Cadence:
             runs.append((str(r["stamp"]), _as_of(p)))
     if latest not in {s for s, _ in runs} and _as_of(latest_payload):
         runs.append((latest, _as_of(latest_payload)))
-    return cadence(runs, latest, days)
+    return runs
+
+
+def _cadence_for(site: Site, latest: str, latest_payload: dict) -> Cadence:
+    """v4.21: the weekly rule (rebalance.cadence) over the run history."""
+    return cadence(_runs_for(site, latest, latest_payload), latest, _days(latest_payload))
+
+
+def tracked_run(site: Site, latest: str, latest_payload: dict) -> str:
+    """The run the Tracker scores: this period's book (what the team holds),
+    or the latest run when it opens a new period."""
+    try:
+        cad = _cadence_for(site, latest, latest_payload)
+    except ValueError:
+        return latest
+    return latest if cad.rebalance_now or not cad.held else cad.held
 
 
 def _default_held(site: Site, latest: str, latest_payload: dict) -> str | None:
@@ -721,6 +803,7 @@ class Site:
     fetch: FetchFn = yahoo_closes
     _payloads: dict[str, tuple[float, dict]] = field(default_factory=dict)
     _tracked: dict[str, tuple[float, TrackerResult]] = field(default_factory=dict)
+    _record: dict[str, tuple[float, list[RecordRow]]] = field(default_factory=dict)
     password: str | None = None          # team mode: required for other computers
     trust_local: bool = True             # this computer itself needs no password
     _macro: dict[str, tuple[float, MacroResult]] = field(default_factory=dict)
@@ -775,6 +858,21 @@ class Site:
         res = track(payload, self.fetch)
         self._tracked[stamp] = (time.time(), res)
         return res
+
+    def recorded(self, latest: str, payload: dict, refresh: bool) -> list[RecordRow]:
+        """v4.21: every book of the weekly rule, scored to the close the next
+        book was bought at (the current one so far) -- one price download."""
+        hit = self._record.get(latest)
+        if hit and not refresh and time.time() - hit[0] < PRICE_TTL:
+            return hit[1]
+        entries: list[tuple[str, dict, str | None]] = []
+        for b in books(_runs_for(self, latest, payload), _days(payload)):
+            p = payload if b.stamp == latest else self.payload(b.stamp)
+            if p is not None:
+                entries.append((b.stamp, p, b.until))
+        rows = record(entries, self.fetch)
+        self._record[latest] = (time.time(), rows)
+        return rows
 
 
 def make_handler(site: Site) -> type[BaseHTTPRequestHandler]:
@@ -883,7 +981,10 @@ def make_handler(site: Site) -> type[BaseHTTPRequestHandler]:
                 ccy = payload.get("meta", {}).get("base_currency", "")
                 try:
                     res = site.tracked(run, payload, "refresh" in params)
-                    body = _run_picker(runner, run, "/tracker") + tracker_body(res, ccy)
+                    lp = payload if run == latest else (site.payload(latest) or payload)
+                    rows = site.recorded(latest, lp, "refresh" in params)
+                    body = (_run_picker(runner, run, "/tracker") + tracker_body(res, ccy)
+                            + record_body(rows, _days(lp)))
                 except Exception as e:  # noqa: BLE001 -- network errors vary
                     body = (_run_picker(runner, run, "/tracker")
                             + f'<p class="note">Could not get prices: {html.escape(str(e))}'

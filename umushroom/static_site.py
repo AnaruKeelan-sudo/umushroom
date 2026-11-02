@@ -43,11 +43,14 @@ from umushroom.web import (
     _NAV_CSS,
     Runner,
     Site,
+    _days,
     _default_held,
     _pretty,
     default_command,
     macro_body,
+    record_body,
     sell_body,
+    tracked_run,
     tracker_body,
 )
 
@@ -122,8 +125,18 @@ def build_pages(site: Site, run_url: str | None = None,
             held = _default_held(site, latest, payload)
             body = sell_body(site, latest, payload, held, today=today, picker=False)
         elif key == "tracker":
+            # v4.21: score the book the team HOLDS (the period's first run), not
+            # whatever ran this morning, and the week-by-week record under it
             try:
-                body = tracker_body(site.tracked(latest, payload, refresh=True), ccy)
+                shown = tracked_run(site, latest, payload)
+                shown_payload = payload if shown == latest else (site.payload(shown) or payload)
+                label = ("" if shown == latest else
+                         f"Your book is the orders of {html.escape(_pretty(shown))}, the "
+                         "first run of this holding period. ")
+                body = (tracker_body(site.tracked(shown, shown_payload, refresh=True), ccy,
+                                     label)
+                        + record_body(site.recorded(latest, payload, refresh=True),
+                                      _days(payload)))
             except Exception as e:  # noqa: BLE001 -- network errors vary
                 body = f'<p class="note">Could not get prices: {html.escape(str(e))}</p>'
         elif key == "macro":

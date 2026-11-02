@@ -135,3 +135,19 @@ def test_cadence_uses_the_first_successful_run_when_monday_failed():
     assert cadence(runs, "20261028-090000", 5).held == "20261027-090000"
     with pytest.raises(ValueError):
         cadence(runs, "20261030-000000", 5)
+
+
+def test_books_are_the_first_run_of_each_period_scored_to_the_next_book():
+    from umushroom.rebalance import books
+    runs = [("20261019-221955", "2026-10-16"), ("20261020-080050", "2026-10-19"),
+            ("20261021-080257", "2026-10-19"), ("20261022-080441", "2026-10-20"),
+            ("20261023-080204", "2026-10-21"), ("20261026-070800", "2026-10-23"),
+            ("20261027-070313", "2026-10-23"), ("20261102-074131", "2026-10-30")]
+    b = books(runs, 5)
+    assert [x.stamp for x in b] == ["20261019-221955", "20261026-070800", "20261102-074131"]
+    # each book is scored to the close the NEXT book was bought at
+    assert b[0].until == "2026-10-23" and b[1].until == "2026-10-30" and b[2].until is None
+    assert b[0].period_start == date(2026, 10, 19) and b[1].as_of == "2026-10-23"
+    assert books(reversed(runs), 5) == b                   # input order is irrelevant
+    assert cadence(runs, "20261027-070313", 5).held == b[1].stamp   # the same run is held
+    assert books([], 5) == []
