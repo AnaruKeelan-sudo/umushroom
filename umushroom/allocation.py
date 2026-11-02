@@ -23,7 +23,12 @@ from umushroom.features import build_features_at_index
 from umushroom.logging_config import get_logger
 from umushroom.model import RankingModel
 from umushroom.portfolio_construction import cap_weights, equal_weight, hrp_weight
-from umushroom.selection import capped_top, correlation_filter, top_sector_share
+from umushroom.selection import (
+    capped_top,
+    correlation_filter,
+    rank_order,
+    top_sector_share,
+)
 
 logger = get_logger("allocation")
 
@@ -164,7 +169,7 @@ def generate_allocation(
     cap = None if hold_all else max_per_sector     # hold-all sleeves hold everything
     too_similar = (correlation_filter(data, as_of_idx, max_pick_correlation)
                    if max_pick_correlation and not hold_all else None)
-    ranked_all = preds.sort_values(ascending=False).index.tolist()
+    ranked_all = rank_order(preds)
     picked_tickers = capped_top(ranked_all, top_n, sectors, cap, too_similar)
     if cap and sectors:
         logger.info(f"Sector cap: at most {cap} per sector "
@@ -239,7 +244,7 @@ def generate_allocation(
     # budget would come out as a 0-share order (the money silently unused).
     # Drop it, re-spread the budget, and -- for model picks -- bring in the
     # next-ranked candidate so the sleeve still holds top_n names.
-    ranked = preds.sort_values(ascending=False).index.tolist()
+    ranked = rank_order(preds)
     selected = list(picked_tickers)
     unaffordable: list[str] = []
     while True:

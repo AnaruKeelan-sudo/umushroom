@@ -285,6 +285,18 @@ config.yaml       # Your contest's parameters — edit this, not the code
   data size -- see `model.py`'s docstring.
 
 
+## Nothing on the path to the orders is random (v4.23)
+
+The orders are a deterministic function of the price data and `config.yaml`: two runs on
+the same data give byte-identical orders, and so does a single-threaded run. The one
+place a seed used to matter was the gradient-boosting learner's bin edges (scikit-learn
+draws them from a seeded subsample above 200,000 rows); `gbm_bins: fixed` removes that,
+verified by identical orders under different seeds. Re-check any time:
+
+```
+python -m umushroom.cli --config config.yaml --compare-gbm-bins equity:fixed,subsample
+```
+
 ## Website (on your own computer)
 
 ```

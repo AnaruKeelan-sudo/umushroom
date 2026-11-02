@@ -432,3 +432,44 @@ def test_cli_mc_default_is_six_weeks():
         assert "default=6" in inspect.getsource(cli)
     else:
         assert p.parse_args([]).mc_weeks == 6
+
+
+def test_cli_compare_gbm_bins_prints_verdict(tmp_path, monkeypatch, capsys):
+    """v4.23: the bin-mode head-to-head runs through the shared machinery and
+    is skipped, with a reason, for a sleeve that does not use gbm."""
+    stocks = [f"B{i}.L" for i in range(8)] + [f"T{i}" for i in range(8)]
+    cfg = tmp_path / "config.yaml"
+    body = textwrap.dedent(f"""\
+        tickers: {stocks}
+        starting_balance: 100000
+        top_n_holdings: 5
+        lookback_period: "10y"
+        forward_return_days: 5
+        rebalance_days: 5
+        min_history_days: 300
+        model_alpha: 1.0
+        random_seed: 42
+        cache_dir: "{tmp_path / '.cache'}"
+        cache_max_age_hours: 12
+        log_level: "WARNING"
+        purged_test_window_days: 21
+        purged_purge_days: 5
+        purged_embargo_days: 5
+        purged_min_train_days: 504
+        prediction_log_path: "{tmp_path / 'pred.csv'}"
+    """)
+    real = data_mod.get_market_data
+    monkeypatch.setattr(data_mod, "get_market_data",
+                        lambda **kw: real(**kw, fetcher=_fake_fetcher_7day))
+    cfg.write_text(body + "model_type: gbm\n")
+    rc = cli.main(["--config", str(cfg), "--output", str(tmp_path / "a.csv"),
+                   "--skip-backtest", "--compare-gbm-bins", "equity:fixed,subsample"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "GBM bins: head-to-head on identical data" in out and "VERDICT:" in out
+    assert "fixed" in out and "subsample" in out
+    cfg.write_text(body)                                   # ridge: nothing to compare
+    rc = cli.main(["--config", str(cfg), "--output", str(tmp_path / "b.csv"),
+                   "--skip-backtest", "--compare-gbm-bins", "equity:fixed,subsample"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "does not use gbm" in out

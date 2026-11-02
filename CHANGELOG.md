@@ -1,5 +1,33 @@
 # Changelog
 
+## 4.23.0 (2026-11-02) -- nothing on the path to the orders is random
+An audit of the model-to-orders path ("check that no allocation is randomly
+done"), with the one real finding fixed behind a pre-declared head-to-head:
+- VERIFIED: the orders are a deterministic function of the data and the
+  config. Two runs on identical data gave identical orders, as did a
+  single-threaded run (OMP_NUM_THREADS=1). Ridge, HRP, equal weight, the
+  sector cap, the near-duplicate guard and the share sizing use no random
+  numbers; the Monte Carlo, placebo and bootstrap use seeded generators and
+  touch only the report.
+- FOUND: the gradient-boosting learner's bin edges came from a SEEDED random
+  subsample of the rows (scikit-learn does this above 200,000 rows; the live
+  stock fit has 244,000). With `random_seed` 42, 43, 44 and 45 the 10 live
+  picks shared only 7 names and the weights of the shared ones moved by up to
+  7 points: 2-3 positions and about a third of the capital depended on an
+  arbitrary constant. FIX: `gbm_bins: fixed` snaps the centred-rank features
+  to the learner's own 255 levels before fitting (`model.quantize_ranks`), so
+  scikit-learn uses those levels as the bins for every seed. Verified: seeds
+  42 and 43 now give identical orders. Head-to-head (`--compare-gbm-bins
+  equity:fixed,subsample`, rule declared first): fixed IC t +6.09, 6-week
+  active t +3.03, win 75%, VaR 3.12% vs subsample +6.21, +2.54, 63%, 3.51%
+  -> fixed wins and is the shipped setting (code default stays "subsample").
+- HARDENED: ties in the ranking are broken alphabetically by a stable sort
+  (`selection.rank_order`) in live orders and both backtests, instead of by
+  whatever order an unstable sort left equal scores in.
+- 12 new tests (tie-break, same inputs -> same orders, every learner
+  reproducible with its seed, the quantiser, seed-independence above the
+  200,000-row threshold, save/load, config, the CLI head-to-head).
+
 ## 4.22.0 (2026-11-02) -- the dashboard shell
 The website is now an app frame instead of a row of tabs (shell.py):
 - A sidebar with the sections in groups (Trade / Performance / Context /

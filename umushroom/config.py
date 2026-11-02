@@ -19,7 +19,7 @@ import yaml
 from umushroom.data import MAX_MISSING_FRACTION
 from umushroom.exceptions import ConfigError
 from umushroom.features import FEATURE_SETS, TARGET_TYPES
-from umushroom.model import MODEL_TYPES
+from umushroom.model import GBM_BIN_MODES, MODEL_TYPES
 from umushroom.universe import SUPPORTED_BASE_CURRENCIES, resolve_universe
 
 FRENCH_REGIONS = ("US", "Developed", "Europe")
@@ -150,6 +150,11 @@ class StrategyConfig:
     history_start: str | None = None
     # refuse to run when the data does not reach the last trading day
     require_fresh_data: bool = False
+    # ---- v4.23 ----
+    # gradient-boosting bin edges: "fixed" = seed-independent (model.py
+    # quantize_ranks); "subsample" = scikit-learn's seeded subsample (the
+    # pre-4.23 behaviour, under which 2-3 of 10 live picks changed with the seed)
+    gbm_bins: str = "subsample"
     # `selection: auto` switches between model and core only after the raw
     # rule has given the same answer on this many consecutive runs
     auto_confirm_runs: int = 1
@@ -260,6 +265,8 @@ def _validate(cfg: StrategyConfig) -> None:
         errors.append("contest_window_days must be >= 1")
     if cfg.model_type not in MODEL_TYPES:
         errors.append(f"model_type must be one of {MODEL_TYPES}, got {cfg.model_type!r}")
+    if cfg.gbm_bins not in GBM_BIN_MODES:
+        errors.append(f"gbm_bins must be one of {GBM_BIN_MODES}, got {cfg.gbm_bins!r}")
     if cfg.max_pick_correlation is not None and not 0 < cfg.max_pick_correlation <= 1:
         errors.append("max_pick_correlation must be in (0, 1] (or left out to switch "
                       "the near-duplicate guard off)")
@@ -556,6 +563,7 @@ def load_config(path: str | Path = "config.yaml") -> StrategyConfig:
                                             DEFAULT_CONTEST_WINDOW_DAYS)),
             model_type=str(raw.get("model_type", "ridge")),
             max_pick_correlation=_optional_float(raw.get("max_pick_correlation")),
+            gbm_bins=str(raw.get("gbm_bins", "subsample")),
             max_missing_fraction=float(raw.get("max_missing_fraction",
                                                MAX_MISSING_FRACTION)),
             weighting=(None if raw.get("weighting") in (None, "")
