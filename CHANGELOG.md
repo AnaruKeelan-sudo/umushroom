@@ -1,5 +1,28 @@
 # Changelog
 
+## 4.22.0 (2026-11-02) -- the dashboard shell
+The website is now an app frame instead of a row of tabs (shell.py):
+- A sidebar with the sections in groups (Trade / Performance / Context /
+  Runs), the six most recent runs with their status, Run now, and a
+  system / light / dark switch that is remembered on the device; a sticky
+  top bar with the section, the signal date and a search button; on a phone
+  the sidebar is a drawer.
+- The published site is ONE encrypted page: every section is a pane picked
+  by the URL hash (#stocks), so switching is instant and the password is
+  asked once. The old per-section files are contentless redirects into it,
+  so bookmarks keep working. Full reports keep their own page with a slim
+  "back to the dashboard" bar. The local website keeps a URL per section
+  (and its run picker and Run now) inside the same frame, with the browser's
+  cross-document view transition where supported.
+- Cmd/Ctrl-K (or "/") opens a palette that finds any ticker, name or section
+  on the page and jumps to the row, highlighting it. Every table sorts by a
+  click on its header. Tables keep scrolling sideways inside their own
+  container; nothing on the page scrolls sideways.
+- No library, no font download, nothing fetched from outside: the frame is
+  plain HTML, CSS and vanilla JavaScript on the report's own colour tokens,
+  so the private site stays private and works offline.
+- Tests updated for the one-page site (panes, redirects, the palette).
+
 ## 4.21.0 (2026-10-27) -- how the first live week went wrong, and the fixes
 Eight days of live runs (20-27 Oct) were reconstructed from the published
 site. The week's return was about -1.4% holding the first book for five
