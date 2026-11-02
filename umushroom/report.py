@@ -27,6 +27,7 @@ from umushroom.montecarlo import MonteCarloResult, bootstrap_annual_alpha, combi
 from umushroom.purged_backtest import PurgedWalkForwardResult
 from umushroom.rebalance import DEFAULT_REBALANCE_DAYS, next_rebalance, trade_day
 from umushroom.risk import MIN_OBS, backtest_var, var_es
+from umushroom.shell import Shell, render_app
 from umushroom.window import WindowResult
 
 W, H = 760, 280
@@ -1215,17 +1216,20 @@ def section_bodies(payload: dict) -> dict[str, str]:
 
 
 def render_page(payload: dict, body: str, title: str = "UMushroom strategy report",
-                nav: str = "", sub: str | None = None) -> str:
-    """A full page in the report's style (charts, tooltips, dark mode)."""
+                nav: str | Shell = "", sub: str | None = None) -> str:
+    """A full page in the report's style (charts, tooltips, dark mode). With a
+    `Shell` (v4.22) the page is wrapped in the dashboard frame: sidebar, top
+    bar, command palette; without one it is the plain stand-alone report."""
     meta = payload.get("meta", {})
     ccy = meta.get("base_currency", "")
     data = json.dumps(payload, allow_nan=False).replace("</", "<\\/")
-    return _PAGE.format(
-        title=_esc(title), nav=nav,
-        sub=_esc(sub if sub is not None else
-                 f"Signals as of the {meta.get('as_of', '')} close · generated "
-                 f"{meta.get('generated', '')} · prices in {ccy} · v{meta.get('version', '')}"),
-        body=body, css=_CSS, js=_JS, data=data)
+    text = (sub if sub is not None else
+            f"Signals as of the {meta.get('as_of', '')} close · generated "
+            f"{meta.get('generated', '')} · prices in {ccy} · v{meta.get('version', '')}")
+    if isinstance(nav, Shell):
+        return render_app(nav, title, body, css=_CSS, js=_JS, data=data, sub=text)
+    return _PAGE.format(title=_esc(title), nav=nav, sub=_esc(text), body=body, css=_CSS,
+                        js=_JS, data=data)
 
 
 def render_html(payload: dict) -> str:
@@ -1244,16 +1248,25 @@ def write_report(path: str | Path, payload: dict) -> Path:
 
 # ---------------------------------------------------------------- chrome
 
-_DARK = """--surface-0:#121211;--surface-1:#1a1a19;--text-primary:#ffffff;
+_DARK = """--surface-0:#121211;--surface-1:#1a1a19;--surface-2:#0d0d0c;--text-primary:#ffffff;
  --text-secondary:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--border:rgba(255,255,255,.10);
  --series-1:#3987e5;--series-2:#d95926;--band-key:#1c5cab;--good:#0ca30c;
- --warn:#fab219;--bad:#e66767"""
+ --warn:#fab219;--bad:#e66767;--hover:rgba(255,255,255,.07);
+ --accent-soft:rgba(57,135,229,.20);--glass:rgba(18,18,17,.82);
+ --shadow:0 2px 6px rgba(0,0,0,.4),0 16px 40px rgba(0,0,0,.45);
+ --shadow-sm:0 1px 2px rgba(0,0,0,.35)"""
 
+# v4.22: the dashboard shell (shell.py) builds on the same tokens -- surface-2
+# is the sidebar, hover / accent-soft the interactive states, glass the
+# translucent top bar; radius and the shadows keep every surface consistent.
 _CSS = """
-:root{color-scheme:light;--surface-0:#f4f3f0;--surface-1:#fcfcfb;--text-primary:#0b0b0b;
- --text-secondary:#52514e;--muted:#898781;--grid:#e1e0d9;--border:rgba(11,11,11,.10);
- --series-1:#2a78d6;--series-2:#eb6834;--band-key:#86b6ef;--good:#006300;
- --warn:#8a5a00;--bad:#d03b3b}
+:root{color-scheme:light;--surface-0:#f4f3f0;--surface-1:#fcfcfb;--surface-2:#ebe9e3;
+ --text-primary:#0b0b0b;--text-secondary:#52514e;--muted:#898781;--grid:#e1e0d9;
+ --border:rgba(11,11,11,.10);--series-1:#2a78d6;--series-2:#eb6834;--band-key:#86b6ef;
+ --good:#006300;--warn:#8a5a00;--bad:#d03b3b;--hover:rgba(11,11,11,.06);
+ --accent-soft:rgba(42,120,214,.14);--glass:rgba(244,243,240,.82);--radius:12px;
+ --shadow:0 2px 6px rgba(20,18,10,.08),0 16px 40px rgba(20,18,10,.12);
+ --shadow-sm:0 1px 2px rgba(20,18,10,.06)}
 @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){color-scheme:dark;
  """ + _DARK + """}}
 :root[data-theme="dark"]{color-scheme:dark;""" + _DARK + """}

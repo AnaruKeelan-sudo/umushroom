@@ -38,14 +38,15 @@ from datetime import date
 from pathlib import Path
 
 from umushroom.report import render_page, section_bodies
+from umushroom.shell import LABELS, Shell, pane, redirect_stub, report_bar
 from umushroom.tracker import FetchFn, yahoo_closes
 from umushroom.web import (
-    _NAV_CSS,
     Runner,
     Site,
     _days,
     _default_held,
     _pretty,
+    _short_stamp,
     default_command,
     macro_body,
     record_body,
@@ -74,18 +75,28 @@ def _short(stamp: str) -> str:
     return datetime.strptime(stamp, "%Y%m%d-%H%M%S").strftime("%d %b %H:%M")
 
 
-def static_nav(active: str, updated: str, run_url: str | None, prefix: str = "") -> str:
-    tabs = "".join(
-        f'<a href="{prefix}{f}"'
-        f'{" aria-current=" + chr(34) + "page" + chr(34) if k == active else ""}>'
-        f"{html.escape(label)}</a>" for k, label, f in PAGES)
-    run = (f'<a class="umw-runlink" href="{html.escape(run_url)}" target="_blank" '
+def static_shell(active: str, updated: str, run_url: str | None,
+                 payload: dict | None = None, hist: list[dict] | None = None,
+                 notice: str = "") -> Shell:
+    """v4.22: the dashboard frame of the published site -- one page, every
+    section a pane picked by the URL hash, the recent runs in the sidebar."""
+    links = {k: f"#{k}" for k, _, _ in PAGES}
+    run = (f'<a class="btn" href="{html.escape(run_url)}" target="_blank" '
            f'rel="noopener">Run now</a>' if run_url else "")
-    return (f"<style>{_NAV_CSS}.umw-runlink{{color:var(--series-1,#2a78d6)}}</style>"
-            f'<nav class="umw-bar" aria-label="Sections"><div class="umw-in">'
-            f'<span class="umw-brand">UMushroom</span><div class="umw-tabs">{tabs}</div>'
-            f'<span class="umw-sp"></span><span class="umw-st" title="Last update">'
-            f"{html.escape(updated)}</span>{run}</div></nav>")
+    runs: list[tuple[str, str, str]] = []
+    for r in (hist or [])[:6]:
+        ok = r.get("status") == "succeeded" and bool(r["has_report"])
+        runs.append((_short_stamp(r["stamp"]), f"reports/{r['stamp']}.html" if ok else "",
+                     "ok" if ok else "bad"))
+    meta = (payload or {}).get("meta", {})
+    return Shell(active=active, links=links, mode="spa",
+                 as_of=str(meta.get("as_of") or "")[:10], updated=updated, action=run,
+                 runs=tuple(runs), notice=notice)
+
+
+def stubs() -> dict[str, str]:
+    """The old per-section files, now unencrypted redirects into index.html."""
+    return {f: redirect_stub(f"index.html#{k}") for k, _, f in PAGES if f != "index.html"}
 
 
 def _with_nav(report_html: str, bar: str) -> str:
@@ -101,11 +112,11 @@ def build_pages(site: Site, run_url: str | None = None,
     hist = runner.history()
     newest = hist[0] if hist else None
     if latest is None:
-        bar = static_nav("overview", "never", run_url)
         msg = ("<h2>No report yet</h2><p>The first run hasn't finished. On GitHub open "
                "<b>Actions -> Website -> Run workflow</b>.</p>")
-        return {f: render_page({"meta": {}}, msg, "UMushroom", nav=bar, sub="")
-                for _, _, f in PAGES}
+        return {"index.html": render_page({"meta": {}}, msg, "UMushroom", sub="",
+                                          nav=static_shell("overview", "never", run_url,
+                                                           hist=hist))}
 
     payload = site.payload(latest) or {"meta": {}}
     updated = "Updated " + _short(latest)
@@ -113,11 +124,11 @@ def build_pages(site: Site, run_url: str | None = None,
     bodies = section_bodies(payload)
     warn = ""
     if newest and newest["stamp"] != latest and newest.get("status") != "succeeded":
-        warn = (f'<div class="due now"><b>The latest run failed</b>The run of '
+        warn = (f"<b>The latest run failed.</b> The run of "
                 f"{html.escape(_pretty(newest['stamp']))} did not finish, so this shows "
-                f"the last good one ({html.escape(_pretty(latest))}). See History.</div>")
+                f"the last good one ({html.escape(_pretty(latest))}). See History.")
 
-    out: dict[str, str] = {}
+    panes: list[str] = []
     for key, label, fname in PAGES:
         if key == "runs":
             continue
@@ -146,10 +157,9 @@ def build_pages(site: Site, run_url: str | None = None,
                 body = f'<p class="note">Could not get macro data: {html.escape(str(e))}</p>'
         else:
             body = bodies[key]
-        title = "UMushroom" if key == "overview" else f"UMushroom: {label}"
-        out[fname] = render_page(payload, (warn if key == "overview" else "") + body,
-                                 title=title, nav=static_nav(key, updated, run_url))
+        panes.append(pane(key, body, active=key == "overview"))
 
+    out: dict[str, str] = {}
     rows = []
     for r in hist:
         st = str(r.get("status", "unknown"))
@@ -160,13 +170,17 @@ def build_pages(site: Site, run_url: str | None = None,
         if link:
             src = runner.path(r["stamp"], "html").read_text(errors="replace")
             out[f"reports/{r['stamp']}.html"] = _with_nav(
-                src, static_nav("", updated, run_url, prefix="../"))
+                src, report_bar("../index.html", _pretty(r["stamp"])))
     table = ('<div class="scroll"><table class="data runs-tbl"><thead><tr><th>Run</th>'
              "<th>Status</th><th>Report</th></tr></thead><tbody>" + "".join(rows)
              + "</tbody></table></div>")
-    out["history.html"] = render_page(
-        payload, '<p class="note">Every run, newest first.</p>' + table,
-        title="Run history", nav=static_nav("runs", updated, run_url), sub="")
+    panes.append(pane("runs", f"<h2>{LABELS['runs']}</h2>"
+                      '<p class="note">Every run, newest first.</p>' + table, active=False))
+    # v4.22: ONE encrypted page with every section as a pane (the hash picks
+    # it); the per-section files are plain redirects into it (stubs())
+    out["index.html"] = render_page(
+        payload, "".join(panes), title="UMushroom",
+        nav=static_shell("overview", updated, run_url, payload, hist, notice=warn))
     return out
 
 
@@ -295,7 +309,7 @@ def prune(runner: Runner, keep: int = KEEP_RUNS) -> None:
 
 
 def write_site(pages: dict[str, str], out: Path, password: str, salt: bytes,
-               iterations: int = ITERATIONS) -> None:
+               iterations: int = ITERATIONS, plain: dict[str, str] | None = None) -> None:
     if len(password) < MIN_PASSWORD:
         raise ValueError(f"the team password must be at least {MIN_PASSWORD} characters "
                          "(the encrypted pages are public, so a short one can be guessed)")
@@ -306,6 +320,8 @@ def write_site(pages: dict[str, str], out: Path, password: str, salt: bytes,
         f = out / name
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(lock(page, key, salt, iterations), encoding="utf-8")
+    for name, page in (plain or {}).items():      # contentless redirects: not locked
+        (out / name).write_text(page, encoding="utf-8")
     (out / ".nojekyll").write_text("")
     (out / "robots.txt").write_text("User-agent: *\nDisallow: /\n")
 
@@ -338,7 +354,8 @@ def build(site_dir: Path, out: Path, password: str, run_url: str | None = None,
             print("Run failed. End of its log:\n" + "\n".join(tail))
     prune(runner)
     site = Site(runner, fetch)
-    write_site(build_pages(site, run_url), out, password, site_salt(site_dir), iterations)
+    write_site(build_pages(site, run_url), out, password, site_salt(site_dir), iterations,
+               plain=stubs())
     not_ready = (not ok and run_first
                  and runner.history()[0].get("returncode") == NOT_READY_CODE)
     state = ("run OK" if ok else "DATA NOT READY -- showing last good" if not_ready

@@ -63,6 +63,7 @@ from umushroom.report import (
     render_page,
     section_bodies,
 )
+from umushroom.shell import Shell, report_bar
 from umushroom.tracker import (
     BENCHMARK,
     FetchFn,
@@ -230,46 +231,6 @@ _PATH_TO_TAB = {path: key for key, _, path in TABS}
 _TAB_PATH = {key: path for key, _, path in TABS}
 _TAB_LABEL = {key: label for key, label, _ in TABS}
 
-_NAV_CSS = """
-.umw-bar{position:sticky;top:0;z-index:50;background:var(--surface-1,#fcfcfb);
-border-bottom:1px solid var(--border,#e2e0da);font:14px/1.4 system-ui,-apple-system,
-sans-serif;color:var(--text-primary,#0b0b0b)}
-.umw-in{max-width:1240px;margin:0 auto;padding:8px 16px;display:flex;flex-wrap:wrap;
-gap:6px 12px;align-items:center}
-.umw-brand{font-weight:600;margin-right:6px}
-.umw-tabs{display:flex;flex-wrap:wrap;gap:2px}
-.umw-tabs a{color:var(--text-secondary,#5f5e5a);text-decoration:none;padding:6px 8px;
-border-radius:8px;font-size:13.5px}
-.umw-tabs a:hover{background:var(--grid,#eceae4);color:var(--text-primary,#0b0b0b)}
-.umw-tabs a[aria-current="page"]{background:var(--series-1,#2a78d6);color:#fff}
-.umw-sp{flex:1}
-.umw-st{color:var(--muted,#888);font-size:13px;max-width:320px;overflow:hidden;
-text-overflow:ellipsis;white-space:nowrap}
-.umw-bar button{font:inherit;padding:6px 14px;border-radius:8px;border:0;cursor:pointer;
-background:var(--series-1,#2a78d6);color:#fff}
-.umw-bar button:disabled{opacity:.6;cursor:default}
-.umw-old{background:var(--grid,#eceae4);font-size:13px;padding:6px 16px;text-align:center}
-.umw-old a{color:inherit}
-.up{color:var(--good,#1d7a3a)}.down{color:var(--bad,#b3261e)}
-.runs-tbl .succeeded{color:var(--good,#1d7a3a)}
-.runs-tbl .failed,.runs-tbl .interrupted{color:var(--bad,#b3261e)}
-form.pick{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 12px}
-form.pick a{color:var(--series-1,#2a78d6)}
-.act{display:inline-block;font-weight:600;font-size:12px;padding:2px 8px;border-radius:6px;
-white-space:nowrap;border:1px solid currentColor}
-.act-sell{color:var(--bad,#b3261e)}.act-buy{color:var(--good,#1d7a3a)}
-.act-hold{color:var(--text-secondary,#5f5e5a)}
-.due{background:var(--surface-1,#fff);border:1px solid var(--border,#ddd);
-border-left:4px solid var(--series-1,#2a78d6);border-radius:10px;padding:12px 16px;
-margin:0 0 16px}
-.sell-tbl td:last-child{white-space:normal;min-width:260px}
-.due.now{border-left-color:var(--bad,#b3261e)}
-.due b{display:block;font-size:17px;margin-bottom:2px}
-form.pick select,form.pick button{font:inherit;padding:5px 8px;border-radius:8px;
-border:1px solid var(--border,#ccc);background:var(--surface-1,#fff);
-color:var(--text-primary,#000)}
-"""
-
 _BAR_JS = """
 (function(){
 var b=document.getElementById('umw-run'),s=document.getElementById('umw-st');
@@ -293,29 +254,38 @@ poll();
 """
 
 
-def nav(active: str, run: str | None = None, latest: str | None = None) -> str:
+def _short_stamp(stamp: str) -> str:
+    return datetime.strptime(stamp, "%Y%m%d-%H%M%S").strftime("%a %d %b %H:%M")
+
+
+def nav(active: str, run: str | None = None, latest: str | None = None,
+        runner: Runner | None = None, payload: dict | None = None) -> Shell:
+    """v4.22: the dashboard frame for the local website (every section is its
+    own URL; the sidebar lists the recent runs; Run now lives in its foot)."""
     q = f"?run={run}" if run and run != latest else ""
-    tabs = "".join(
-        f'<a href="{path}{q if key != "runs" else ""}"'
-        f'{" aria-current=" + chr(34) + "page" + chr(34) if key == active else ""}>'
-        f"{html.escape(label)}</a>" for key, label, path in TABS)
-    old = ""
+    links = {key: f"{path}{q if key != 'runs' else ''}" for key, _, path in TABS}
+    notice = ""
     if run and latest and run != latest:
-        old = (f'<div class="umw-old">Viewing an older run ({html.escape(_pretty(run))}). '
-               f'<a href="{_TAB_PATH.get(active, "/")}">'
-               f"Back to the latest</a></div>")
-    return (f'<style>{_NAV_CSS}</style><nav class="umw-bar" aria-label="Sections">'
-            f'<div class="umw-in"><span class="umw-brand">UMushroom</span>'
-            f'<div class="umw-tabs">{tabs}</div><span class="umw-sp"></span>'
-            f'<span class="umw-st" id="umw-st" aria-live="polite"></span>'
-            f'<button id="umw-run" type="button">Run now</button></div>{old}</nav>'
-            f"<script>{_BAR_JS}</script>")
+        notice = (f"Viewing an older run ({html.escape(_pretty(run))}). "
+                  f'<a href="{_TAB_PATH.get(active, "/")}">Back to the latest</a>')
+    runs: list[tuple[str, str, str]] = []
+    if runner is not None:
+        for r in runner.history()[:6]:
+            ok = r.get("status") == "succeeded" and bool(r["has_report"])
+            href = f"/?run={r['stamp']}" if ok else f"/reports/{r['stamp']}.log"
+            runs.append((_short_stamp(r["stamp"]), href, "ok" if ok else "bad"))
+    meta = (payload or {}).get("meta", {})
+    action = ('<button class="btn" id="umw-run" type="button">Run now</button>'
+              '<span class="st" id="umw-st" aria-live="polite"></span>')
+    return Shell(active=active, links=links, mode="pages",
+                 as_of=str(meta.get("as_of") or "")[:10], notice=notice, action=action,
+                 runs=tuple(runs), extra_js=_BAR_JS)
 
 
 def inject_toolbar(report_html: str, latest: str | None, run: str | None = None) -> str:
-    """Put the site navigation at the top of a stored full report."""
+    """Put a slim 'back to the dashboard' bar at the top of a stored full report."""
     m = re.search(r"<body[^>]*>", report_html, flags=re.IGNORECASE)
-    bar = nav("", run, latest)
+    bar = report_bar("/", _pretty(run) if run else "")
     if not m:
         return bar + report_html
     return report_html[:m.end()] + bar + report_html[m.end():]
@@ -344,7 +314,7 @@ def _site_page(title: str, body: str, active: str, runner: Runner,
                run: str | None = None, payload: dict | None = None,
                sub: str | None = None) -> str:
     return render_page(payload or _EMPTY, body, title=title,
-                       nav=nav(active, run, runner.latest_report()), sub=sub)
+                       nav=nav(active, run, runner.latest_report(), runner, payload), sub=sub)
 
 
 def empty_page(runner: Runner, active: str = "overview") -> str:
@@ -993,7 +963,7 @@ def make_handler(site: Site) -> type[BaseHTTPRequestHandler]:
                 body = section_bodies(payload)[key]
             title = "UMushroom" if key == "overview" else f"UMushroom: {label}"
             page = render_page(payload, body, title=title,
-                               nav=nav(key, run, latest))
+                               nav=nav(key, run, latest, runner, payload))
             self._send(200, page, _TYPES["html"])
 
         def do_POST(self) -> None:

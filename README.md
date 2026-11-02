@@ -291,11 +291,19 @@ config.yaml       # Your contest's parameters — edit this, not the code
 python -m umushroom.web
 ```
 
-Opens http://127.0.0.1:8000 with a tab per section: **Overview**, **Stocks**, **When to sell**,
-**Tracker** (the book you hold since its prediction, and a week-by-week record of every
-book against MSCI World), **Graphs**,
-**Monte Carlo**, **Risk (VaR)**, **Macro**, **Checks** and **History**, plus a **Run now** button. Add `--daily 07:30` to run automatically every weekday.
-Stop it with Ctrl+C. Nothing leaves your computer.
+Opens http://127.0.0.1:8000 as a dashboard (v4.22): a sidebar with the sections in groups
+and the recent runs, a **Run now** button and a light / dark switch; a sticky top bar with
+the signal date and a search button. The sections: **Overview**, **Stocks**, **ETFs**,
+**When to sell**, **Tracker** (the book you hold since its prediction, and a week-by-week
+record of every book against MSCI World), **Graphs**, **Monte Carlo**, **Risk (VaR)**,
+**Macro**, **Checks** and **History**. Press **Cmd/Ctrl-K** (or `/`) to find any ticker,
+name or section on the page; click a table header to sort it. On a phone the sidebar is a
+drawer. Add `--daily 07:30` to run automatically every weekday. Stop it with Ctrl+C.
+Nothing leaves your computer.
+
+The published site (below) is the same dashboard as ONE encrypted page: every section is
+a pane picked by the address (`index.html#stocks`), so the password is asked once and
+switching is instant. The old per-section addresses redirect into it.
 
 
 ## Sharing the website with your team

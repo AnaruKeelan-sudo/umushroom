@@ -89,14 +89,16 @@ def test_build_runs_and_writes_every_page_encrypted(tmp_path):
         raw = f.read_text()
         assert "AAA.L" not in raw and "Alpha Co" not in raw   # nothing readable
     home = _open((out / "index.html").read_text(), PW)
-    assert "Invested today" in home and 'href="stocks.html"' in home
+    assert "Invested today" in home and 'href="#stocks"' in home   # v4.22: one page, panes
     assert ">Run now</a>" in home and "github.com/x/y" in home and "/api/" not in home
-    stocks = _open((out / "stocks.html").read_text(), PW)
-    assert "AAA.L" in stocks
-    tracker = _open((out / "tracker.html").read_text(), PW)
-    assert "+10.00%" in tracker
+    assert 'data-key="stocks"' in home and "AAA.L" in home          # the Stocks pane
+    assert "+10.00%" in home                                        # the Tracker pane
+    assert 'class="pal"' in home and "Find a ticker" in home       # command palette
+    # the old per-section files are contentless redirects into the dashboard
+    stub = (out / "stocks.html").read_text()
+    assert "url=index.html#stocks" in stub and "AAA.L" not in stub
     rep = next((out / "reports").iterdir())
-    assert 'href="../stocks.html"' in _open(rep.read_text(), PW)
+    assert 'href="../index.html"' in _open(rep.read_text(), PW)
 
 
 def test_failed_run_still_publishes_last_good_with_a_warning(tmp_path):
@@ -206,7 +208,7 @@ def _build_twice(tmp_path, dates, fetch):
             time.sleep(1.1)                               # a distinct run stamp
         assert build(site, out, PW, fetch=fetch, command=cmd, run_first=True,
                      run_timeout=60, iterations=FAST) == 0
-    return _open((out / "tracker.html").read_text(), PW)
+    return _open((out / "index.html").read_text(), PW)
 
 
 def test_tracker_scores_the_new_book_and_the_week_by_week_record(tmp_path):
@@ -237,6 +239,6 @@ def test_tracker_says_no_close_yet_instead_of_zero_up(tmp_path):
     out = tmp_path / "public"
     assert build(tmp_path / "site", out, PW, fetch=flat, command=_fake_cmd(tmp_path),
                  run_first=True, run_timeout=60, iterations=FAST) == 0
-    tracker = _open((out / "tracker.html").read_text(), PW)
+    tracker = _open((out / "index.html").read_text(), PW)
     assert "No close newer than 2026-10-02 yet" in tracker and "no close yet" in tracker
     assert "0 / 1" not in tracker and ">Up / down</div>" not in tracker   # no tile

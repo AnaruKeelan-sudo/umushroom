@@ -99,7 +99,7 @@ def test_run_now_produces_report_history_and_files(site):
     status = json.loads(_get(base + "/api/status")[1])
     assert status["status"] == "succeeded" and "step 2" in status["log_tail"]
     _, home = _get(base + "/")
-    assert "Invested today" in home and 'class="umw-bar"' in home
+    assert "Invested today" in home and 'class="app"' in home     # the dashboard shell
     _, hist = _get(base + "/runs")
     assert d["stamp"] in hist and "succeeded" in hist
     assert "AAA,1" in _get(f"{base}/reports/{d['stamp']}.csv")[1]
