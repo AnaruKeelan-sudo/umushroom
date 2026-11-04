@@ -213,6 +213,164 @@ def _fetch_with_retries(tickers: list[str], period: str, download=None, sleep=No
     return closes, volumes
 
 
+# --------------------------------------------------------------------------
+# v4.25: repair the price errors the spike guard would otherwise drop
+# --------------------------------------------------------------------------
+# The guard below (SPIKE_THRESHOLD) drops an instrument for ONE >95% day
+# anywhere in ten years. On 2026-11-02 it dropped 53 instruments -- 13 stocks
+# and the core ETF IB01.L, which Yahoo shows at 5.00 on its first two days in
+# 2019 and at ~99 ever since. Most such days are one of three Yahoo errors,
+# each repaired under a rule that NEVER changes an instrument's latest price
+# (the one its order is sized on), so a repair cannot create an order error:
+#   listing artefact  a >95% jump within a series' first 5 prints: the prints
+#                     before the jump are dropped (the history starts after it)
+#   pence/pound flip  stretches quoted 100x off the series' usual unit (a
+#                     day-on-day ratio of 80-125x, or its inverse): rescaled by
+#                     100 -- only when the latest print is in the unit most of
+#                     the series is quoted in; otherwise left for the guard
+#   bad print         at most 5 prints off by >95% that come back to within 25%
+#                     of the last good close: replaced by that close (a stale
+#                     price, never an interpolation from a later one)
+# FX series get the same repair (JPYGBP=X has two one-day 100x prints). What
+# is still spiky afterwards -- real jumps, unadjusted splits, a flip still open
+# on the latest day -- is dropped by the guard exactly as before.
+REPAIR_LEAD_PRINTS = 5
+REPAIR_MAX_BAD_PRINTS = 5
+REPAIR_BACK_WITHIN = 0.25
+UNIT_FLIP_RATIO = (80.0, 125.0)
+
+
+@dataclass(frozen=True)
+class PriceRepair:
+    ticker: str
+    kind: str            # "listing artefact" | "pence/pound flip" | "bad print"
+    first: date          # first and last print repaired (or dropped)
+    last: date
+    prints: int
+
+
+def _unit_offsets(values: np.ndarray) -> np.ndarray:
+    """Each print's unit relative to the first, in powers of ten (0, +-2, ...):
+    a day-on-day ratio inside UNIT_FLIP_RATIO (or its inverse) is a flip."""
+    d = np.diff(np.log10(values))
+    lo, hi = np.log10(UNIT_FLIP_RATIO[0]), np.log10(UNIT_FLIP_RATIO[1])
+    step = np.where((np.abs(d) >= lo) & (np.abs(d) <= hi), 2.0 * np.sign(d), 0.0)
+    return np.concatenate([[0.0], np.cumsum(step)])
+
+
+def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """(first, last) index of every run of True."""
+    out: list[tuple[int, int]] = []
+    start = None
+    for i, m in enumerate(mask):
+        if m and start is None:
+            start = i
+        elif not m and start is not None:
+            out.append((start, i - 1))
+            start = None
+    if start is not None:
+        out.append((start, len(mask) - 1))
+    return out
+
+
+def _repair_series(name: str, s: pd.Series) -> tuple[pd.Series, list[PriceRepair]]:
+    ok = s.notna() & (s > 0)
+    if int(ok.sum()) < 2 * REPAIR_LEAD_PRINTS + 2:
+        return s, []
+    idx = s.index[ok.to_numpy()]
+    vals = s[ok].to_numpy(dtype=float).copy()
+    found: list[PriceRepair] = []
+
+    def note(kind: str, a: int, b: int) -> None:
+        found.append(PriceRepair(name, kind, pd.Timestamp(idx[a]).date(),
+                                 pd.Timestamp(idx[b]).date(), b - a + 1))
+
+    # 1. listing artefact: a jump within the first prints -> start after it
+    moves = np.abs(vals[1:REPAIR_LEAD_PRINTS + 1] / vals[:REPAIR_LEAD_PRINTS] - 1)
+    lead = np.flatnonzero(moves > SPIKE_THRESHOLD)
+    start = int(lead[-1]) + 1 if len(lead) else 0
+    if start:
+        note("listing artefact", 0, start - 1)
+    v = vals[start:]
+    n = len(v)
+
+    # 2. pence/pound flips, rescaled to the unit most prints are in -- only
+    # when the latest print is already in that unit (it is never changed)
+    off = _unit_offsets(v)
+    if off.any():
+        levels, counts = np.unique(off, return_counts=True)
+        best = levels[counts == int(np.max(counts))]
+        major = float(best[0]) if len(best) == 1 else None
+        if (major is not None and off[-1] == major
+                and set(levels.tolist()) <= {major - 2, major, major + 2}):
+            for a, b in _runs(off != major):
+                note("pence/pound flip", start + a, start + b)
+            v = v * 10.0 ** (major - off)
+
+    # 3. bad prints: a >95% move into (or out of) a run of at most
+    # REPAIR_MAX_BAD_PRINTS prints, with the price back near the last good
+    # close straight after the run; the latest print is never part of a run
+    hits = np.flatnonzero(np.abs(v[1:] / v[:-1] - 1) > SPIKE_THRESHOLD) + 1
+    done = 0
+    for k in hits.tolist():
+        if k < done or abs(v[k] / v[k - 1] - 1) <= SPIKE_THRESHOLD:
+            continue                      # inside, or removed by, an earlier repair
+        ref = v[k - 1]
+        for j in range(k + 1, min(k + REPAIR_MAX_BAD_PRINTS, n - 1) + 1):
+            if abs(v[j] / ref - 1) < REPAIR_BACK_WITHIN:   # prints k..j-1 are bad
+                note("bad print", start + k, start + j - 1)
+                v[k:j] = ref
+                done = j
+                break
+        else:
+            for a in range(k - 1, max(k - REPAIR_MAX_BAD_PRINTS, 1) - 1, -1):
+                if abs(v[k] / v[a - 1] - 1) < REPAIR_BACK_WITHIN:   # a..k-1 are bad
+                    note("bad print", start + a, start + k - 1)
+                    v[a:k] = v[a - 1]
+                    done = k + 1
+                    break
+    if not found:
+        return s, []
+    out = s.copy()
+    out.loc[idx[:start]] = np.nan
+    out.loc[idx[start:]] = v
+    assert out.loc[idx[-1]] == s.loc[idx[-1]], "a repair changed the latest price"
+    return out, found
+
+
+def repair_price_errors(raw: pd.DataFrame, exempt: frozenset[str] = frozenset()
+                        ) -> tuple[pd.DataFrame, list[PriceRepair]]:
+    """v4.25: repair listing artefacts, pence/pound flips and bad prints in a
+    (date x symbol) close frame (instruments and FX). `exempt` (crypto) can
+    genuinely move this much and is left alone. Returns the repaired frame and
+    one PriceRepair per repaired stretch; the latest price of every series is
+    unchanged, and anything the rules cannot explain is left for the guard."""
+    repairs: list[PriceRepair] = []
+    fixed: dict[str, pd.Series] = {}
+    for c in raw.columns:
+        if c in exempt:
+            continue
+        new, found = _repair_series(str(c), raw[c])
+        if found:
+            fixed[c] = new
+            repairs += found
+    if not fixed:
+        return raw, []
+    out = raw.copy()
+    for c, new in fixed.items():
+        out[c] = new
+    return out, repairs
+
+
+def repair_summary(repairs: list[PriceRepair] | tuple[PriceRepair, ...]
+                   ) -> dict[str, list[str]]:
+    """{kind: sorted tickers} -- for the log and the report's Checks tab."""
+    out: dict[str, set[str]] = {}
+    for r in repairs:
+        out.setdefault(r.kind, set()).add(r.ticker)
+    return {k: sorted(v) for k, v in sorted(out.items())}
+
+
 def _validate_prices(data: pd.DataFrame, requested_tickers: list[str],
                       min_history_days: int,
                       spike_exempt: frozenset[str] = frozenset(),
@@ -350,6 +508,8 @@ class MarketData:
     # v4.6: tickers with NO actual price on the latest day (their last price
     # was carried forward from an earlier day). Never picked for new orders.
     stale_last: frozenset[str] = frozenset()
+    # v4.25: every stretch of prices repaired by repair_price_errors
+    repairs: tuple[PriceRepair, ...] = ()
 
 
 class SnapshotFetcher:
@@ -539,6 +699,7 @@ def get_market_data(
     yahoo_symbols: dict[str, str] | None = None,
     max_missing_fraction: float = MAX_MISSING_FRACTION,
     require_fresh: bool = False,
+    repair: bool = False,
 ) -> MarketData:
     """Fetch, validate and currency-convert the full universe.
 
@@ -546,7 +707,9 @@ def get_market_data(
     path is testable offline; it defaults to the yfinance fetcher. The
     missing-data guard (`max_missing_fraction`) applies to live Yahoo data
     only -- fresh or cached; an injected fetcher or price snapshot is
-    taken as deliberately complete.
+    taken as deliberately complete. `repair` (v4.25) fixes listing
+    artefacts, pence/pound flips and bad prints before validation
+    (repair_price_errors); the raw download is what gets cached.
     """
     listings = resolve_universe(tickers, currency_overrides)
     fx_tickers = required_fx_tickers(listings, base_currency)
@@ -611,6 +774,16 @@ def get_market_data(
     if calendar_tickers:
         raw = align_to_trading_calendar(raw, calendar_tickers)
 
+    crypto = frozenset(t for t, lst in listings.items() if lst.exchange == "Crypto")
+    repairs: list[PriceRepair] = []
+    if repair:
+        raw, repairs = repair_price_errors(raw, exempt=crypto)
+        if repairs:
+            summary = "; ".join(f"{k} {len(v)}: {v}"
+                                for k, v in repair_summary(repairs).items())
+            logger.warning(f"Repaired price errors in "
+                           f"{len({r.ticker for r in repairs})} series ({summary})")
+
     missing_fx = [f for f in fx_tickers if f not in raw.columns or raw[f].isna().all()]
     if missing_fx:
         # A missing FX pair is not fatal: Yahoo sometimes rate-limits a lone
@@ -630,7 +803,6 @@ def get_market_data(
                             f"instruments left to price in {base_currency}")
 
     equities = raw[[t for t in tickers if t in raw.columns]]
-    crypto = frozenset(t for t, lst in listings.items() if lst.exchange == "Crypto")
     validated_local = _validate_prices(equities, tickers, min_history_days,
                                        spike_exempt=crypto, ragged=ragged)
     surviving = {t: listings[t] for t in validated_local.columns}
@@ -659,4 +831,4 @@ def get_market_data(
         dollar_volume = (vol.where(vol > 0) * prices).astype(float)
     return MarketData(prices=prices, local_prices=local, listings=surviving,
                       base_currency=base_currency, dollar_volume=dollar_volume,
-                      stale_last=stale)
+                      stale_last=stale, repairs=tuple(repairs))

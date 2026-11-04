@@ -177,3 +177,163 @@ def evaluate_latest_predictions(
     logger.info(f"Evaluated predictions from {last_run_date.date()}: "
                 f"directional accuracy={directional_accuracy:.1%}, IC={ic:.3f}")
     return report
+
+
+# --------------------------------------------------------------------------
+# v4.25: the live record -- is the model right, at its own horizon?
+# --------------------------------------------------------------------------
+# evaluate_latest_predictions above scores the previous run against today's
+# price: one day of a 5-day forecast, mostly noise. Below, every logged
+# cross-section is scored once its full horizon has passed, on the same
+# base-currency closes the model is trained on, and the live record is set
+# against the walk-forward's own week-to-week spread: "how often did the
+# backtest have a stretch this bad?" is the honest yardstick for a few weeks
+# of live data, which on their own can neither confirm nor refute 8 years.
+# a rank correlation over fewer names is mostly noise (and the pre-4.25 ETF log
+# held only the ~12 core ETFs the sleeve bought, not the universe it ranked)
+MIN_LIVE_NAMES = 30
+
+
+@dataclass(frozen=True)
+class LiveScore:
+    """One logged cross-section, scored once `horizon` closes have passed."""
+    run_date: str           # the close the scores were built on
+    scored_to: str          # the close `horizon` trading days later
+    n: int                  # instruments scored
+    ic: float               # Spearman rank correlation of scores and returns
+    picks: float | None     # mean realised return of the picks (None = none)
+    universe: float         # mean realised return of every scored instrument
+    independent: bool = False   # True = its window overlaps no earlier counted one
+
+    @property
+    def active(self) -> float | None:
+        return None if self.picks is None else self.picks - self.universe
+
+
+def score_logged(log_path: Path, prices: pd.DataFrame, horizon: int,
+                 min_names: int | None = None) -> tuple[list[LiveScore], list[str]]:
+    """(scored cross-sections oldest first, run dates still waiting for their
+    horizon). A cross-section's window starts at the last close on or before
+    its run date; the windows of the `independent` rows never overlap."""
+    min_names = MIN_LIVE_NAMES if min_names is None else min_names
+    if not log_path.exists() or horizon < 1 or prices.empty:
+        return [], []
+    log = pd.read_csv(log_path, parse_dates=["run_date"])
+    idx = prices.index
+    rows: list[LiveScore] = []
+    pending: list[str] = []
+    next_free = -1                      # first close an independent window may use
+    for d, g in sorted(log.groupby("run_date"), key=lambda kv: kv[0]):
+        i = int(idx.searchsorted(pd.Timestamp(d), side="right")) - 1
+        if i < 0:
+            continue
+        j = i + horizon
+        if j >= len(idx):
+            pending.append(pd.Timestamp(d).strftime("%Y-%m-%d"))
+            continue
+        g = g.drop_duplicates("ticker").set_index("ticker")
+        g = g[g.index.isin(prices.columns)]
+        realised = (prices.iloc[j] / prices.iloc[i] - 1).reindex(g.index)
+        ok = realised.notna() & np.isfinite(realised) & g["predicted_score"].notna()
+        g, realised = g[ok], realised[ok]
+        if len(g) < min_names or g["predicted_score"].nunique() < 2:
+            continue
+        ic = float(spearmanr(g["predicted_score"], realised)[0])
+        top = realised[g["is_top_pick"].astype(str).str.lower() == "true"]
+        indep = i >= next_free
+        if indep:
+            next_free = j
+        rows.append(LiveScore(pd.Timestamp(d).strftime("%Y-%m-%d"),
+                              idx[j].strftime("%Y-%m-%d"), len(g), ic,
+                              float(top.mean()) if len(top) else None,
+                              float(realised.mean()), indep))
+    return rows, pending
+
+
+@dataclass(frozen=True)
+class LiveVerdict:
+    """The live record against the walk-forward it is supposed to resemble."""
+    n: int                        # independent live periods
+    mean_ic: float
+    mean_active: float | None
+    bt_mean_ic: float             # walk-forward mean IC per period
+    bt_sd_ic: float
+    share_as_bad: float | None    # share of n-period stretches of the walk-forward
+                                  # whose mean IC was this low or lower
+    streak: int                   # latest periods in a row with negative active
+    after_streak_n: int = 0       # walk-forward periods that followed such a streak
+    after_streak_next: float | None = None   # their mean active return
+    all_next: float | None = None            # mean active return of every period
+
+
+def live_verdict(rows: list[LiveScore], period_ic: pd.Series,
+                 active: pd.Series) -> LiveVerdict | None:
+    """Compare the independent live periods with the walk-forward's per-period
+    IC and active returns (both out of sample). None without both."""
+    live = [r for r in rows if r.independent]
+    ics = period_ic.dropna()
+    if not live or len(ics) < 10:
+        return None
+    n = len(live)
+    mean_ic = float(np.mean([r.ic for r in live]))
+    acts = [r.active for r in live if r.active is not None]
+    windows = ics.rolling(n).mean().dropna()
+    share = float((windows <= mean_ic).mean()) if len(windows) else None
+    streak = 0
+    for r in reversed(live):
+        if r.active is None or r.active >= 0:
+            break
+        streak += 1
+    a = active.dropna()
+    after_n, after_next = 0, None
+    if streak and len(a) > streak:
+        lagging = (a < 0).astype(int).rolling(streak).sum().shift(1) == streak
+        nxt = a[lagging]
+        after_n = len(nxt)
+        after_next = float(nxt.mean()) if after_n else None
+    return LiveVerdict(n, mean_ic, float(np.mean(acts)) if acts else None,
+                       float(ics.mean()), float(ics.std(ddof=1)), share, streak,
+                       after_n, after_next, float(a.mean()) if len(a) else None)
+
+
+def live_payload(rows: list[LiveScore], pending: list[str], horizon: int,
+                 verdict: LiveVerdict | None) -> dict:
+    """JSON-ready live record for the report (all floats finite or None)."""
+    def f(v: float | None) -> float | None:
+        return None if v is None or not np.isfinite(v) else float(v)
+    out: dict = {
+        "horizon": horizon, "pending": list(pending),
+        "rows": [{"run_date": r.run_date, "scored_to": r.scored_to, "n": r.n,
+                  "ic": f(r.ic), "picks": f(r.picks), "universe": f(r.universe),
+                  "active": f(r.active), "independent": r.independent} for r in rows],
+        "verdict": None,
+    }
+    if verdict is not None:
+        out["verdict"] = {k: (f(v) if isinstance(v, float) else v)
+                          for k, v in verdict.__dict__.items()}
+    return out
+
+
+def live_summary(name: str, rows: list[LiveScore], horizon: int,
+                 verdict: LiveVerdict | None) -> str:
+    """Plain-text live record for the run log."""
+    head = f"--- Live record ({name}, {horizon}-day horizon) ---"
+    if not rows:
+        return head + "\nNo logged predictions old enough to score yet."
+    lines = [head]
+    for r in rows:
+        act = "n/a" if r.active is None else f"{r.active:+.2%}"
+        lines.append(f"{r.run_date} -> {r.scored_to}: IC {r.ic:+.3f}, picks minus "
+                     f"universe {act}{'' if r.independent else '  (overlaps)'}")
+    if verdict is not None:
+        share = ("n/a" if verdict.share_as_bad is None
+                 else f"{verdict.share_as_bad:.1%}")
+        lines.append(f"Independent periods: {verdict.n}; mean IC {verdict.mean_ic:+.3f} vs "
+                     f"walk-forward {verdict.bt_mean_ic:+.3f} (sd {verdict.bt_sd_ic:.3f}); "
+                     f"walk-forward {verdict.n}-period stretches this bad: {share}")
+        if verdict.streak and verdict.after_streak_next is not None:
+            lines.append(f"Walk-forward after {verdict.streak} lagging period(s) in a row "
+                         f"({verdict.after_streak_n} times): next period "
+                         f"{verdict.after_streak_next:+.2%} vs {verdict.all_next:+.2%} on "
+                         "average")
+    return "\n".join(lines)

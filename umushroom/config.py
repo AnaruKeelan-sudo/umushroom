@@ -10,7 +10,7 @@ diff config.yaml between two runs to see exactly what changed.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import date
 from pathlib import Path
 
@@ -166,6 +166,11 @@ class StrategyConfig:
     # data.py: refuse to run (and to cache) when Yahoo serves less than this
     # share of the universe -- a rate-limited download must never be traded
     max_missing_fraction: float = MAX_MISSING_FRACTION
+    # ---- v4.25 ----
+    # repair listing artefacts, pence/pound flips and bad prints before the
+    # >95%-day guard drops the instrument (data.repair_price_errors); False =
+    # the pre-4.25 behaviour (drop every instrument with one such day)
+    repair_price_errors: bool = False
 
     def __post_init__(self) -> None:
         _validate(self)
@@ -513,7 +518,10 @@ def load_config(path: str | Path = "config.yaml") -> StrategyConfig:
     if missing:
         raise ConfigError(f"Config file {path} is missing keys: {sorted(missing)}")
 
-    for key in raw:
+    # v4.25: every scalar field, not only the keys this file happens to set
+    # (README: "any field can be overridden") -- before, a field left at its
+    # default in config.yaml silently ignored its environment variable
+    for key in [*raw, *(f.name for f in fields(StrategyConfig) if f.name not in raw)]:
         env_key = f"UMUSHROOM_{key.upper()}"
         if env_key in os.environ:
             raw[key] = os.environ[env_key]
@@ -573,6 +581,7 @@ def load_config(path: str | Path = "config.yaml") -> StrategyConfig:
             require_fresh_data=_to_bool(raw.get("require_fresh_data", False)),
             auto_confirm_runs=int(raw.get("auto_confirm_runs", 1)),
             auto_trade_on=str(raw.get("auto_trade_on", "pass")).lower(),
+            repair_price_errors=_to_bool(raw.get("repair_price_errors", False)),
         )
     except (TypeError, ValueError, KeyError) as e:
         raise ConfigError(f"Config file {path} has a field of the wrong type: {e}") from e

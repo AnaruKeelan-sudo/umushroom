@@ -56,6 +56,7 @@ from umushroom import __version__
 from umushroom.macro import FBY, MacroResult, analyse, talking_points
 from umushroom.rebalance import DEFAULT_REBALANCE_DAYS, Cadence, books, cadence, plan
 from umushroom.report import (
+    _label,
     _price,
     _tile,
     bar_chart,
@@ -376,11 +377,22 @@ def payload_urls(payload: dict) -> dict[str, str]:
     return out
 
 
+def _fx_note(res: TrackerResult, ccy: str) -> str:
+    """v4.25: what the values include -- said plainly either way."""
+    if res.fx:
+        return (f"Values are in {html.escape(ccy or 'the account currency')}, currency "
+                "moves included, as the UMushroom account counts them; prices are in "
+                "each listing's own currency.")
+    missing = sorted({p.ticker for p in res.priced if not p.fx})
+    return ("Values are approximate: no exchange rate was found for "
+            f"{html.escape(', '.join(missing))}, so their currency moves are ignored.")
+
+
 def tracker_body(res: TrackerResult, ccy: str, label: str = "",
                  urls: dict[str, str] | None = None) -> str:
     out = [(f'<h2>Since the prediction</h2><p class="note">{label}Each pick\'s latest '
             f"close compared with its close on {html.escape(res.as_of)}, when the model "
-            f"chose it. Values are approximate: they ignore currency moves since then.</p>")]
+            f"chose it. {_fx_note(res, ccy)}</p>")]
     priced = res.priced
     if not res.positions:
         return out[0] + '<p class="note">This run has no orders.</p>'
@@ -415,13 +427,13 @@ def tracker_body(res: TrackerResult, ccy: str, label: str = "",
             out.append(line_chart(
                 "Your picks since the prediction",
                 f"Value of this run's orders on each trading day since {res.as_of} "
-                f"({ccy}, currency moves ignored).",
+                f"({ccy}, currency moves {'included' if res.fx else 'partly ignored'}).",
                 [d.strftime("%Y-%m-%d") for d in path.index],
                 [("Portfolio value", [float(v) for v in path], "--series-1")], "money"))
         ranked = sorted(priced, key=lambda p: p.change or 0.0, reverse=True)
         out.append(bar_chart(
             "Change since the prediction, by holding",
-            "Latest close against the close on the prediction date.",
+            f"Value now against the value on the prediction date, in {ccy}.",
             [p.ticker for p in ranked], [p.change or 0.0 for p in ranked], "pct"))
     head = ["Sleeve", "Ticker", "Trade", "Name", "Shares", "Price at prediction",
             "Price now", "Change", "Value then", "Value now", "Gain", "Last price"]
@@ -448,15 +460,19 @@ def tracker_body(res: TrackerResult, ccy: str, label: str = "",
     return "".join(out)
 
 
-def record_body(rows: list[RecordRow], days: int, benchmark: str = BENCHMARK) -> str:
+def record_body(rows: list[RecordRow], days: int, benchmark: str = BENCHMARK,
+                ccy: str = "GBP") -> str:
     """v4.21: the live track record -- one holding period's book per row,
     scored to the close the next book was bought at, against the benchmark
-    over exactly the same closes."""
+    over exactly the same closes. v4.25: both in the account currency."""
+    fx = all(r.fx for r in rows)
+    money = (f"Book and benchmark are in {html.escape(ccy)}, currency moves included."
+             if fx else "Currency moves are ignored where no exchange rate was found.")
     out = [(f'<h2>Week by week</h2><p class="note">Every holding period\'s book under '
             f"the {days}-trading-day rule (the first run of the period), scored from the "
             "close its signals were built on to the close the next book was bought at; "
             f"the current book is scored so far. {html.escape(benchmark)} (MSCI World) "
-            "is scored over the same closes. Currency moves are ignored.</p>")]
+            f"is scored over the same closes. {money}</p>")]
     if not rows:
         return out[0] + '<p class="note">No books yet.</p>'
     done = [r for r in rows if r.until and r.change is not None]
@@ -467,7 +483,7 @@ def record_body(rows: list[RecordRow], days: int, benchmark: str = BENCHMARK) ->
             _tile("Weeks scored", str(len(done)), "completed holding periods"),
             _tile("Beat MSCI World", f"{beat} of {len(act)}" if act else "n/a", "weeks"),
             _tile("Average week", f"{float(np.mean([r.change for r in done])):+.2%}",
-                  "the book, before currency"),
+                  f"the book, in {ccy}" if fx else "the book"),
             _tile("Average vs world", f"{float(np.mean(act)):+.2%}" if act else "n/a",
                   "per week"),
         ]) + "</section>")
@@ -497,6 +513,93 @@ def record_body(rows: list[RecordRow], days: int, benchmark: str = BENCHMARK) ->
     return "".join(out)
 
 
+def _pct(v: float | None, digits: int = 2) -> str:
+    return "n/a" if v is None else f"{v:+.{digits}%}"
+
+
+def _live_reading(v: dict) -> str:
+    """One plain sentence on what the live record means, by the numbers."""
+    n, share = int(v.get("n") or 0), v.get("share_as_bad")
+    weeks = f"{n} independent period{'s' if n != 1 else ''}"
+    if share is None:
+        out = f"Too little walk-forward history to compare {weeks} against."
+    elif share < 0.05:
+        out = (f"The live record is worse than all but {share:.1%} of {weeks.split()[0]}-"
+               "period stretches of the walk-forward: a real warning -- though by the "
+               "rules this strategy runs on, a few weeks cannot overturn years of "
+               "out-of-sample evidence.")
+    elif share < 0.25:
+        out = (f"Weaker than the walk-forward's average, but stretches like this "
+               f"happened in {share:.0%} of it.")
+    else:
+        out = "In line with the walk-forward."
+    streak, after, base = v.get("streak") or 0, v.get("after_streak_next"), v.get("all_next")
+    if streak >= 2 and after is not None and base is not None and (v.get("after_streak_n") or 0) >= 5:
+        tail = (f" In the walk-forward, after {streak} periods in a row of the picks lagging "
+                f"the universe, the next period's picks {'beat' if after >= 0 else 'lagged'} "
+                f"it by {abs(after):.2%} on average ({v['after_streak_n']} times), against "
+                f"{base:+.2%} for every period: ")
+        tail += ("a losing run was not, in the model's own history, a sign that it had "
+                 "stopped working." if after >= base else
+                 "in the model's own history, losing runs tended to continue.")
+        out += tail
+    return out
+
+
+def live_body(payload: dict) -> str:
+    """v4.25: is the model right? Every logged forecast scored at its horizon."""
+    parts: list[str] = []
+    for sl in payload.get("sleeves") or []:
+        live = sl.get("live") or {}
+        rows = live.get("rows") or []
+        if not rows:
+            continue
+        h = int(live.get("horizon") or 0)
+        name = _label(str(sl.get("name") or ""))
+        parts.append(f"<h3>{html.escape(name)}: {h}-trading-day forecasts</h3>")
+        v = live.get("verdict")
+        if v:
+            parts.append('<section class="tiles">' + "".join([
+                _tile("Periods counted", str(v["n"]), "non-overlapping"),
+                _tile("Live IC", f"{v['mean_ic']:+.3f}",
+                      f"walk-forward {v['bt_mean_ic']:+.3f} a period"),
+                _tile("Picks vs universe", _pct(v.get("mean_active")), "average a period"),
+                _tile("As bad in the walk-forward",
+                      "n/a" if v.get("share_as_bad") is None else f"{v['share_as_bad']:.1%}",
+                      f"of {v['n']}-period stretches"),
+            ]) + "</section>")
+            parts.append(f'<p class="note">{html.escape(_live_reading(v))}</p>')
+        head = ["Signals of", "Scored to", "Instruments", "IC", "Picks", "Universe",
+                "Picks minus universe", "Counted"]
+        trs = []
+        for r in reversed(rows):                       # newest first
+            trs.append(
+                f"<tr><td>{html.escape(r['run_date'])}</td>"
+                f"<td>{html.escape(r['scored_to'])}</td><td>{int(r['n'])}</td>"
+                f'<td class="{_cls(r.get("ic"))}">'
+                f"{'n/a' if r.get('ic') is None else format(r['ic'], '+.3f')}</td>"
+                f'<td class="{_cls(r.get("picks"))}">{_pct(r.get("picks"))}</td>'
+                f'<td class="{_cls(r.get("universe"))}">{_pct(r.get("universe"))}</td>'
+                f'<td class="{_cls(r.get("active"))}">{_pct(r.get("active"))}</td>'
+                f"<td>{'yes' if r.get('independent') else 'overlaps'}</td></tr>")
+        th = "".join(f"<th>{html.escape(x)}</th>" for x in head)
+        parts.append(f'<div class="scroll"><table class="data"><thead><tr>{th}</tr>'
+                     f'</thead><tbody>{"".join(trs)}</tbody></table></div>')
+    if not parts:
+        return ""
+    intro = ('<h2>Is the model right? The live record</h2><p class="note">Every run logs '
+             "the model's score for every instrument it ranks. Once the forecast horizon "
+             "has passed, each day's scores are checked against what the prices actually "
+             "did: the IC is the rank correlation between scores and returns (+1 = perfect "
+             "order, 0 = no skill, below 0 = the wrong way round), and the picks are "
+             "compared with the average of everything ranked. Rows that share days with "
+             "an earlier counted row are shown but not counted again. The walk-forward "
+             "figures are the same model's out-of-sample record, so the comparison asks "
+             "how often the backtest had a stretch this good or bad.</p>")
+    return intro + "".join(parts)
+
+
+# --------------------------------------------------------- when to sell
 # --------------------------------------------------------- when to sell
 
 _ACT_CLASS = {"SELL ALL": "act-sell", "SELL": "act-sell", "BUY NEW": "act-buy",
@@ -972,11 +1075,13 @@ def make_handler(site: Site) -> type[BaseHTTPRequestHandler]:
                     rows = site.recorded(latest, lp, "refresh" in params)
                     body = (_run_picker(runner, run, "/tracker")
                             + tracker_body(res, ccy, urls=payload_urls(payload))
-                            + record_body(rows, _days(lp)))
+                            + record_body(rows, _days(lp), ccy=ccy or "GBP"))
                 except Exception as e:  # noqa: BLE001 -- network errors vary
                     body = (_run_picker(runner, run, "/tracker")
                             + f'<p class="note">Could not get prices: {html.escape(str(e))}'
                               "</p>")
+                # v4.25: needs no download -- the run itself scored its log
+                body += live_body(site.payload(latest) or payload)
             else:
                 body = section_bodies(payload)[key]
             title = "UMushroom" if key == "overview" else f"UMushroom: {label}"

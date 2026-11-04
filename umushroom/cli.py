@@ -52,7 +52,14 @@ from umushroom.logging_config import configure_logging, get_logger
 from umushroom.model import GBM_BIN_MODES, MODEL_TYPES, RankingModel
 from umushroom.montecarlo import combine_sleeves, simulate
 from umushroom.portfolio_construction import hrp_weight
-from umushroom.prediction_log import evaluate_latest_predictions, log_predictions
+from umushroom.prediction_log import (
+    evaluate_latest_predictions,
+    live_payload,
+    live_summary,
+    live_verdict,
+    log_predictions,
+    score_logged,
+)
 from umushroom.purged_backtest import (
     PurgedWalkForwardResult,
     WeightFn,
@@ -225,11 +232,16 @@ def main(argv: list[str] | None = None) -> int:
             yahoo_symbols=cfg.yahoo_symbols,
             max_missing_fraction=cfg.max_missing_fraction,
             require_fresh=cfg.require_fresh_data,
+            repair=cfg.repair_price_errors,
         )
         prices = market.prices
         print(f"\nData: {prices.shape[1]} instruments, {len(prices)} trading days "
               f"({prices.index[0].date()} .. {prices.index[-1].date()}), "
               f"prices in {cfg.base_currency}")
+        if market.repairs:
+            print("Price errors repaired (v4.25): "
+                  + "; ".join(f"{k} -- {len(v)}: {', '.join(v)}"
+                              for k, v in data_mod.repair_summary(market.repairs).items()))
 
         allocations: list[tuple[SleeveConfig, Allocation]] = []
         collected: dict[str, SleeveReport] = {}
@@ -416,7 +428,8 @@ def _write_report(cfg: StrategyConfig, args: argparse.Namespace,
               "generated": datetime.now(data_mod.LOCAL_TZ).strftime("%Y-%m-%d %H:%M"),
               "base_currency": cfg.base_currency, "version": __version__,
               "rebalance_days": cfg.rebalance_days,
-              "contest_window_days": cfg.contest_window_days},
+              "contest_window_days": cfg.contest_window_days,
+              "price_repairs": data_mod.repair_summary(market.repairs)},
         sleeves=sleeves, orders=orders, top_ranked=top, deciles=deciles,
         mc=mc, mc_note=mc_note, top_etfs=top_etfs)
     return write_report(args.report, payload)
@@ -647,9 +660,6 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
         print("\n--- Factor-risk weights (v4.20) ---")
         print(alloc.factor_risk.summary())
         info.factor_risk = factor_risk_payload(alloc.factor_risk)
-    log_predictions(log_path=log_path, run_date=prices.index[-1],
-                    all_scores=alloc.all_scores, prices=prices.iloc[-1],
-                    picked_tickers=set(alloc.orders.index))
     info.scores = alloc.all_scores
     if alloc_cols is not cols:
         # held the core basket: still rank the whole universe for the report
@@ -662,6 +672,19 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
         except (InsufficientHistoryError, ValueError) as e:
             get_logger("cli").warning(
                 f"Could not rank the full {sleeve.name} universe today: {e}")
+    # v4.25: the live record at the model's own horizon, BEFORE today's scores
+    # join the log (they are scored once their horizon has passed)
+    live_rows, live_pending = score_logged(log_path, prices, horizon)
+    verdict = (live_verdict(live_rows, pwf.period_ic, pwf.active_returns)
+               if pwf is not None else None)
+    info.live = live_payload(live_rows, live_pending, horizon, verdict)
+    print("\n" + live_summary(sleeve.name, live_rows, horizon, verdict))
+    # v4.25: log the scores of the WHOLE ranked universe (before, a sleeve
+    # holding its core basket logged only the core ETFs it held, so the ETF
+    # model's live skill over 1,500 ETFs could never be measured)
+    log_predictions(log_path=log_path, run_date=prices.index[-1],
+                    all_scores=info.scores, prices=prices.iloc[-1],
+                    picked_tickers=set(alloc.orders.index))
     return alloc
 
 

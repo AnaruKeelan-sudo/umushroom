@@ -118,7 +118,8 @@ def test_record_scores_each_book_to_the_next_one_against_the_benchmark():
     week2 = _payload([{"ticker": "A", "local_price": 110.0, "allocated_value": 100.0}],
                      as_of="2026-10-05")
     rows = record([("r1", week1, "2026-10-05"), ("r2", week2, None)], f)
-    assert len(f.calls) == 1 and f.calls[0][0] == ("A", "B", "IWDA.L")   # one download
+    # one download -- v4.25: with the benchmark's FX pair (IWDA.L is the USD line)
+    assert len(f.calls) == 1 and f.calls[0][0] == ("A", "B", "IWDA.L", "USDGBP=X")
     r1, r2 = rows
     assert r1.change == pytest.approx((300 * 1.1 + 100 * 0.8) / 400 - 1)  # +2.5%
     assert r1.up == 1 and r1.n == 2 and r1.until == "2026-10-05"
@@ -126,3 +127,76 @@ def test_record_scores_each_book_to_the_next_one_against_the_benchmark():
     assert r2.change == pytest.approx(0.10) and r2.until is None
     assert r2.benchmark == pytest.approx(0.0) and r2.last_date == "2026-10-06"
     assert record([], f) == []
+    assert not r1.fx       # no USDGBP=X in this frame: the page must say so
+
+
+# --------------------------------------------- v4.25: values in GBP, with FX
+
+def test_a_usd_holding_is_valued_in_gbp_with_the_currency_move():
+    """The stock is flat in dollars while the dollar gains 10% on the pound:
+    the GBP value (what the UMushroom account shows) is up 10%; the price on
+    the page stays the dollar price."""
+    closes = pd.DataFrame({"AAPL": [200.0, 200.0, 200.0, 200.0],
+                           "USDGBP=X": [0.75, 0.75, 0.80, 0.825]}, index=DAYS)
+    f = _fetch(closes)
+    res = track(_payload([{"ticker": "AAPL", "local_price": 200.0, "shares": 10,
+                           "listing_currency": "USD", "allocated_value": 1500.0}]), f)
+    p = res.positions[0]
+    assert f.calls[0][0] == ("AAPL", "USDGBP=X")
+    assert p.change == pytest.approx(0.10) and p.local_change == pytest.approx(0.0)
+    assert p.value_now == pytest.approx(1650.0) and p.price_now == pytest.approx(200.0)
+    assert p.fx and res.fx
+    assert res.portfolio_path().iloc[-1] == pytest.approx(1650.0)
+
+
+def test_fx_rate_on_a_day_the_stock_did_not_trade_is_carried_forward():
+    days = pd.to_datetime(["2026-10-01", "2026-10-02", "2026-10-05", "2026-10-06"])
+    closes = pd.DataFrame({"NESN.SW": [100.0, 100.0, None, 110.0],
+                           "CHFGBP=X": [0.90, 0.90, 0.99, None]}, index=days)
+    res = track(_payload([{"ticker": "NESN.SW", "local_price": 100.0,
+                           "listing_currency": "CHF", "allocated_value": 900.0}]),
+                _fetch(closes))
+    # 10/06: price +10% in CHF, the rate's last print (10/05) +10% -> +21% in GBP
+    assert res.positions[0].change == pytest.approx(1.1 * 1.1 - 1)
+
+
+def test_missing_fx_pair_falls_back_to_the_local_change_and_says_so():
+    from umushroom.web import tracker_body
+    closes = pd.DataFrame({"AAPL": [200.0, 200.0, 210.0, 220.0],
+                           "AZN.L": [100.0, 100.0, 101.0, 102.0]}, index=DAYS)
+    res = track(_payload([
+        {"ticker": "AAPL", "local_price": 200.0, "listing_currency": "USD",
+         "allocated_value": 1500.0},
+        {"ticker": "AZN.L", "local_price": 1.0, "listing_currency": "GBP",
+         "allocated_value": 100.0}]), _fetch(closes))
+    aapl, azn = res.positions
+    assert aapl.change == pytest.approx(0.10) and not aapl.fx
+    assert azn.fx and not res.fx                   # GBP needs no rate
+    html = tracker_body(res, "GBP")
+    assert "no exchange rate was found for AAPL" in html
+    good = track(_payload([{"ticker": "AZN.L", "local_price": 1.0,
+                            "listing_currency": "GBP", "allocated_value": 100.0}]),
+                 _fetch(closes))
+    assert "currency moves included" in tracker_body(good, "GBP")
+
+
+def test_record_scores_book_and_benchmark_in_gbp():
+    from umushroom.tracker import record
+    from umushroom.web import record_body
+    closes = pd.DataFrame({"AZN.L": [100.0, 100.0, 100.0, 100.0],
+                           "IWDA.L": [10.0, 10.0, 10.0, 10.0],
+                           "USDGBP=X": [0.80, 0.80, 0.78, 0.76]}, index=DAYS)
+    book = _payload([{"ticker": "AZN.L", "local_price": 1.0, "listing_currency": "GBP",
+                      "allocated_value": 100.0}], as_of="2026-10-02")
+    (row,) = record([("20261002-080000", book, "2026-10-06")], _fetch(closes))
+    assert row.change == pytest.approx(0.0)
+    assert row.benchmark == pytest.approx(0.76 / 0.80 - 1)        # -5% in pounds
+    assert row.active == pytest.approx(0.05) and row.fx
+    assert "in GBP, currency moves included" in record_body([row], 5, ccy="GBP")
+
+
+def test_fx_pair_names():
+    from umushroom.tracker import fx_pair
+    assert fx_pair("USD", "GBP") == "USDGBP=X" and fx_pair("chf", "GBP") == "CHFGBP=X"
+    assert fx_pair("GBP", "GBP") is None and fx_pair("", "GBP") is None
+    assert fx_pair("GBp", "GBP") is None and fx_pair("GBp", "USD") == "GBPUSD=X"

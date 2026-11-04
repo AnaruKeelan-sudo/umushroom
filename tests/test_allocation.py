@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from umushroom.allocation import generate_allocation
+from umushroom.exceptions import DataError
 from umushroom.features import build_training_set
 from umushroom.model import RankingModel
 
@@ -181,6 +183,36 @@ def test_hold_all_uses_every_available_instrument(synthetic_prices, trained_mode
     assert len(alloc.orders) == 7
 
 
+def test_hold_all_holds_an_instrument_the_model_cannot_score(synthetic_prices,
+                                                             trained_model):
+    """v4.25: CSNDX.SW had no prices 24 Dec - 2 Jan, so its 252-day factors were
+    undefined for a year and the core basket silently held 12 ETFs, not 13.
+    A held-all basket does not use the model: it holds every priced name."""
+    data = synthetic_prices.copy()
+    victim = data.columns[0]
+    data.iloc[-100:-95, 0] = float("nan")          # a 5-day gap inside the last year
+    alloc = generate_allocation(data, trained_model, top_n=8, balance=100_000,
+                                hold_all=True)
+    assert len(alloc.orders) == data.shape[1]      # every instrument is held
+    assert victim in alloc.orders.index
+    assert np.isnan(alloc.orders.loc[victim, "predicted_score"])
+    assert alloc.orders["target_weight"].round(4).nunique() == 1   # equal weight
+    assert victim not in alloc.all_scores.index    # never logged as a prediction
+    assert alloc.all_scores.notna().all()
+    # a MODEL sleeve still never picks a name it cannot score
+    picks = generate_allocation(data, trained_model, top_n=7, balance=100_000)
+    assert victim not in picks.orders.index and len(picks.orders) == 7
+
+
+def test_hold_all_with_no_priced_instrument_fails_loudly(synthetic_prices,
+                                                         trained_model):
+    data = synthetic_prices.copy()
+    data.iloc[-1, :] = float("nan")
+    with pytest.raises(DataError, match="usable price"):
+        generate_allocation(data, trained_model, top_n=8, balance=100_000,
+                            hold_all=True)
+
+
 def test_stale_priced_instrument_is_excluded_and_replaced(synthetic_prices, trained_model):
     base = generate_allocation(synthetic_prices, trained_model, top_n=3,
                                balance=100_000)
@@ -220,7 +252,6 @@ def test_hold_all_drops_unaffordable_and_respreads_budget(synthetic_prices,
 
 
 # ------------------------------------- v4.20: factor weighting, twin guard
-import numpy as np
 import pandas as pd
 
 

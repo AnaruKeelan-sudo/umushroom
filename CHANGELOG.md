@@ -1,5 +1,82 @@
 # Changelog
 
+## 4.25.0 (2026-11-03) -- a complete core basket, repaired prices, the Tracker in pounds, the live record
+Found by decrypting the published site and replaying the 2-3 Nov runs offline:
+- CORE BASKET (bug). The ETF sleeve held 11 of its 13 core ETFs. CSNDX.SW
+  (Nasdaq 100) has no SIX prints from 24 Dec to 2 Jan, so its 252-day factors
+  are undefined for a year, and a held-all basket only held instruments whose
+  every factor was defined: it would have stayed out until January 2027.
+  IB01.L (the cash-like ETF) was dropped by the >95%-day guard for two
+  placeholder prints of 5.00 on its first days in 2019. Now a held-all basket
+  holds every instrument with a usable price today (its model score is shown
+  where defined and never logged as a prediction); IB01.L is fixed by the
+  repair below. The model's own picks still never include an unscored name.
+- PRICE REPAIR (`repair_price_errors`, code default off = old behaviour).
+  The guard dropped 53 instruments on 2 Nov -- 13 stocks among them -- for one
+  bad day in ten years. `data.repair_price_errors` fixes three kinds of Yahoo
+  error first, under rules that never change an instrument's latest price
+  (the one its order is sized on): listing artefacts (a >95% jump within the
+  first 5 prints), pence/pound flips (day-on-day ratio 80-125x or its
+  inverse; rescaled only when the latest print is in the series' usual unit)
+  and bad prints (at most 5 prints that come back to within 25% of the last
+  good close; replaced by that close, never by a later price). FX series get
+  the same repair (JPYGBP=X had two one-day 100x prints, in 2016 and 2020).
+  On 2 Nov: 44 series repaired, 31 recovered (7 stocks: BXP.L, ELM.L,
+  FXPO.L, INDV.L, ISN.SW, LECN.SW, SAR.L; IB01.L and 22 other ETFs; the yen
+  rate), 25 still dropped (real jumps, unadjusted splits, BCG.L's flip still
+  open today). The Checks tab lists every repair of the run.
+  HEAD-TO-HEAD on the same cached download (rule declared before the numbers:
+  adopt unless the repaired stock sleeve's walk-forward IC t falls below 2 or
+  its contest-window verdict is worse; the ETF sleeve is reported):
+    stocks  off 568 names, IC t +4.71, alpha +10.7%/yr (t 2.09), window PASS
+            on  575 names, IC t +5.17, alpha +19.1%/yr (t 3.22), window PASS -> ADOPTED
+    ETFs    off 1,592 (12 core), IC t +2.92, alpha +0.1%, WARN -> core basket
+            on  1,613 (13 core), IC t +2.95, alpha +0.0%, FAIL -> core basket
+  The alpha gain is not a forecast. Attribution: the 7 recovered stocks were
+  in the walk-forward's top 10 76 times in 330 weeks and add about 2.3 points
+  a year (Sareum SAR.L most of it); the rest is the gbm model reshuffling its
+  other picks when its training set changes (the fragility noted in 4.23).
+  Today's stock orders change by 4 of 10 names; SAR.L is one of them (it was
+  suspended for two weeks and resumed 40% lower, which the model's reversal
+  factor favours).
+- TRACKER IN POUNDS. The since-prediction values and the week-by-week record
+  ignored currency moves, so a USD or CHF holding's value differed from what
+  the UMushroom account shows. The FX pairs (USDGBP=X, CHFGBP=X, ...) now come
+  in the same download and every value, the book and MSCI World (IWDA.L, the
+  USD line) included, is in GBP; prices stay in each listing's currency. A
+  holding whose rate cannot be fetched falls back to its local change and the
+  page names it.
+- THE LIVE RECORD ("Is the model right?", Tracker tab). The old check scored
+  the previous run against today's price: one day of a 5-day forecast. Every
+  logged cross-section is now scored once its horizon has passed, on the same
+  base-currency closes the model trains on: rank correlation (IC) with what
+  happened, picks against the universe; overlapping windows are shown but
+  counted once. The live weeks are set against the walk-forward's own
+  per-period IC ("how often did the backtest have a stretch this bad?") and
+  against what the walk-forward did after the same number of lagging weeks
+  in a row. On the local log (7 Oct - 2 Nov 2026) the stock model's live IC
+  was -0.11, -0.20, -0.24, -0.21 and -0.13: negative in all five cross-
+  sections (three independent weeks, mean -0.15, picks behind the universe
+  by about 2% a week). In the walk-forward's 330 weeks, active returns were
+  negatively autocorrelated (lag-1 -0.14) and the week after three lagging
+  weeks beat the universe by +0.64% on average (17 times) against +0.25% for
+  all weeks: by the model's own history a losing run is not a reason to
+  switch it off. No gate was added; three weeks cannot overturn eight years by
+  this repo's rules, and the page now shows the evidence every run.
+- The ETF sleeve's prediction log holds the whole ranked universe (it held
+  only the ~12 core ETFs bought, so the ETF model's live skill could never be
+  measured); cross-sections of fewer than 30 names are not scored.
+- CONFIG. A `UMUSHROOM_<FIELD>` environment variable now overrides ANY field,
+  as the README always said; before, only keys present in config.yaml could
+  be overridden, so a field left at its default silently ignored its variable.
+- README: the run steps, schedule, learners and module list brought up to
+  date; a v4.25 section.
+- 28 new tests (held-all basket with a gap; every repair kind with known
+  answers, the latest price never changed, idempotence, crypto exempt, FX;
+  the loader on/off; GBP valuation, FX alignment and fallback, the record in
+  GBP; live scoring, overlaps, the verdict, payload and page; the ETF log;
+  a later run scoring an earlier one; the published Tracker pane; config).
+
 ## 4.24.0 (2026-11-02) -- a buy / sell link next to every instrument
 - Every table that lists an instrument (today's orders, top-ranked stocks,
   the ETF orders and ranking, the sell tab's trade list, the Tracker's
