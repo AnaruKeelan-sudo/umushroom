@@ -429,7 +429,12 @@ def _write_report(cfg: StrategyConfig, args: argparse.Namespace,
               "base_currency": cfg.base_currency, "version": __version__,
               "rebalance_days": cfg.rebalance_days,
               "contest_window_days": cfg.contest_window_days,
-              "price_repairs": data_mod.repair_summary(market.repairs)},
+              "price_repairs": data_mod.repair_summary(market.repairs),
+              # v4.26: what the Sell tab needs to tell "the model dropped it"
+              # from "this run could not price or run it" (rebalance.plan)
+              "skipped_sleeves": sorted({s.name for s in cfg.all_sleeves}
+                                        - {s.name for s, _ in allocations}),
+              "stale_last": sorted(market.stale_last)},
         sleeves=sleeves, orders=orders, top_ranked=top, deciles=deciles,
         mc=mc, mc_note=mc_note, top_etfs=top_etfs)
     return write_report(args.report, payload)
