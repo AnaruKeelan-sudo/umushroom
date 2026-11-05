@@ -804,6 +804,28 @@ weighting: "hrp"
 # Refuse to run (and to cache) when Yahoo serves less than 90% of the
 # universe -- a rate-limited download must never be traded (data.py).
 max_missing_fraction: 0.10
+# v4.25 (2026-11-03): repair Yahoo's price errors BEFORE the >95%-day guard,
+# which dropped any instrument with one such day in ten years -- 53 of them on
+# 2 Nov (13 stocks; the core ETF IB01.L for two placeholder prints of 5.00 on
+# its first days in 2019). Three kinds are repaired (data.repair_price_errors),
+# never changing an instrument's latest price, the one its order is sized on:
+# listing artefacts (a jump within the first 5 prints), pence/pound flips
+# (rescaled by 100 when the latest print is in the series' usual unit) and bad
+# prints (<= 5 prints that come straight back; replaced by the last good
+# close). JPYGBP=X's two one-day 100x prints are fixed the same way. What the
+# rules cannot explain (real jumps, unadjusted splits, BCG.L's flip still open
+# today) is dropped as before: 25 instruments on 2 Nov instead of 53.
+# HEAD-TO-HEAD (same cached download to 2026-11-02, rule declared first:
+# adopt unless the repaired stock sleeve's IC t < 2 or its contest-window
+# verdict is worse; the ETF sleeve is reported):
+#   stocks  off: 568 names  IC t +4.71  alpha +10.7%/yr (t 2.09)  window PASS
+#           on:  575 names  IC t +5.17  alpha +19.1%/yr (t 3.22)  window PASS  <- ADOPTED
+#   ETFs    off: 1,592 (12 core)  IC t +2.92  alpha +0.1%  window WARN -> core basket
+#           on:  1,613 (13 core)  IC t +2.95  alpha +0.0%  window FAIL -> core basket
+# The alpha gain is NOT a forecast: ~2.3 points/yr are the 7 recovered stocks
+# being picked (Sareum SAR.L most of it), the rest is the gbm model reshuffling
+# its other picks when its training set changes (the fragility noted in v4.23).
+repair_price_errors: true
 top_n_holdings: 10              # v4.5: back to 10 -- won the 10-year
                                 # head-to-head (alpha t=2.22) vs 25
 lookback_period: "10y"          # v4.4: 10 years (each stock joins the model

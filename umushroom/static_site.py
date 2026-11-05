@@ -48,6 +48,7 @@ from umushroom.web import (
     _pretty,
     _short_stamp,
     default_command,
+    live_body,
     macro_body,
     payload_urls,
     record_body,
@@ -148,9 +149,10 @@ def build_pages(site: Site, run_url: str | None = None,
                 body = (tracker_body(site.tracked(shown, shown_payload, refresh=True), ccy,
                                      label, urls=payload_urls(shown_payload))
                         + record_body(site.recorded(latest, payload, refresh=True),
-                                      _days(payload)))
+                                      _days(payload), ccy=ccy or "GBP"))
             except Exception as e:  # noqa: BLE001 -- network errors vary
                 body = f'<p class="note">Could not get prices: {html.escape(str(e))}</p>'
+            body += live_body(payload)      # v4.25: scored by the run, no download
         elif key == "macro":
             try:
                 body = macro_body(site.macro(latest, payload, refresh=True), ccy)

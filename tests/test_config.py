@@ -613,3 +613,12 @@ def test_gbm_bins_is_parsed_and_validated(tmp_path):
     assert load_config(_write(tmp_path, VALID_YAML + "\ngbm_bins: fixed\n")).gbm_bins == "fixed"
     with pytest.raises(ConfigError):
         load_config(_write(tmp_path, VALID_YAML + "\ngbm_bins: sometimes\n"))
+
+
+def test_repair_price_errors_defaults_off_and_is_on_in_the_shipped_config(tmp_path):
+    """v4.25: the code default is the pre-4.25 behaviour (drop every
+    instrument with one >95% day); the shipped config repairs first."""
+    assert load_config(_write(tmp_path, VALID_YAML)).repair_price_errors is False
+    on = load_config(_write(tmp_path, VALID_YAML + "\nrepair_price_errors: true\n"))
+    assert on.repair_price_errors is True
+    assert load_config(REPO_CONFIG).repair_price_errors is True

@@ -64,6 +64,8 @@ class SleeveReport:
     weighting: str = "equal"                # equal | hrp | factor
     max_pick_correlation: float | None = None   # near-duplicate guard, None = off
     factor_risk: dict | None = None         # factor_risk_payload(), when sized by it
+    # ---- v4.25 ----
+    live: dict | None = None                # prediction_log.live_payload()
 
 
 def _clean(v: Any) -> Any:
@@ -186,7 +188,7 @@ def _sleeve_payload(s: SleeveReport, periods_per_year: float) -> dict:
                            "window": _window_payload(s.window),
                            "model_type": s.model_type, "weighting": s.weighting,
                            "max_pick_correlation": _clean(s.max_pick_correlation),
-                           "factor_risk": s.factor_risk}
+                           "factor_risk": s.factor_risk, "live": s.live}
     r = s.backtest
     if r is None or len(r.period_returns) == 0:
         return out
@@ -708,6 +710,21 @@ def _sleeve_checks(s: dict) -> str:
             f'<ul class="checks">{items}</ul></div>')
 
 
+def _repairs_card(payload: dict) -> str:
+    """v4.25: the Yahoo price errors repaired in this run (data.py)."""
+    rep = (payload.get("meta") or {}).get("price_repairs") or {}
+    if not rep:
+        return ""
+    items = "".join(f"<li><b>{_esc(kind.capitalize())}</b> ({len(tickers)}): "
+                    f"{_esc(', '.join(tickers))}</li>" for kind, tickers in rep.items())
+    return ('<h2>Data quality</h2><div class="card"><h3>Prices repaired in this run</h3>'
+            '<p class="note">Yahoo errors fixed before the &gt;95%-day guard, so these '
+            "instruments are kept instead of dropped. No repair changes an instrument's "
+            "latest price, the one its order is sized on; instruments the rules cannot "
+            "explain are still dropped.</p>"
+            f'<ul class="checks">{items}</ul></div>')
+
+
 def _how_held(s: dict) -> str:
     used = s.get("selection_used") or ("model" if s["selection"] == "model" else "all")
     if used == "model":
@@ -1222,7 +1239,7 @@ def section_bodies(payload: dict) -> dict[str, str]:
         checks += _var_backtest_card(payload["risk"]["backtest"])
     checks = "<h2>Validation checks</h2>" + (checks or (
         '<p class="note">No checks in this run. Run with <b>--validate</b> (or start '
-        "the website with --validate) to include them.</p>"))
+        "the website with --validate) to include them.</p>")) + _repairs_card(payload)
 
     return {"overview": _tiles(payload) + _READ_FIRST, "stocks": "".join(stocks),
             "etfs": _etf_section(payload),

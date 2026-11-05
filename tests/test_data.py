@@ -539,3 +539,119 @@ def test_fixed_start_period_is_passed_to_yahoo_and_keyed_in_the_cache(tmp_path, 
     rolling = data_mod._cache_path(tmp_path, ["A", "B"], "10y")
     fixed = data_mod._cache_path(tmp_path, ["A", "B"], START_PREFIX + "2016-10-01")
     assert rolling != fixed
+
+
+# ------------------------------------------- v4.25: price-error repair
+from umushroom.data import repair_price_errors, repair_summary
+
+
+def _walk(n=400, level=100.0, seed=3):
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2024-01-01", periods=n)
+    return pd.Series(level * np.cumprod(1 + rng.normal(0, 0.01, n)), index=idx)
+
+
+def test_repair_restores_a_pence_pound_flip_exactly():
+    s = _walk(level=2500.0)
+    bad = s.copy()
+    bad.iloc[100:180] /= 100                 # 80 days quoted in pounds, not pence
+    out, reps = repair_price_errors(bad.to_frame("BXP.L"))
+    np.testing.assert_allclose(out["BXP.L"].to_numpy(), s.to_numpy())
+    assert [(r.kind, r.prints) for r in reps] == [("pence/pound flip", 80)]
+    assert reps[0].first == s.index[100].date() and reps[0].last == s.index[179].date()
+
+
+def test_repair_never_fixes_a_flip_that_is_still_open_on_the_latest_day():
+    """BCG.L: Yahoo switched to pounds for the last 50 days. Which unit is
+    right today is unknowable from the series, so it is left for the guard
+    (which drops it) -- a repair must never change the price an order uses."""
+    s = _walk(level=200.0)
+    bad = s.copy()
+    bad.iloc[-50:] /= 100
+    out, reps = repair_price_errors(bad.to_frame("BCG.L"))
+    assert reps == []
+    pd.testing.assert_series_equal(out["BCG.L"], bad.rename("BCG.L"))
+    assert "BCG.L" not in _validate_prices(
+        pd.concat([out, _walk(seed=9).to_frame("OK")], axis=1), ["BCG.L", "OK"], 70).columns
+
+
+def test_repair_replaces_bad_prints_with_the_last_good_close():
+    s = _walk()
+    bad = s.copy()
+    bad.iloc[150] = s.iloc[150] * 0.22       # ISN.SW: 104 -> 23 -> 115
+    bad.iloc[250:252] = s.iloc[249] * 0.16   # INDV: two prints at 3.13 between ~20s
+    bad.iloc[300] = s.iloc[300] * 4.6        # LECN.SW: one print up 360%
+    out, reps = repair_price_errors(bad.to_frame("X"))
+    fixed = out["X"]
+    assert fixed.iloc[150] == bad.iloc[149]
+    assert (fixed.iloc[250:252] == bad.iloc[249]).all()
+    assert fixed.iloc[300] == bad.iloc[299]
+    untouched = [i for i in range(len(s)) if i not in (150, 250, 251, 300)]
+    np.testing.assert_allclose(fixed.iloc[untouched], s.iloc[untouched])
+    assert sorted((r.kind, r.prints) for r in reps) == [("bad print", 1), ("bad print", 1),
+                                                         ("bad print", 2)]
+    assert fixed.pct_change().abs().max() < 0.95
+
+
+def test_repair_drops_a_listing_artefact_at_the_start_of_the_history():
+    """IB01.L: two placeholder prints of 5.00 on its first days, ~99 since."""
+    s = _walk(level=99.0)
+    s.iloc[:2] = 5.0
+    out, reps = repair_price_errors(s.to_frame("IB01.L"))
+    assert out["IB01.L"].iloc[:2].isna().all()
+    np.testing.assert_allclose(out["IB01.L"].iloc[2:], s.iloc[2:])
+    assert [(r.kind, r.prints) for r in reps] == [("listing artefact", 2)]
+
+
+def test_repair_leaves_real_moves_crypto_and_the_latest_price_alone():
+    s = _walk()
+    real = s.copy()
+    real.iloc[200:] *= 2.4                   # a real, permanent +140% day (a takeover)
+    last = s.copy()
+    last.iloc[-1] *= 3.0                     # a jump ON the latest day: unknowable yet
+    crypto = s.copy()
+    crypto.iloc[100] *= 0.02
+    frame = pd.DataFrame({"REAL": real, "LAST": last, "BTC-USD": crypto})
+    out, reps = repair_price_errors(frame, exempt=frozenset({"BTC-USD"}))
+    assert reps == []
+    pd.testing.assert_frame_equal(out, frame)
+
+
+def test_repair_fixes_a_one_day_fx_glitch():
+    """JPYGBP=X printed 100x its rate for one day in 2016 and in 2020."""
+    s = _walk(level=0.0075)
+    bad = s.copy()
+    bad.iloc[120] *= 100
+    out, reps = repair_price_errors(bad.to_frame("JPYGBP=X"))
+    np.testing.assert_allclose(out["JPYGBP=X"], s)
+    assert repair_summary(reps) == {"pence/pound flip": ["JPYGBP=X"]}
+
+
+def test_repair_is_idempotent_and_keeps_gaps():
+    s = _walk(level=2500.0)
+    bad = s.copy()
+    bad.iloc[100:110] /= 100
+    bad.iloc[50:53] = np.nan                 # a holiday gap is not a price error
+    once, reps = repair_price_errors(bad.to_frame("A"))
+    twice, again = repair_price_errors(once)
+    assert reps and again == []
+    pd.testing.assert_frame_equal(once, twice)
+    assert once["A"].iloc[50:53].isna().all()
+
+
+def test_get_market_data_repairs_only_when_asked(tmp_path):
+    tickers = ["AAPL", "MSFT", "AZN.L", "SHEL.L"]
+    frame = _fake_fetcher()(tickers + ["USDGBP=X"], "2y")   # ONE fixed download
+    frame.iloc[100:140, frame.columns.get_loc("AZN.L")] /= 100   # pounds, not pence
+
+    def fetch(symbols, period):
+        return frame[[s for s in symbols if s in frame.columns]].copy()
+    off = get_market_data(tickers, "2y", tmp_path, 12, 70, "GBP", fetcher=fetch,
+                          drop_today_bar=False)
+    assert "AZN.L" not in off.prices.columns and off.repairs == ()
+    on = get_market_data(tickers, "2y", tmp_path, 12, 70, "GBP", fetcher=fetch,
+                         drop_today_bar=False, repair=True)
+    assert "AZN.L" in on.prices.columns
+    assert on.prices["AZN.L"].pct_change().abs().max() < 0.2
+    assert repair_summary(on.repairs) == {"pence/pound flip": ["AZN.L"]}
+    pd.testing.assert_series_equal(on.prices["AAPL"], off.prices["AAPL"])

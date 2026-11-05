@@ -482,3 +482,46 @@ def test_stale_data_exits_3_and_prints_not_ready(tmp_path, monkeypatch, capsys):
     rc, _o, _r = _run(monkeypatch, cfg, tmp_path, _fetch_factory(seed=5))   # data ends 2026-03
     err = capsys.readouterr().err
     assert rc == 3 and "NOT READY" in err and "has already closed" in err
+
+
+def test_core_holding_sleeve_logs_the_whole_ranked_universe(tmp_path, monkeypatch, capsys):
+    """v4.25: holding the core basket used to log only the core ETFs it held,
+    so the ETF model's live skill over its universe could never be scored.
+    The log now holds every ranked ETF, with the held ones flagged as picks;
+    the report carries each sleeve's live record (empty on a first run)."""
+    cfg = _config(tmp_path)
+    rc, out_csv, report = _run(monkeypatch, cfg, tmp_path, _fetch_factory(seed=5))
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    log = pd.read_csv(tmp_path / "pred_etf.csv")
+    assert len(log) > len(CORE) and set(CORE) <= set(log["ticker"])
+    picked = set(log.loc[log["is_top_pick"], "ticker"])
+    assert picked == set(pd.read_csv(out_csv, index_col=0).query("sleeve == 'etf'").index)
+    assert "--- Live record (etf, 10-day horizon) ---" in out
+    s = next(x for x in _payload(report)["sleeves"] if x["name"] == "etf")
+    assert s["live"]["horizon"] == 10 and s["live"]["rows"] == []
+
+
+def test_a_later_run_scores_the_earlier_runs_forecasts(tmp_path, monkeypatch, capsys):
+    """v4.25: run 1 logs its forecasts; run 2, 20 trading days later, scores
+    them at each sleeve's horizon and puts the live record in the report."""
+    from umushroom import prediction_log
+    from umushroom.web import live_body
+    monkeypatch.setattr(prediction_log, "MIN_LIVE_NAMES", 5)     # tiny test universe
+    full = _fetch_factory(seed=5)
+
+    def early(symbols, period):
+        return full(symbols, period).iloc[:-20]
+    cfg = _config(tmp_path)
+    rc, _out, _report = _run(monkeypatch, cfg, tmp_path, early)
+    assert rc == 0
+    rc, _out, report = _run(monkeypatch, cfg, tmp_path, full)
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    sleeves = {s["name"]: s for s in _payload(report)["sleeves"]}
+    for name, horizon in (("equity", 5), ("etf", 10)):
+        live = sleeves[name]["live"]
+        assert live["horizon"] == horizon and len(live["rows"]) == 1, name
+        row = live["rows"][0]
+        assert row["independent"] and -1 <= row["ic"] <= 1 and row["n"] >= 5
+    assert "Is the model right? The live record" in live_body(_payload(report))

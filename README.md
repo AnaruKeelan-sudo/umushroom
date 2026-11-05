@@ -45,16 +45,19 @@ umushroom --config config.yaml --weighting hrp --output umushroom_allocation.csv
 ```
 
 This will:
-1. Fetch (or reuse a cached) 5-year daily history for a **multi-market
-   universe** (FTSE 100 + US large caps + SMI by default), drop today's
-   still-trading bar, and convert every price into your account currency
-   (London pence -> pounds, USD/CHF -> GBP)
+1. Fetch (or reuse a cached) daily history from a fixed first date
+   (`history_start`, 2016-10-01) for a **multi-market universe** (every
+   UMushroom-listed London and Swiss stock, US large caps and UMushroom's
+   ETFs), drop today's still-trading bar, repair Yahoo's known price errors
+   (v4.25), and convert every price into your account currency (London pence
+   -> pounds, USD/CHF/EUR -> GBP)
 2. Score yesterday's logged predictions against today's prices
 3. Build 9 published factors (12-1 momentum, residual momentum, 52-week
-   high, 1-month and 1-week reversal, low volatility, low beta, RSI),
-   **ranked within each date and within each exchange** -- no lookahead,
-   tested explicitly
-4. Train a Ridge model on the **cross-sectional rank of forward returns**,
+   high, 1-month and 1-week reversal, low volatility, low beta, RSI; 13
+   trend factors for ETFs), **ranked within each date and within each
+   exchange** (asset class for ETFs) -- no lookahead, tested explicitly
+4. Train the configured learner (gradient boosting for stocks, ridge for
+   ETFs; `model_type`) on the **cross-sectional rank of forward returns**,
    with date-based, purged cross-validation that reports IC
 5. Run the purged & embargoed walk-forward backtest and print the
    skill statistics: IC, IC t-stat, hit rate, active return, top-minus-
@@ -249,7 +252,7 @@ umushroom/
   catalogue.py    # v4.19: scrape UMushroom's public ETF catalogue (sitemap + API)
   etf_universe.py # v4.19: ISIN -> Yahoo line mapping, audited universe CSV
   window.py       # v4.19: contest-window (30-day) evaluation + verdict
-  data.py         # Fetch w/ retry+backoff, validate, FX-convert, parquet cache
+  data.py         # Fetch w/ retry+backoff, repair price errors, validate, FX-convert, cache
   features.py     # Pure functions: prices -> cross-sectionally ranked factors
   model.py        # RankingModel (ridge | mlp | gbm): fit/predict/save/load, purged date-CV
   factor_risk.py  # v4.20: factor exposures, factor covariance, factor-risk-parity weights
@@ -258,8 +261,20 @@ umushroom/
   robustness.py           # Block-bootstrap Sharpe confidence interval
   factor_regression.py    # Alpha vs universe and Fama-French (Newey-West t-stats)
   portfolio_construction.py  # Equal weight and native-scipy HRP
-  prediction_log.py       # Next-run accuracy check of logged predictions
+  prediction_log.py       # Logged predictions; v4.25 live record at the model's horizon
+  selection.py    # Ranking order, sector/group caps, near-duplicate guard, rules
   allocation.py   # Rankings -> balance-constrained share order, validated
+  rebalance.py    # Weekly cadence: which run is the book, what to sell
+  tracker.py      # Since-prediction tracker and week-by-week record (in GBP)
+  validation.py   # Placebo, deciles, years, markets, delay, concentration checks
+  montecarlo.py   # Contest Monte Carlo from real out-of-sample weeks
+  risk.py         # Value at Risk and its backtest
+  macro.py        # Macro context tab
+  report.py       # The HTML report (one self-contained file)
+  shell.py        # v4.22 dashboard frame: sidebar, top bar, palette, themes
+  web.py          # Local website (python -m umushroom.web)
+  static_site.py  # Encrypted one-page site for GitHub Pages
+  check_tickers.py        # Verify config tickers against Yahoo
   cli.py          # Orchestration + argument parsing + exit codes
 tests/            # Offline, synthetic-data test suite (pytest)
 config.yaml       # Your contest's parameters — edit this, not the code
@@ -281,12 +296,39 @@ config.yaml       # Your contest's parameters — edit this, not the code
 - **Multiple testing.** Every time you try a new feature set or parameter
   and keep the best, the backtest t-stat overstates real skill. Decide
   the configuration, then run the backtest; require t >= 3 if you iterated.
-- Ridge regression on 9 ranked factors is deliberately simple for the
-  data size -- see `model.py`'s docstring.
+- The learners are deliberately shallow for the data size (gradient
+  boosting for stocks, ridge for ETFs, each adopted by a head-to-head) --
+  see `model.py`'s docstring. Their picks are deterministic but sensitive to
+  small changes in the training set (v4.23): a one-month shift of the data,
+  or seven more stocks, reshuffles several of the ten picks.
+- **The live record is the final judge.** The Tracker tab scores every
+  forecast once its horizon has passed and sets it against the walk-forward
+  (v4.25). In the first scored weeks (7 Oct - 2 Nov 2026) the stock model's
+  live rank correlation was negative every time.
 
 
 Every instrument in the tables has a **Buy / sell** link to its page on UMushroom (v4.24),
 so an order can be entered straight from the Stocks, ETFs, When to sell and Tracker tabs.
+
+## Data integrity and the live record (v4.25)
+
+- **The core ETF basket is complete again.** It had silently held 11 of its 13
+  ETFs: CSNDX.SW had a gap in its prices over Christmas, which blanks a year of
+  factors, and a held-everything basket used to require every factor; IB01.L
+  was dropped for two placeholder prints on its first days in 2019. A held
+  basket now holds every instrument with a usable price.
+- **Yahoo's price errors are repaired instead of costing the instrument.**
+  Listing artefacts, pence/pound flips and one-off bad prints are fixed before
+  the >95%-day guard (`repair_price_errors: true`); a repair never changes an
+  instrument's latest price, and what the rules cannot explain is still
+  dropped. The Checks tab lists every repair of the run.
+- **The Tracker counts in pounds.** Holdings and MSCI World are valued with
+  currency moves included, as the UMushroom account counts them.
+- **Is the model right? The live record.** The Tracker tab scores every
+  logged forecast once its horizon has passed (rank correlation with what
+  happened, picks against the universe) and sets the live weeks against the
+  walk-forward's own spread, including what the backtest did after a losing
+  streak.
 
 ## Nothing on the path to the orders is random (v4.23)
 
@@ -347,8 +389,10 @@ To change the password, delete `site/team_password.txt` and restart (or set
 
 ## Website without your laptop (GitHub)
 
-GitHub runs the model every weekday morning (~07:20 UK time) in its cloud and
-publishes the website, locked with a team password. Teammates just open the
+GitHub runs the model every weekday at 08:40 and 11:40 UTC in its cloud and
+publishes the website, locked with a team password. The first slot that finds
+the previous day's closes publishes; a run on stale data exits "not ready"
+and the site keeps the last good run (v4.21). Teammates just open the
 link. Every page is encrypted, so the picks stay private even though GitHub
 Pages sites are public.
 

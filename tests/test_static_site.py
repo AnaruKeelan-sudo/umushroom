@@ -242,3 +242,33 @@ def test_tracker_says_no_close_yet_instead_of_zero_up(tmp_path):
     tracker = _open((out / "index.html").read_text(), PW)
     assert "No close newer than 2026-10-02 yet" in tracker and "no close yet" in tracker
     assert "0 / 1" not in tracker and ">Up / down</div>" not in tracker   # no tile
+
+
+def test_tracker_pane_shows_the_live_record_of_the_latest_run(tmp_path):
+    """v4.25: the run scores its own prediction log; the published Tracker
+    shows it under the week-by-week record, with no extra download."""
+    import pandas as pd
+
+    from umushroom.prediction_log import LiveScore, live_payload
+    from umushroom.report import SleeveReport, build_payload, render_html
+    rows = [LiveScore("2026-10-07", "2026-10-14", 557, -0.106, -0.003, 0.015, True)]
+    orders = pd.DataFrame({"sleeve": ["equity"], "shares": [100],
+                           "allocated_value": [1000.0], "local_price": [10.0],
+                           "listing_currency": ["GBP"], "name": ["Alpha Co"]},
+                          index=["AAA.L"])
+    sleeve = SleeveReport("equity", 0.8, "model",
+                          live=live_payload(rows, ["2026-10-30"], 5, None))
+    src = tmp_path / "src.html"
+    src.write_text(render_html(build_payload(
+        {"as_of": "2026-10-02", "base_currency": "GBP", "version": "t"}, [sleeve], orders)))
+
+    def cmd(report, orders_path):
+        return [sys.executable, "-c", f"import shutil;shutil.copy({str(src)!r},{str(report)!r})"]
+    site, out = tmp_path / "site", tmp_path / "public"
+    assert build(site, out, PW, fetch=_yahoo, command=cmd, run_first=True,
+                 run_timeout=60, iterations=FAST) == 0
+    page = _open((out / "index.html").read_text(), PW)
+    tracker = page.split('<section class="pane" data-key="tracker"')[1].split(
+        '<section class="pane"')[0]
+    assert "Is the model right? The live record" in tracker
+    assert "2026-10-14" in tracker and "-0.106" in tracker

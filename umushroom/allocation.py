@@ -128,14 +128,32 @@ def generate_allocation(
     feats_today = build_features_at_index(
         data, as_of_idx, groups=groups, dollar_volume=dollar_volume,
         feature_set=feature_set).dropna()
-    preds = model.predict(feats_today)
+    preds = (model.predict(feats_today) if len(feats_today)
+             else pd.Series(dtype=float))
+    # v4.25: a held-all basket holds every instrument with a usable price
+    # today, scored or not. Before, it held only the instruments whose every
+    # factor was defined -- and one short gap in a year of prices (CSNDX.SW:
+    # no SIX prints 24 Dec - 2 Jan) leaves the 252-day factors undefined for
+    # a year, so the Nasdaq-100 ETF silently left the core basket until 2027.
+    # The basket does not use the model, so it must not depend on its inputs.
+    unscored: list[str] = []
+    if hold_all:
+        latest = data.iloc[-1]
+        priced = [t for t in data.columns
+                  if pd.notna(latest[t]) and float(latest[t]) > 0]
+        unscored = sorted(set(priced) - set(preds.index))
+        preds = preds.reindex(sorted(set(preds.index) | set(priced)))
+        if unscored:
+            logger.warning(f"Holding {unscored} without a model score today (a gap "
+                           f"in the last year of prices leaves some factors "
+                           f"undefined); a held-all basket does not need one.")
 
     stale = sorted(set(preds.index) & set(exclude))
     if stale:
         logger.warning(f"Excluding {stale}: no fresh price for the latest day "
                        f"(would trade on an old price).")
         preds = preds.drop(stale)
-        feats_today = feats_today.drop(stale)
+        feats_today = feats_today.drop(stale, errors="ignore")
 
     # v4.5: drop untradeable candidates BEFORE choosing the top N, so the
     # next-ranked instrument takes the slot (v4.4 skipped them AFTER
@@ -151,16 +169,16 @@ def generate_allocation(
                 f"probably a pence/pound or USD-line error. Check on UMushroom "
                 f"and fix currency_overrides.")
             preds = preds.drop(too_low)
-            feats_today = feats_today.drop(too_low)
+            feats_today = feats_today.drop(too_low, errors="ignore")
     if excluded_any and 0 < len(feats_today) < top_n and not hold_all:
         logger.warning(f"Only {len(feats_today)} tradeable candidates left after "
                        f"exclusions; holding all of them instead of {top_n}.")
         top_n = len(feats_today)
     if hold_all:
-        top_n = len(feats_today)       # "all" = every instrument usable today
+        top_n = len(preds)             # "all" = every instrument priced today
         if top_n == 0:
-            raise DataError("No instruments have clean features today")
-    if len(feats_today) < top_n:
+            raise DataError("No instruments have a usable price today")
+    if not hold_all and len(feats_today) < top_n:
         raise DataError(
             f"Only {len(feats_today)} tickers have clean features today; "
             f"cannot select top_n={top_n}."
@@ -227,7 +245,8 @@ def generate_allocation(
             else:
                 shares = int(dollars // price)
             row: dict[str, object] = {
-                "predicted_score": round(float(preds[ticker]), 5),
+                # NaN for a held instrument the model could not score today
+                "predicted_score": round(float(preds.get(ticker, float("nan"))), 5),
                 "target_weight": round(float(weights[ticker]), 4),
                 "price": round(price, 4),
                 "shares": shares,
@@ -281,7 +300,7 @@ def generate_allocation(
         total_deployed=total_deployed,
         cash_remaining=balance - total_deployed,
         balance=balance,
-        all_scores=preds,
+        all_scores=preds.dropna(),     # model scores only (never a held NaN)
         factor_risk=factor_report,
     )
     logger.info(f"Generated allocation: {len(orders)} positions, "

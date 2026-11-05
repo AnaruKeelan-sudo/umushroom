@@ -469,3 +469,49 @@ def test_payload_urls_and_tracker_links():
     body = tracker_body(res, "GBP", urls=urls)
     assert "<th>Trade</th>" in body and f'href="{u}"' in body and "Buy / sell" in body
     assert 'href="' not in tracker_body(res, "GBP")                 # no urls: no link
+
+
+# ------------------------------------------------- v4.25: the live record
+def _live_payload():
+    from umushroom.prediction_log import LiveScore, live_payload, live_verdict
+    rows = [LiveScore("2026-10-07", "2026-10-14", 557, -0.106, -0.003, 0.015, True),
+            LiveScore("2026-10-08", "2026-10-15", 556, -0.199, 0.022, 0.028, False),
+            LiveScore("2026-10-16", "2026-10-23", 557, -0.207, -0.039, -0.004, True),
+            LiveScore("2026-10-26", "2026-11-02", 556, -0.128, -0.001, 0.012, True)]
+    dates = pd.bdate_range("2018-01-01", periods=60, freq="W-MON")
+    ic = pd.Series([0.03 + 0.13 * ((i * 7) % 11 - 5) / 5 for i in range(60)], index=dates)
+    active = pd.Series([(-0.01 if i % 4 else 0.02) for i in range(60)], index=dates)
+    live = live_payload(rows, ["2026-10-30"], 5, live_verdict(rows, ic, active))
+    return {"meta": {"as_of": "2026-11-02"},
+            "sleeves": [{"name": "equity", "live": live},
+                        {"name": "etf", "live": {"horizon": 10, "rows": [], "verdict": None}}]}
+
+
+def test_live_body_shows_every_scored_forecast_newest_first():
+    from umushroom.web import live_body
+    html_ = live_body(_live_payload())
+    assert "Is the model right? The live record" in html_
+    assert "Equity: 5-trading-day forecasts" in html_ and "ETF: 10-trading-day" not in html_
+    assert html_.index("2026-10-26") < html_.index("2026-10-07")     # newest first
+    assert "overlaps" in html_ and "-0.207" in html_
+    assert "Periods counted" in html_ and ">3<" in html_              # three independent
+    assert "of 3-period stretches" in html_
+
+
+def test_live_reading_states_the_warning_and_the_streak_history():
+    from umushroom.web import _live_reading
+    v = {"n": 3, "share_as_bad": 0.009, "streak": 3, "after_streak_n": 17,
+         "after_streak_next": 0.0064, "all_next": 0.0025}
+    text = _live_reading(v)
+    assert "worse than all but 0.9%" in text and "a real warning" in text
+    assert "after 3 periods in a row" in text and "beat it by 0.64%" in text
+    assert "not, in the model's own history" in text
+    v.update(share_as_bad=0.4, after_streak_next=-0.004)
+    text = _live_reading(v)
+    assert "In line with the walk-forward" in text and "tended to continue" in text
+
+
+def test_live_body_is_empty_without_scored_rows():
+    from umushroom.web import live_body
+    assert live_body({"sleeves": [{"name": "equity", "live": None}]}) == ""
+    assert live_body({}) == ""

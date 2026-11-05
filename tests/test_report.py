@@ -272,3 +272,16 @@ def test_tables_link_each_instrument_to_its_umushroom_page():
                   _etf_orders_table([o], "GBP"), _etf_top_table([{**o, "rank": 1}])):
         assert "<th>Trade</th>" in table and f'href="{url}"' in table
     assert 'href="' not in _orders_table([{**o, "url": ""}], "GBP")   # unknown: no link
+
+
+def test_checks_tab_lists_the_price_repairs_of_the_run(payload):
+    """v4.25: the Yahoo errors repaired in a run are shown, not hidden."""
+    from umushroom.report import section_bodies
+    assert "Prices repaired" not in section_bodies(payload)["checks"]
+    p = json.loads(json.dumps(payload))
+    p["meta"]["price_repairs"] = {"bad print": ["ISN.SW"],
+                                  "pence/pound flip": ["FXPO.L", "SAR.L<"]}
+    checks = section_bodies(p)["checks"]
+    assert "Prices repaired in this run" in checks
+    assert "FXPO.L, SAR.L&lt;" in checks and "Bad print" in checks
+    assert "Placebo test" in checks                # the validation cards are kept
