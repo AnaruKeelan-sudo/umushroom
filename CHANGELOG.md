@@ -1,5 +1,19 @@
 # Changelog
 
+## 4.25.1 (2026-11-05) -- the repairs list names only what the run kept
+- REPAIR REPORT (bug). The Checks tab's "Prices repaired in this run" card
+  says the listed instruments "are kept instead of dropped", but it listed
+  every repaired series -- including those the >95%-day guard still drops
+  for a jump the rules cannot explain. Replaying the 2 Nov download: 44
+  series repaired, 13 of them still dropped (COFF.L, CURN.SW, DTRE.L, EGAS.L,
+  FTSE.PA, HLTW.L, JRDZ.L, JT13.L, NXTU.L, PRIJ.L, S5EW.L, TNOW.L, UC95.L).
+  `MarketData.repairs` (and so the card, the run log and the report payload)
+  now holds only repairs to instruments and FX pairs the run kept; the run
+  log names the repaired-but-dropped ones on a separate line. Prices,
+  orders and the model are unchanged.
+- 1 new test (a series with a repairable bad print and a real +140% day is
+  dropped and not listed; fails on 4.25.0).
+
 ## 4.25.0 (2026-11-03) -- a complete core basket, repaired prices, the Tracker in pounds, the live record
 Found by decrypting the published site and replaying the 2-3 Nov runs offline:
 - CORE BASKET (bug). The ETF sleeve held 11 of its 13 core ETFs. CSNDX.SW

@@ -655,3 +655,24 @@ def test_get_market_data_repairs_only_when_asked(tmp_path):
     assert on.prices["AZN.L"].pct_change().abs().max() < 0.2
     assert repair_summary(on.repairs) == {"pence/pound flip": ["AZN.L"]}
     pd.testing.assert_series_equal(on.prices["AAPL"], off.prices["AAPL"])
+
+
+def test_get_market_data_reports_only_the_repairs_it_keeps(tmp_path):
+    """v4.25.1: a series repaired but still dropped by the guard (here a bad
+    print AND a real +140% day) is not listed as repaired -- the Checks tab
+    says the listed instruments are kept."""
+    tickers = ["AAPL", "MSFT", "AZN.L", "SHEL.L"]
+    frame = _fake_fetcher()(tickers + ["USDGBP=X"], "2y")
+    frame.iloc[100:140, frame.columns.get_loc("AZN.L")] /= 100   # repaired, kept
+    m = frame.columns.get_loc("MSFT")
+    frame.iloc[50, m] *= 30                  # a one-day bad print: repairable
+    frame.iloc[200:, m] *= 2.4               # a real jump: still dropped
+
+    def fetch(symbols, period):
+        return frame[[s for s in symbols if s in frame.columns]].copy()
+    raw_reps = repair_price_errors(frame)[1]
+    assert {"AZN.L", "MSFT"} <= {r.ticker for r in raw_reps}
+    md = get_market_data(tickers, "2y", tmp_path, 12, 70, "GBP", fetcher=fetch,
+                         drop_today_bar=False, repair=True)
+    assert "MSFT" not in md.prices.columns and "AZN.L" in md.prices.columns
+    assert repair_summary(md.repairs) == {"pence/pound flip": ["AZN.L"]}
