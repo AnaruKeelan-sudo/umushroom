@@ -509,6 +509,7 @@ class MarketData:
     # was carried forward from an earlier day). Never picked for new orders.
     stale_last: frozenset[str] = frozenset()
     # v4.25: every stretch of prices repaired by repair_price_errors
+    # (v4.25.1: in instruments and FX pairs the run kept)
     repairs: tuple[PriceRepair, ...] = ()
 
 
@@ -778,11 +779,6 @@ def get_market_data(
     repairs: list[PriceRepair] = []
     if repair:
         raw, repairs = repair_price_errors(raw, exempt=crypto)
-        if repairs:
-            summary = "; ".join(f"{k} {len(v)}: {v}"
-                                for k, v in repair_summary(repairs).items())
-            logger.warning(f"Repaired price errors in "
-                           f"{len({r.ticker for r in repairs})} series ({summary})")
 
     missing_fx = [f for f in fx_tickers if f not in raw.columns or raw[f].isna().all()]
     if missing_fx:
@@ -806,6 +802,22 @@ def get_market_data(
     validated_local = _validate_prices(equities, tickers, min_history_days,
                                        spike_exempt=crypto, ragged=ragged)
     surviving = {t: listings[t] for t in validated_local.columns}
+    if repairs:
+        # v4.25.1: report only the repairs the run keeps. A series can be
+        # repaired and still fail the guard (a real jump or an open flip
+        # elsewhere in it); on 2 Nov 13 of the 44 repaired series were, and the
+        # Checks tab listed them as "kept instead of dropped".
+        kept_names = set(surviving) | set(fx_tickers)
+        lost = sorted({r.ticker for r in repairs} - kept_names)
+        repairs = [r for r in repairs if r.ticker in kept_names]
+        if repairs:
+            summary = "; ".join(f"{k} {len(v)}: {v}"
+                                for k, v in repair_summary(repairs).items())
+            logger.warning(f"Repaired price errors in "
+                           f"{len({r.ticker for r in repairs})} series ({summary})")
+        if lost:
+            logger.warning(f"Repaired but still dropped by the >95%-day guard "
+                           f"({len(lost)}): {lost}")
 
     prices, local = convert_to_base_currency(
         validated_local, raw[fx_tickers], surviving, base_currency)
