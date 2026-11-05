@@ -245,3 +245,30 @@ def test_risk_histogram_never_hides_the_worst_weeks(payload):
     h = payload["risk"]["weekly"]["hist"]
     assert h["hidden_low"] == 0 and h["hidden_high"] == 0
     assert h["edges"][0] == pytest.approx(-payload["risk"]["weekly"]["worst"])
+
+
+# ---------------------------------------------- v4.24: buy / sell page links
+
+def test_tables_link_each_instrument_to_its_umushroom_page():
+    from umushroom.report import (
+        Raw,
+        _etf_orders_table,
+        _etf_top_table,
+        _orders_table,
+        _plain_table,
+        _top_table,
+        trade_link,
+    )
+    url = "https://umushroom.com/en/equity/hsba-hsbc-hldgs"
+    link = trade_link(url)
+    assert isinstance(link, Raw) and 'target="_blank"' in link and 'rel="noopener"' in link
+    assert f'href="{url}"' in link and "Buy / sell" in link
+    assert trade_link(None) == "" and trade_link("") == "" and trade_link(3.5) == ""
+    # raw cells are kept, ordinary cells are escaped
+    html_ = _plain_table(["a"], [[Raw("<b>x</b>")], ["<b>y</b>"]])
+    assert "<b>x</b>" in html_ and "&lt;b&gt;y&lt;/b&gt;" in html_
+    o = {"ticker": "HSBA.L", "sleeve": "equity", "url": url, "shares": 3, "local_price": 12.5}
+    for table in (_orders_table([o], "GBP"), _top_table([{**o, "rank": 1}]),
+                  _etf_orders_table([o], "GBP"), _etf_top_table([{**o, "rank": 1}])):
+        assert "<th>Trade</th>" in table and f'href="{url}"' in table
+    assert 'href="' not in _orders_table([{**o, "url": ""}], "GBP")   # unknown: no link

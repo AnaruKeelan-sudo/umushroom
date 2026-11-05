@@ -450,3 +450,22 @@ def test_team_password_is_generated_once_and_private(tmp_path, monkeypatch):
     assert not mode & (stat.S_IRGRP | stat.S_IROTH)
     monkeypatch.setenv("UMUSHROOM_PASSWORD", "from-env")
     assert team_password(tmp_path) == "from-env"
+
+
+# ---------------------------------------------- v4.24: buy / sell page links
+
+def test_payload_urls_and_tracker_links():
+    from umushroom.tracker import TrackedPosition, TrackerResult
+    from umushroom.web import payload_urls, tracker_body
+    u = "https://umushroom.com/en/equity/hsba-hsbc-hldgs"
+    payload = {"orders": [{"ticker": "HSBA.L", "url": u}, {"ticker": "NOURL"}],
+               "top": [{"ticker": "AAPL", "url": "https://umushroom.com/en/equity/aapl-apple"}],
+               "top_etfs": {"etf": [{"ticker": "IWDA.L", "url": "https://umushroom.com/en/etf/x"}]}}
+    urls = payload_urls(payload)
+    assert set(urls) == {"HSBA.L", "AAPL", "IWDA.L"} and urls["HSBA.L"] == u
+    res = TrackerResult("2026-10-02", [TrackedPosition("equity", "HSBA.L", "HSBA.L", "HSBC",
+                                                         "GBP", 10, 12.0, 120.0, 0.05,
+                                                         "2026-10-05")])
+    body = tracker_body(res, "GBP", urls=urls)
+    assert "<th>Trade</th>" in body and f'href="{u}"' in body and "Buy / sell" in body
+    assert 'href="' not in tracker_body(res, "GBP")                 # no urls: no link

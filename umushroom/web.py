@@ -62,6 +62,7 @@ from umushroom.report import (
     line_chart,
     render_page,
     section_bodies,
+    trade_link,
 )
 from umushroom.shell import Shell, report_bar
 from umushroom.tracker import (
@@ -363,7 +364,20 @@ def _run_picker(runner: Runner, run: str, action: str) -> str:
             f'<a href="{action}?run={run}&amp;refresh=1">Refresh prices</a></form>')
 
 
-def tracker_body(res: TrackerResult, ccy: str, label: str = "") -> str:
+def payload_urls(payload: dict) -> dict[str, str]:
+    """v4.24: ticker -> its buy / sell page, from every table in the report."""
+    out: dict[str, str] = {}
+    rows = list(payload.get("orders") or []) + list(payload.get("top") or [])
+    for lst in (payload.get("top_etfs") or {}).values():
+        rows += list(lst or [])
+    for r in rows:
+        if r.get("url") and r.get("ticker"):
+            out.setdefault(str(r["ticker"]), str(r["url"]))
+    return out
+
+
+def tracker_body(res: TrackerResult, ccy: str, label: str = "",
+                 urls: dict[str, str] | None = None) -> str:
     out = [(f'<h2>Since the prediction</h2><p class="note">{label}Each pick\'s latest '
             f"close compared with its close on {html.escape(res.as_of)}, when the model "
             f"chose it. Values are approximate: they ignore currency moves since then.</p>")]
@@ -409,14 +423,15 @@ def tracker_body(res: TrackerResult, ccy: str, label: str = "") -> str:
             "Change since the prediction, by holding",
             "Latest close against the close on the prediction date.",
             [p.ticker for p in ranked], [p.change or 0.0 for p in ranked], "pct"))
-    head = ["Sleeve", "Ticker", "Name", "Shares", "Price at prediction", "Price now",
-            "Change", "Value then", "Value now", "Gain", "Last price"]
+    head = ["Sleeve", "Ticker", "Trade", "Name", "Shares", "Price at prediction",
+            "Price now", "Change", "Value then", "Value now", "Gain", "Last price"]
     rows = []
     for p in sorted(res.positions, key=lambda p: (p.sleeve, -(p.change or -9))):
         cur = f" {p.currency}" if p.currency else ""
         gain = None if p.value_now is None else p.value_now - p.value_then
         rows.append(
             f"<tr><td>{html.escape(p.sleeve)}</td><td>{html.escape(p.ticker)}</td>"
+            f"<td>{trade_link((urls or {}).get(p.ticker))}</td>"
             f"<td>{html.escape(p.name)}</td>"
             f"<td>{'' if p.shares is None else html.escape(f'{p.shares:g}')}</td>"
             f"<td>{'n/a' if p.price_then is None else html.escape(_price(p.price_then) + cur)}"
@@ -613,8 +628,9 @@ def sell_body(site: Site, run: str, latest_payload: dict, held: str | None,
         _tile("Hold", str(counts["HOLD"]), "no trade needed"),
     ]) + "</section>")
 
-    head = ["Action", "Sleeve", "Ticker", "Name", "Held", "Target", "Trade", "≈ Value",
-            "Since you bought", "Why"]
+    head = ["Action", "Sleeve", "Ticker", "On UMushroom", "Name", "Held", "Target", "Trade",
+            "≈ Value", "Since you bought", "Why"]
+    urls = {**payload_urls(held_payload), **payload_urls(latest_payload)}
     rows = []
     for a in actions:
         t = a.trade_shares
@@ -623,6 +639,7 @@ def sell_body(site: Site, run: str, latest_payload: dict, held: str | None,
         rows.append(
             f'<tr><td><span class="act {_ACT_CLASS[a.action]}">{a.action}</span></td>'
             f"<td>{html.escape(a.sleeve)}</td><td>{html.escape(a.ticker)}</td>"
+            f"<td>{trade_link(urls.get(a.ticker))}</td>"
             f"<td>{html.escape(a.name)}</td><td>{_sh(a.held_shares)}</td>"
             f"<td>{_sh(a.target_shares)}</td>"
             f"<td>{'' if t == 0 else ('+' if t > 0 else '-') + _sh(abs(t))}</td>"
@@ -953,7 +970,8 @@ def make_handler(site: Site) -> type[BaseHTTPRequestHandler]:
                     res = site.tracked(run, payload, "refresh" in params)
                     lp = payload if run == latest else (site.payload(latest) or payload)
                     rows = site.recorded(latest, lp, "refresh" in params)
-                    body = (_run_picker(runner, run, "/tracker") + tracker_body(res, ccy)
+                    body = (_run_picker(runner, run, "/tracker")
+                            + tracker_body(res, ccy, urls=payload_urls(payload))
                             + record_body(rows, _days(lp)))
                 except Exception as e:  # noqa: BLE001 -- network errors vary
                     body = (_run_picker(runner, run, "/tracker")

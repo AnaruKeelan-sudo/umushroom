@@ -49,6 +49,7 @@ from umushroom.web import (
     _short_stamp,
     default_command,
     macro_body,
+    payload_urls,
     record_body,
     sell_body,
     tracked_run,
@@ -145,7 +146,7 @@ def build_pages(site: Site, run_url: str | None = None,
                          f"Your book is the orders of {html.escape(_pretty(shown))}, the "
                          "first run of this holding period. ")
                 body = (tracker_body(site.tracked(shown, shown_payload, refresh=True), ccy,
-                                     label)
+                                     label, urls=payload_urls(shown_payload))
                         + record_body(site.recorded(latest, payload, refresh=True),
                                       _days(payload)))
             except Exception as e:  # noqa: BLE001 -- network errors vary

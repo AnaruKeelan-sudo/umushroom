@@ -78,3 +78,17 @@ def test_mapped_universe_has_no_name_letter_share_classes():
     assert rows["vzug-v-zug-hldg"] == "VZUG.SW"
     assert rows["brk-b-berkshire-hath"] == "BRK-B"      # real class kept
     assert rows["bt-a-bt-group"] == "BT-A.L"            # real class kept
+
+
+# ---------------------------------------------- v4.24: buy / sell page links
+
+def test_instrument_url_uses_the_platform_sitemap_patterns():
+    from umushroom.universe import instrument_url
+    assert (instrument_url({"url_name": "ishares-core-msci-world-ucits-etf-usd-acc"}, None)
+            == "https://umushroom.com/en/etf/ishares-core-msci-world-ucits-etf-usd-acc")
+    assert (instrument_url(None, {"urlName": "hsba-hsbc-hldgs"})
+            == "https://umushroom.com/en/equity/hsba-hsbc-hldgs")
+    # an ETF row wins over a stock row; nothing known -> no link
+    assert instrument_url({"url_name": "x"}, {"urlName": "y"}).endswith("/etf/x")
+    assert instrument_url({"url_name": ""}, {"urlName": ""}) == ""
+    assert instrument_url(None, None) == ""

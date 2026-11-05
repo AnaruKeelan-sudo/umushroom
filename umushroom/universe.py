@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from umushroom.exceptions import ConfigError
@@ -151,3 +152,24 @@ def check_concentration(listings: dict[str, Listing],
             logger.warning(msg)
             warnings.append(msg)
     return warnings
+
+
+# ------------------------------------------------------------ platform links
+# v4.24: every instrument's page on UMushroom, where it is bought and sold.
+# The slugs come from the platform's own sitemaps (sitemap.en_equity.xml ->
+# umushroom_universe_mapped.csv `urlName`; sitemap.en_etf.xml -> the ETF
+# universe file `url_name`), so the links are exactly the pages it publishes.
+PLATFORM_URL = "https://umushroom.com/en"
+
+
+def instrument_url(etf_meta: Mapping[str, str] | None = None,
+                   stock_meta: Mapping[str, str] | None = None) -> str:
+    """/en/etf/<url_name> for an ETF, else /en/equity/<urlName> for a stock,
+    else "" (nothing to link to)."""
+    slug = (etf_meta or {}).get("url_name") or ""
+    if slug:
+        return f"{PLATFORM_URL}/etf/{slug}"
+    slug = (stock_meta or {}).get("urlName") or ""
+    if slug:
+        return f"{PLATFORM_URL}/equity/{slug}"
+    return ""

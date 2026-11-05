@@ -422,6 +422,8 @@ class EtfUniverse:
     def meta(self) -> dict[str, dict[str, str]]:
         cols = ["name", "umushroom_symbol", "umushroom_currency", "asset_class",
                 "isin", "yahoo_currency", "style"]
+        if "url_name" in self.rows.columns:      # v4.24: the ETF's page on UMushroom
+            cols.append("url_name")
         ok = self.rows[self.rows["status"] == STATUS_OK]
         return {str(r["yahoo"]): {c: ("" if pd.isna(r[c]) else str(r[c])) for c in cols}
                 for _, r in ok.iterrows()}
