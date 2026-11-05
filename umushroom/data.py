@@ -827,7 +827,19 @@ def get_market_data(
             f"need {min_history_days}")
 
     if require_fresh:
-        check_freshness(prices.index[-1].date(), today or datetime.now(LOCAL_TZ).date())
+        try:
+            check_freshness(prices.index[-1].date(),
+                            today or datetime.now(LOCAL_TZ).date())
+        except StaleDataError:
+            # v4.26: a stale Yahoo download must not be cached. It was written
+            # above, and within cache_max_age_hours the 11:40 retry slot would
+            # reuse it and refuse again instead of asking Yahoo a second time.
+            if fetcher is None:
+                for p in (cache_path, vol_cache):
+                    p.unlink(missing_ok=True)
+                logger.warning(f"Deleted the stale cached download {cache_path.name} "
+                               f"so the next run fetches again")
+            raise
 
     raw_last = equities.reindex(index=prices.index, columns=prices.columns).iloc[-1]
     stale = frozenset(raw_last[raw_last.isna()].index)

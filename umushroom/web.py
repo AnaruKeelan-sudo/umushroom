@@ -640,7 +640,9 @@ def tracked_run(site: Site, latest: str, latest_payload: dict) -> str:
         cad = _cadence_for(site, latest, latest_payload)
     except ValueError:
         return latest
-    return latest if cad.rebalance_now or not cad.held else cad.held
+    if cad.rebalance_now:
+        return cad.book or latest       # v4.26: a same-day repeat run tracks the book
+    return cad.held or latest
 
 
 def _default_held(site: Site, latest: str, latest_payload: dict) -> str | None:
@@ -712,7 +714,14 @@ def sell_body(site: Site, run: str, latest_payload: dict, held: str | None,
                   f"(signals of {html.escape(_as_of(held_payload))}), the first run of "
                   "this period. Nothing to do until the next period starts.</p>")
 
-    actions = plan(held_payload, latest_payload)
+    # v4.26: on a same-day repeat run, the period's book is the FIRST run's
+    # orders (what the record scores and what the morning's readers bought)
+    target, target_payload = run, latest_payload
+    if cad.rebalance_now and cad.book and cad.book != run and not explicit:
+        book_payload = site.payload(cad.book)
+        if book_payload is not None:
+            target, target_payload = cad.book, book_payload
+    actions = plan(held_payload, target_payload)
     out = [intro, _held_picker(site, run, held) if picker else "", _due_box(cad, days, today)]
 
     gains: dict[str, float] = {}
@@ -754,8 +763,9 @@ def sell_body(site: Site, run: str, latest_payload: dict, held: str | None,
                f'<table class="data sell-tbl"><thead><tr>{th}</tr></thead>'
                f'<tbody>{"".join(rows)}</tbody></table></div>')
     out.append(f'<p class="note">Held = the orders from {html.escape(_pretty(held))} '  # type: ignore[arg-type]
-               f"(signals of {html.escape(_as_of(held_payload))}). Target = the latest "
-               f"run. Values are in each listing's currency ({ccy} totals are on the "
+               f"(signals of {html.escape(_as_of(held_payload))}). Target = the orders "
+               f"of {html.escape(_pretty(target))}"
+               f"{', the first run of this period' if target != run else ''}. Values are in each listing's currency ({ccy} totals are on the "
                "Stocks tab). Check prices on UMushroom before trading; differences under "
                "2% of a position are left alone.</p>")
     return "".join(out)

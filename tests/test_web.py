@@ -327,6 +327,36 @@ def test_sell_page_holds_mid_period_instead_of_churning_daily(tmp_path):
     assert "Trade list" not in body
 
 
+
+def test_sell_page_keeps_the_trade_list_on_a_same_day_repeat_run(tmp_path):
+    """v4.26: both daily slots publish; the 11:40 run on the 08:40 run's close
+    told readers 'nothing to do' on a rebalance day. It must show the trade list,
+    against the period's book (the first run), and the Tracker must score it."""
+    import time
+
+    from umushroom.web import Site, sell_body, tracked_run
+    runner = Runner(tmp_path / "site", _fake(as_of="2026-10-02"))
+    runner.start()
+    runner.wait()
+    old = runner.latest_report()
+    stamps = []
+    for _ in range(2):                        # the two slots, same close
+        time.sleep(1.1)
+        runner.command = _fake(as_of="2026-10-09")
+        runner.start()
+        runner.wait()
+        stamps.append(runner.latest_report())
+    first, second = stamps
+    assert first[:8] == second[:8]
+    site = Site(runner, _yahoo())
+    body = sell_body(site, second, site.payload(second), None, today=date(2026, 10, 12),
+                     picker=False)
+    assert "Sell / rebalance now" in body and "Trade list" in body
+    assert "the first run of this period" in body
+    assert tracked_run(site, second, site.payload(second)) == first
+    assert tracked_run(site, first, site.payload(first)) == first
+    assert old not in (first, second)
+
 def test_sell_page_rejects_bad_held_param(site):
     runner, base = site
     _run_once(runner, base)

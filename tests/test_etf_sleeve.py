@@ -14,6 +14,7 @@ import pytest
 from umushroom import cli
 from umushroom import data as data_mod
 from umushroom.config import SleeveConfig
+from umushroom.exceptions import DataError
 from umushroom.purged_backtest import PurgedWalkForwardResult
 from umushroom.report import section_bodies
 from umushroom.window import FAIL, PASS, WARN, WindowResult
@@ -525,3 +526,30 @@ def test_a_later_run_scores_the_earlier_runs_forecasts(tmp_path, monkeypatch, ca
         row = live["rows"][0]
         assert row["independent"] and -1 <= row["ic"] <= 1 and row["n"] >= 5
     assert "Is the model right? The live record" in live_body(_payload(report))
+
+
+def test_a_skipped_sleeve_and_stale_prices_are_recorded_for_the_sell_tab(
+        tmp_path, monkeypatch, capsys):
+    """v4.26: the report says which configured sleeves did not run and which
+    instruments had no fresh close, so rebalance.plan holds them instead of
+    turning them into SELL ALL."""
+    cfg = _config(tmp_path)
+    base = _fetch_factory(seed=2)
+    real_sleeve = cli._run_sleeve
+
+    def run_sleeve(cfg_, args, sleeve, *a, **kw):
+        if sleeve.name == "etf":
+            raise DataError("a transient Yahoo error")       # the sleeve fails this run
+        return real_sleeve(cfg_, args, sleeve, *a, **kw)
+    monkeypatch.setattr(cli, "_run_sleeve", run_sleeve)
+
+    def fetch(symbols, period):
+        f = base(symbols, period)
+        f.iloc[-1, f.columns.get_loc("U3")] = np.nan          # U3: no close on the last day
+        return f
+    rc, _, report = _run(monkeypatch, cfg, tmp_path, fetch, "--skip-purged-backtest")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    meta = _payload(report)["meta"]
+    assert meta["skipped_sleeves"] == ["etf"]
+    assert meta["stale_last"] == ["U3"]

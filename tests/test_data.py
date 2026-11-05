@@ -520,6 +520,26 @@ def test_get_market_data_refuses_stale_data_only_when_asked(tmp_path):
                     drop_today_bar=False, today=date(2030, 1, 7))
 
 
+
+def test_a_stale_download_is_not_cached_so_the_retry_slot_fetches_again(tmp_path,
+                                                                        monkeypatch):
+    """v4.26: the 08:40 slot cached Yahoo's stale download before refusing it;
+    within cache_max_age_hours the 11:40 slot then reused it and refused again
+    instead of asking Yahoo a second time."""
+    tickers = ["AAPL", "MSFT", "AZN.L", "SHEL.L"]
+    dl = _flaky_download(set())
+    monkeypatch.setattr(data_mod, "_yf_download", dl)
+    monkeypatch.setattr(data_mod, "_sleep", lambda s: None)
+    for _ in range(2):                       # the two daily slots, same stale data
+        with pytest.raises(StaleDataError):
+            get_market_data(tickers, "2y", tmp_path, 12, 70, "GBP", drop_today_bar=False,
+                            require_fresh=True, today=date(2030, 1, 7))
+        assert list(tmp_path.glob("*.parquet")) == []
+    assert len(dl.calls) == 2                # the second slot asked Yahoo again
+    # a fresh download is still cached as before
+    get_market_data(tickers, "2y", tmp_path, 12, 70, "GBP", drop_today_bar=False)
+    assert len(list(tmp_path.glob("*.parquet"))) == 2
+
 def test_fixed_start_period_is_passed_to_yahoo_and_keyed_in_the_cache(tmp_path, monkeypatch):
     import sys
     import types

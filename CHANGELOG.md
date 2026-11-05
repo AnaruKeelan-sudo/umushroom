@@ -1,5 +1,33 @@
 # Changelog
 
+## 4.26.0 (2026-11-05) -- the Sell tab never sells on a failed run, keeps its list after midday, and the retry slot really retries
+Found in a review of the order path and the website workflow; every case
+below has a test that fails on 4.25.1.
+- SELL ALL ON A FAILED RUN (bug). `rebalance.plan` turned every holding the
+  latest run had no order for into SELL ALL, "dropped out of the picks". A
+  sleeve that failed that run (a Yahoo hiccup, too few instruments: the run
+  still succeeds, the sleeve "stays in cash") therefore told the team to sell
+  the whole ETF book, and a held model pick with no fresh close (a model
+  sleeve never picks one) was sold too. The report now records
+  `skipped_sleeves` and `stale_last` in its meta, and `plan` HOLDs those
+  holdings with the true reason. A sleeve removed from the config is still
+  sold; reports written before 4.26 behave as before.
+- THE SECOND SLOT HID THE TRADE LIST (bug). Both daily slots publish when the
+  data is fresh, and only the first run of a period counted as the
+  rebalance, so from about 12:40 UK on a rebalance day the Sell tab said
+  "Nothing to do until the next period starts". A later run on the same day
+  and the same close is now still the rebalance; its trade list targets the
+  period's book (the first run's orders, which the record scores and the
+  Tracker follows: `Cadence.book`). A run on a later day still holds, even on
+  the same close.
+- THE RETRY SLOT REUSED THE STALE DOWNLOAD (bug). The download was cached
+  before the freshness check refused it, and within cache_max_age_hours (12)
+  the 11:40 slot read that cache and refused again without asking Yahoo. A
+  refused download is now deleted from the cache.
+- The workflow comment ("the other keeps the last good run") now says what
+  the slots actually do.
+- 6 new tests.
+
 ## 4.25.1 (2026-11-05) -- the repairs list names only what the run kept
 - REPAIR REPORT (bug). The Checks tab's "Prices repaired in this run" card
   says the listed instruments "are kept instead of dropped", but it listed
