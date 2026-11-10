@@ -756,6 +756,13 @@ sleeves:
 #               "XLM-USD", "TRX-USD", "ATOM-USD", "ETC-USD", "HBAR-USD", "FIL-USD"]
 
 starting_balance: 100000        # contest virtual capital (in base_currency)
+# v4.27: the UMushroom account's CURRENT total value (holdings + cash, in
+# base_currency). When set, orders are sized on it instead of starting_balance,
+# so gains and losses compound and the Sell tab's buys never cost more than the
+# account holds. In the cloud set the repository variable ACCOUNT_VALUE
+# (Settings -> Secrets and variables -> Actions -> Variables), e.g. 98500, and
+# update it before each rebalance; locally: UMUSHROOM_ACCOUNT_VALUE=98500.
+# account_value: 98500
 
 # --- v4.20 (2026-10-19; every number below is from ONE pre-declared head-to-head
 # on identical data, 568 stocks / 1,590 ETFs, 30-day test folds; see CHANGELOG) ---

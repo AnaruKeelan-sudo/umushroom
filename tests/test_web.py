@@ -545,3 +545,15 @@ def test_live_body_is_empty_without_scored_rows():
     from umushroom.web import live_body
     assert live_body({"sleeves": [{"name": "equity", "live": None}]}) == ""
     assert live_body({}) == ""
+
+
+def test_sell_tab_says_what_the_orders_were_sized_on():
+    """v4.27"""
+    from umushroom.web import _capital_note
+    note = _capital_note({"capital": 98500, "capital_source": "account_value",
+                          "base_currency": "GBP"})
+    assert "account value <b>98,500 GBP</b>" in note
+    note = _capital_note({"capital": 100000, "capital_source": "starting_balance",
+                          "base_currency": "GBP"})
+    assert "fixed starting balance of 100,000 GBP" in note and "ACCOUNT_VALUE" in note
+    assert _capital_note({}) == ""                  # reports written before 4.27

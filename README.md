@@ -429,7 +429,20 @@ Run it any time: on GitHub open **Actions -> Website -> Run workflow** (the
 site's "Run now" link goes there). After you change the code:
 `git add . && git commit -m "update" && git push`.
 
+Size the orders on the account's real value (v4.27): set the repository
+variable to the UMushroom account's total (holdings + cash) and update it
+before each rebalance; unset, orders are sized on `starting_balance`.
+
+```
+gh variable set ACCOUNT_VALUE --body 98500
+```
+
 Change the password: `gh secret set UMUSHROOM_PASSWORD`, then run the workflow.
+The saved run history is encrypted with the password (v4.27), so a new
+password cannot read the old one: the build stops with "Cannot decrypt the
+saved state". To start afresh with the new password, delete the
+`umushroom-state-*` caches (Actions -> Caches; this drops the run history and
+the weekly record), or set the old password back.
 
 
 ## Sector cap (optional)

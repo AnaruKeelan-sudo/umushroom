@@ -553,3 +553,19 @@ def test_a_skipped_sleeve_and_stale_prices_are_recorded_for_the_sell_tab(
     meta = _payload(report)["meta"]
     assert meta["skipped_sleeves"] == ["etf"]
     assert meta["stale_last"] == ["U3"]
+
+
+def test_orders_are_sized_on_the_account_value(tmp_path, monkeypatch, capsys):
+    """v4.27: every sleeve's budget is its weight of the account value, and the
+    report says what the orders were sized on."""
+    cfg = _config(tmp_path)
+    monkeypatch.setenv("UMUSHROOM_ACCOUNT_VALUE", "40000")
+    rc, out_csv, report = _run(monkeypatch, cfg, tmp_path, _fetch_factory(seed=2),
+                               "--skip-purged-backtest")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    orders = pd.read_csv(out_csv, index_col=0)
+    assert 30000 < orders["allocated_value"].sum() <= 40000
+    meta = _payload(report)["meta"]
+    assert meta["capital"] == 40000 and meta["capital_source"] == "account_value"
+    assert "sized on the account value" in out

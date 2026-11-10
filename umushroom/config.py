@@ -171,9 +171,21 @@ class StrategyConfig:
     # >95%-day guard drops the instrument (data.repair_price_errors); False =
     # the pre-4.25 behaviour (drop every instrument with one such day)
     repair_price_errors: bool = False
+    # ---- v4.27 ----
+    # the UMushroom account's current total value (holdings + cash, in
+    # base_currency). Orders are sized on it, so gains and losses compound and
+    # the Sell tab's buys never cost more than the account has. None = size on
+    # starting_balance (the pre-4.27 behaviour). In the cloud it comes from the
+    # repository variable ACCOUNT_VALUE (env UMUSHROOM_ACCOUNT_VALUE).
+    account_value: float | None = None
 
     def __post_init__(self) -> None:
         _validate(self)
+
+    @property
+    def capital(self) -> float:
+        """What the orders are sized on: the account value when set."""
+        return self.account_value if self.account_value is not None else self.starting_balance
 
     @property
     def equity_weight(self) -> float:
@@ -208,6 +220,8 @@ def _validate(cfg: StrategyConfig) -> None:
 
     if cfg.starting_balance <= 0:
         errors.append(f"starting_balance must be > 0, got {cfg.starting_balance}")
+    if cfg.account_value is not None and not cfg.account_value > 0:
+        errors.append(f"account_value must be > 0 when set, got {cfg.account_value}")
 
     if cfg.top_n_holdings < 1:
         errors.append(f"top_n_holdings must be >= 1, got {cfg.top_n_holdings}")
@@ -582,9 +596,21 @@ def load_config(path: str | Path = "config.yaml") -> StrategyConfig:
             auto_confirm_runs=int(raw.get("auto_confirm_runs", 1)),
             auto_trade_on=str(raw.get("auto_trade_on", "pass")).lower(),
             repair_price_errors=_to_bool(raw.get("repair_price_errors", False)),
+            account_value=_to_money(raw.get("account_value")),
         )
     except (TypeError, ValueError, KeyError) as e:
         raise ConfigError(f"Config file {path} has a field of the wrong type: {e}") from e
+
+
+def _to_money(v: object) -> float | None:
+    """v4.27: an amount such as 98500, "98,500" or "£98,500.25"; empty / none
+    = not set (an unset GitHub variable arrives as an empty string)."""
+    if v is None:
+        return None
+    t = str(v).strip().replace(",", "").replace("£", "").replace("$", "").replace("€", "")
+    if t.lower() in ("", "none", "null"):
+        return None
+    return float(t)
 
 
 def sleeve_horizon(cfg: StrategyConfig, sleeve: SleeveConfig) -> int:

@@ -686,6 +686,24 @@ def _due_box(cad: Cadence, days: int, today: date) -> str:
             "Stocks tab are for anyone entering now, not a signal to trade.</div>")
 
 
+def _capital_note(meta: dict) -> str:
+    """v4.27: what the orders were sized on -- the account value, or the fixed
+    starting balance (then the buys can cost more than the account holds)."""
+    cap, src = meta.get("capital"), meta.get("capital_source")
+    if cap is None:
+        return ""
+    amount = html.escape(f"{float(cap):,.0f} {meta.get('base_currency', '')}".strip())
+    if src == "account_value":
+        return (f'<p class="note">Orders are sized on the account value <b>{amount}</b> '
+                "(the ACCOUNT_VALUE repository variable). Update it to the UMushroom "
+                "account's total (holdings + cash) before each rebalance.</p>")
+    return (f'<p class="note"><b>Orders are sized on the fixed starting balance of '
+            f"{amount}</b>, not on what the account is worth now: after losses the buys "
+            "below can cost more than the cash the sells raise. Set the ACCOUNT_VALUE "
+            "repository variable (GitHub: Settings, Secrets and variables, Actions, "
+            "Variables) to the account's total value.</p>")
+
+
 def sell_body(site: Site, run: str, latest_payload: dict, held: str | None,
               today: date | None = None, picker: bool = True) -> str:
     today = today or date.today()
@@ -697,7 +715,7 @@ def sell_body(site: Site, run: str, latest_payload: dict, held: str | None,
              "that is no longer a pick is sold and the money moves to the new picks. "
              "There is no stop-loss or profit target -- none was tested, and an untested "
              "rule can quietly wipe out the measured alpha. This is the contest "
-             "strategy's output, not financial advice.</p>")
+             "strategy's output, not financial advice.</p>") + _capital_note(meta)
     cad = _cadence_for(site, run, latest_payload)
     explicit = held is not None and held != cad.held      # the picker overrides
     held = held or cad.held

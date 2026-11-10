@@ -272,9 +272,9 @@ def main(argv: list[str] | None = None) -> int:
         combined["shares"] = [int(v) if float(v).is_integer() else float(v)
                               for v in combined["shares"]]
         deployed = float(combined["allocated_value"].sum())
-        if deployed > cfg.starting_balance + 1e-6:
+        if deployed > cfg.capital + 1e-6:
             raise DataError(f"Combined orders overspend: {deployed:,.2f} > "
-                            f"{cfg.starting_balance:,.2f}")
+                            f"{cfg.capital:,.2f}")
 
         print(f"\n=== Today's Orders: all sleeves (enter into UMushroom; 'price' in "
               f"{cfg.base_currency}, 'local_price' in the listing currency -- "
@@ -283,8 +283,9 @@ def main(argv: list[str] | None = None) -> int:
         for sleeve, alloc in allocations:
             print(f"  {sleeve.name:<8} {alloc.total_deployed:>12,.2f} of "
                   f"{alloc.balance:>12,.2f}")
-        print(f"\nDeployed: {deployed:,.2f} / {cfg.starting_balance:,.2f}  "
-              f"(cash remaining: {cfg.starting_balance - deployed:,.2f})")
+        print(f"\nDeployed: {deployed:,.2f} / {cfg.capital:,.2f}  "
+              f"(cash remaining: {cfg.capital - deployed:,.2f}; sized on "
+              f"{'the account value' if cfg.account_value is not None else 'starting_balance'})")
         combined.to_csv(args.output)
 
         if args.report:
@@ -347,7 +348,7 @@ def _write_report(cfg: StrategyConfig, args: argparse.Namespace,
                                  for t in orders.index]
     orders["umushroom_currency"] = [etf_meta.get(t, {}).get("umushroom_currency", "")
                                    for t in orders.index]
-    orders["portfolio_weight"] = orders["allocated_value"] / cfg.starting_balance
+    orders["portfolio_weight"] = orders["allocated_value"] / cfg.capital
 
     def url(t: str) -> str:              # v4.24: the buy / sell page on UMushroom
         return instrument_url(etf_meta.get(t), meta_rows.get(t))
@@ -411,7 +412,7 @@ def _write_report(cfg: StrategyConfig, args: argparse.Namespace,
         try:
             mc = simulate(combine_sleeves(strat_parts), combine_sleeves(bench_parts),
                           horizon_weeks=args.mc_weeks,
-                          start_value=cfg.starting_balance, n_paths=args.mc_sims,
+                          start_value=cfg.capital, n_paths=args.mc_sims,
                           seed=cfg.random_seed)
             mc_note = ("Whole portfolio, all sleeves at their target weights; the "
                        "benchmark replaces the stock picks with the equal-weight "
@@ -434,7 +435,11 @@ def _write_report(cfg: StrategyConfig, args: argparse.Namespace,
               # from "this run could not price or run it" (rebalance.plan)
               "skipped_sleeves": sorted({s.name for s in cfg.all_sleeves}
                                         - {s.name for s, _ in allocations}),
-              "stale_last": sorted(market.stale_last)},
+              "stale_last": sorted(market.stale_last),
+              # v4.27: what the orders were sized on, said on the Sell tab
+              "capital": cfg.capital,
+              "capital_source": ("account_value" if cfg.account_value is not None
+                                 else "starting_balance")},
         sleeves=sleeves, orders=orders, top_ranked=top, deciles=deciles,
         mc=mc, mc_note=mc_note, top_etfs=top_etfs)
     return write_report(args.report, payload)
@@ -641,7 +646,7 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
                  if weighting != "equal" else ""))
     alloc = generate_allocation(
         alloc_prices, model, top_n=sleeve.top_n, hold_all=hold_all,
-        balance=cfg.starting_balance * sleeve.weight,
+        balance=cfg.capital * sleeve.weight,     # v4.27: the account value when set
         weighting=alloc_weighting, groups=groups,
         local_prices=market.local_prices[alloc_cols],
         currencies={t: listings[t].currency for t in alloc_cols},

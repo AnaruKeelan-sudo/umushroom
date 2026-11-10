@@ -622,3 +622,24 @@ def test_repair_price_errors_defaults_off_and_is_on_in_the_shipped_config(tmp_pa
     on = load_config(_write(tmp_path, VALID_YAML + "\nrepair_price_errors: true\n"))
     assert on.repair_price_errors is True
     assert load_config(REPO_CONFIG).repair_price_errors is True
+
+
+def test_account_value_sizes_the_orders_when_set(tmp_path, monkeypatch):
+    """v4.27: orders are sized on the account's current value (holdings +
+    cash) when set -- in the cloud from the ACCOUNT_VALUE repo variable, which
+    arrives as UMUSHROOM_ACCOUNT_VALUE (empty when the variable is unset)."""
+    path = _write(tmp_path, VALID_YAML)
+    monkeypatch.delenv("UMUSHROOM_ACCOUNT_VALUE", raising=False)
+    cfg = load_config(path)
+    assert cfg.account_value is None and cfg.capital == cfg.starting_balance
+    monkeypatch.setenv("UMUSHROOM_ACCOUNT_VALUE", "")               # unset variable
+    assert load_config(path).capital == cfg.starting_balance
+    monkeypatch.setenv("UMUSHROOM_ACCOUNT_VALUE", "£98,500.25")
+    cfg = load_config(path)
+    assert cfg.account_value == 98500.25 and cfg.capital == 98500.25
+    monkeypatch.delenv("UMUSHROOM_ACCOUNT_VALUE")
+    assert load_config(_write(tmp_path, VALID_YAML + "\naccount_value: 120000\n")).capital == 120000
+    for bad in ("0", "-5", "lots"):
+        monkeypatch.setenv("UMUSHROOM_ACCOUNT_VALUE", bad)
+        with pytest.raises(ConfigError):
+            load_config(path)

@@ -1,5 +1,42 @@
 # Changelog
 
+## 4.27.0 (2026-11-05) -- orders sized on the account value, an encrypted Actions cache, an age warning, the whole weekly record
+Found in the 5 Nov review; every change below has a test that fails on 4.26.0.
+- ORDER SIZING (`account_value`, env `UMUSHROOM_ACCOUNT_VALUE`, in the cloud
+  the repository variable ACCOUNT_VALUE). Every run sized its orders on the
+  fixed starting_balance, so the Sell tab's targets ignored what the account
+  is worth: after a 10% fall the buys cost about 10k more than the sells
+  raised; after gains the profit was trimmed into cash and never reinvested,
+  unlike the compounding backtest. When set, every sleeve's budget is its
+  weight of the account value; unset = the old behaviour. The report records
+  `capital` / `capital_source` and the Sell tab says which was used (and, on
+  the fixed balance, that the buys can exceed the cash). Amounts like
+  "98,500" or "£98,500.25" are accepted; an empty variable means unset.
+- ENCRYPTED STATE IN THE ACTIONS CACHE (security). The repository is public
+  and its Actions caches can be restored by pull-request workflows; the cache
+  held `site/` -- every report in plain HTML/CSV/JSON -- so the picks could be
+  read without the team password. The workflow now saves one `state.enc`
+  (tar of `site/` and `.cache/`, AES-256 with a PBKDF2 key from the team
+  password, 600k iterations) under `umushroom-state-*`, and restores the old
+  plaintext `umushroom-data-*` cache only once, to migrate. If the state
+  cannot be decrypted (a changed password) the build stops and saves
+  nothing, rather than starting empty and burying the history. Delete the old
+  `umushroom-data-*` caches (Actions -> Caches) after the first encrypted
+  save. `umushroom_report*.html` (the default `--report`, plaintext) is now
+  git-ignored.
+- AGE WARNING. A build that crashed, timed out or never started (Actions
+  outage; GitHub pauses scheduled workflows in a public repo after 60 days
+  without commits) left yesterday's site up looking current. The page now
+  checks its own close date in the reader's browser and shows "This page may
+  be out of date" once two or more weekdays have closed since (normally at
+  most one, before the morning run; a market holiday can trigger it a day
+  early).
+- THE WHOLE WEEKLY RECORD. Pruning kept the newest 40 runs -- two a day,
+  failed ones included -- so "Week by week" only ever covered about four
+  weeks and its oldest row could score a run the team never held. Every
+  period's book (its first successful run) is now kept for good.
+- 7 new tests.
+
 ## 4.26.0 (2026-11-05) -- the Sell tab never sells on a failed run, keeps its list after midday, and the retry slot really retries
 Found in a review of the order path and the website workflow; every case
 below has a test that fails on 4.25.1.

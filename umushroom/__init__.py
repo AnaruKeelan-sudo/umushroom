@@ -5,4 +5,4 @@ rebalancing against end-of-day priced simulators (e.g. the UMushroom
 student trading contest platform).
 """
 
-__version__ = "4.26.0"
+__version__ = "4.27.0"

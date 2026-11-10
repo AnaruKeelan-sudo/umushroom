@@ -17,3 +17,5 @@ public/
 .DS_Store
 *.log
 site_password.txt
+# v4.27: the default --report output holds the picks in plain text (public repo)
+umushroom_report*.html

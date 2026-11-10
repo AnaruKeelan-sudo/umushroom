@@ -59,7 +59,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[site]"
 
-      - name: Restore past runs and the price cache
+      # v4.27: the saved state (past runs, their plaintext reports, the price
+      # cache) is stored ENCRYPTED with the team password. This repository is
+      # public and Actions caches can be restored by pull-request workflows,
+      # so a plaintext cache bypassed the site's encryption.
+      - name: Restore past runs and the price cache (encrypted)
+        uses: actions/cache/restore@v4
+        with:
+          path: state.enc
+          key: umushroom-state-${{ github.run_id }}
+          restore-keys: umushroom-state-
+
+      # One-time migration: the pre-4.27 plaintext cache, read only when no
+      # encrypted state exists yet. Delete the old umushroom-data-* caches
+      # (Actions -> Caches) once an encrypted one has been saved.
+      - name: Restore pre-4.27 state (migration)
+        if: hashFiles('state.enc') == ''
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -68,10 +83,30 @@ jobs:
           key: umushroom-data-${{ github.run_id }}
           restore-keys: umushroom-data-
 
+      - name: Decrypt the saved state
+        id: unpack
+        env:
+          UMUSHROOM_PASSWORD: ${{ secrets.UMUSHROOM_PASSWORD }}
+        run: |
+          if [ -f state.enc ]; then
+            # never run (and then save over it) on state we could not read
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass env:UMUSHROOM_PASSWORD \
+              -in state.enc | tar -xzf - \
+              || { echo "::error::Cannot decrypt the saved state (was UMUSHROOM_PASSWORD changed?). Nothing was overwritten."; exit 1; }
+            rm state.enc
+          fi
+          if [ ! -d site/reports ]; then
+            echo "::warning::No saved run history was restored: the site starts empty (first run, or the cache was evicted)."
+          fi
+
       - name: Run the model and build the encrypted site
         id: site
         env:
           UMUSHROOM_PASSWORD: ${{ secrets.UMUSHROOM_PASSWORD }}
+          # v4.27: orders are sized on the account's current total value
+          # (Settings -> Secrets and variables -> Actions -> Variables ->
+          # ACCOUNT_VALUE, e.g. 98500). Unset = the config's starting_balance.
+          UMUSHROOM_ACCOUNT_VALUE: ${{ vars.ACCOUNT_VALUE }}
         run: |
           set +e
           python -m umushroom.static_site --run --out public \
@@ -86,14 +121,22 @@ jobs:
             echo "run_ok=$([ "$code" = "0" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Save past runs and the price cache
-        if: always()
+      - name: Encrypt the state to save
+        if: always() && steps.unpack.outcome == 'success'
+        env:
+          UMUSHROOM_PASSWORD: ${{ secrets.UMUSHROOM_PASSWORD }}
+        run: |
+          dirs=$(ls -d site .cache 2>/dev/null || true)
+          if [ -z "$dirs" ]; then echo "Nothing to save."; exit 0; fi
+          tar -czf - $dirs | openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt \
+            -pass env:UMUSHROOM_PASSWORD -out state.enc
+
+      - name: Save past runs and the price cache (encrypted)
+        if: always() && steps.unpack.outcome == 'success' && hashFiles('state.enc') != ''
         uses: actions/cache/save@v4
         with:
-          path: |
-            site
-            .cache
-          key: umushroom-data-${{ github.run_id }}
+          path: state.enc
+          key: umushroom-state-${{ github.run_id }}
 
       - uses: actions/configure-pages@v5
 

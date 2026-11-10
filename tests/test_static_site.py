@@ -94,6 +94,7 @@ def test_build_runs_and_writes_every_page_encrypted(tmp_path):
     assert 'data-key="stocks"' in home and "AAA.L" in home          # the Stocks pane
     assert "+10.00%" in home                                        # the Tracker pane
     assert 'class="pal"' in home and "Find a ticker" in home       # command palette
+    assert 'id="stale"' in home and "data-asof=" in home              # v4.27 age check
     # the old per-section files are contentless redirects into the dashboard
     stub = (out / "stocks.html").read_text()
     assert "url=index.html#stocks" in stub and "AAA.L" not in stub
@@ -272,3 +273,46 @@ def test_tracker_pane_shows_the_live_record_of_the_latest_run(tmp_path):
         '<section class="pane"')[0]
     assert "Is the model right? The live record" in tracker
     assert "2026-10-14" in tracker and "-0.106" in tracker
+
+
+def test_pruning_keeps_every_weekly_book(tmp_path):
+    """v4.27: KEEP_RUNS counted every run (two a day, failed ones included), so
+    the week-by-week record only ever covered ~20 trading days. The runs that
+    are a period's book are never pruned."""
+    from umushroom.static_site import prune
+    r = Runner(tmp_path / "site", _fake_cmd(tmp_path))
+    for i in range(6):
+        (r.reports / f"2026010{i}-000000.json").write_text('{"status": "succeeded"}')
+        (r.reports / f"2026010{i}-000000.html").write_text("x")
+    prune(r, keep=2, protect={"20260101-000000"})
+    left = sorted(p.stem for p in r.reports.glob("*.json"))
+    assert left == ["20260101-000000", "20260104-000000", "20260105-000000"]
+    assert (r.reports / "20260101-000000.html").exists()
+
+
+def test_book_stamps_are_the_first_run_of_each_period(tmp_path):
+    import time
+
+    from tests.test_web import _fake
+    from umushroom.static_site import book_stamps
+    from umushroom.web import Site
+    runner = Runner(tmp_path / "site", _fake(as_of="2026-10-02"))
+    stamps = []
+    for as_of in ("2026-10-02", "2026-10-09", "2026-10-09"):
+        runner.command = _fake(as_of=as_of)
+        runner.start()
+        runner.wait()
+        stamps.append(runner.latest_report())
+        time.sleep(1.1)
+    assert book_stamps(Site(runner, lambda s, d: None)) == {stamps[0], stamps[1]}
+
+
+def test_the_page_warns_when_it_is_out_of_date():
+    """v4.27: a frozen site (a crashed or never-started build) showed old orders
+    as current. The reader's browser now warns once 2+ weekdays have closed
+    since the page's close."""
+    from umushroom.static_site import stale_banner
+    b = stale_banner("2026-11-02")
+    assert 'data-asof="2026-11-02"' in b and "hidden" in b and "out of date" in b
+    assert "n>=2" in b
+    assert stale_banner("") == "" and stale_banner("<script>") == ""
