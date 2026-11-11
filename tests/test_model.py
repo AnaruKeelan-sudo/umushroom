@@ -266,7 +266,10 @@ def test_one_phase_is_the_single_model_exactly():
     m = RankingModel(alpha=1.0).fit(X, y)
     assert m.phases == 1 and len(m._members) == 1
     direct = Ridge(alpha=1.0, random_state=42).fit(X, y).predict(X)
-    np.testing.assert_array_equal(m.predict(X).to_numpy(), direct)
+    # the same fit by two routes: equal to the last digits, not bit for bit (the
+    # row selection copies the frame, and BLAS rounds a copy differently on
+    # some NumPy versions -- 1e-16 on Python 3.10's)
+    np.testing.assert_allclose(m.predict(X).to_numpy(), direct, rtol=0, atol=1e-12)
 
 
 def test_phase_models_each_take_every_kth_date_and_are_averaged():
