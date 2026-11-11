@@ -1347,7 +1347,8 @@ def compare_train_phases(cfg: StrategyConfig, sleeve: SleeveConfig, prices: pd.D
           f"MEAN of the {k} single-phase ICs and its contest-window active t at least "
           f"their MEDIAN.")
     print(f"(test folds of {test_days} days so each holds one contest window; phase 0 is "
-          f"the single model used before v4.28)")
+          f"the single model the walk-forward scored before v4.28 -- the live fit, whose "
+          f"sample starts at min_history_days, was another phase)")
     rows: dict[str, dict[str, float]] = {}
     for name, overrides in variants.items():
         try:

@@ -60,7 +60,11 @@ WHAT WAS BROKEN
   the five single phases   IC +0.0386..+0.0418   6-week active t +2.69..+4.25   win 59-78%   VaR95/wk 2.88-3.81%
   ensemble5                IC +0.0433 (t +6.09)  6-week active +3.02% (t +5.14)  win 80%      VaR95/wk 3.08%
   -> ADOPTED (`train_phases: 5`; code default 1 = the old behaviour; the ETF
-  sleeve keeps one model). It is one more comparison on the same eight years,
+  sleeve keeps one model). A side effect worth stating: before 4.28 the
+  walk-forward scored phase 0 while the live orders came from phase 2 (the
+  live sample starts at min_history_days, 47 days later), so the model that
+  traded was not the model that was backtested -- phases that differ by up to
+  1.5 in contest-window t. One model per phase leaves no such difference. It is one more comparison on the same eight years,
   but an average of the same learner, not a new signal, and it beats every
   one of its own members. On the contest weeks it is the wrong way round too
   (IC -0.14 against -0.16; picks -0.95% a week against -1.41%).
