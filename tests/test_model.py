@@ -241,3 +241,116 @@ def test_mean_date_ic_known_answer():
     y = pd.Series([1, 2, 3, 4, 4, 3, 2, 1], index=idx, dtype=float)
     assert mean_date_ic(y, y) == pytest.approx(1.0)
     assert mean_date_ic(-y, y) == pytest.approx(-1.0)
+
+
+# ---------------------------------------------------------------------------
+# v4.28: phase models (`phases`)
+# ---------------------------------------------------------------------------
+# One model on every 5th trading day is ONE of five equally valid samples of
+# the same history, and the live top-10 depended on which (6 of 10 picks
+# changed with a one-day shift; 3-4 with a 1e-9 price revision).
+
+def _dated_xy(n_dates=40, n_names=12, seed=0):
+    rng = np.random.default_rng(seed)
+    idx = pd.MultiIndex.from_product(
+        [pd.bdate_range("2024-01-01", periods=n_dates), [f"T{i}" for i in range(n_names)]],
+        names=["date", "ticker"])
+    X = pd.DataFrame(rng.uniform(-0.5, 0.5, (len(idx), 3)), index=idx, columns=list("abc"))
+    y = pd.Series(0.3 * X["a"] - 0.2 * X["b"] + rng.normal(0, 0.1, len(idx)), index=idx)
+    return X, y
+
+
+def test_one_phase_is_the_single_model_exactly():
+    from sklearn.linear_model import Ridge
+    X, y = _dated_xy()
+    m = RankingModel(alpha=1.0).fit(X, y)
+    assert m.phases == 1 and len(m._members) == 1
+    direct = Ridge(alpha=1.0, random_state=42).fit(X, y).predict(X)
+    # the same fit by two routes: equal to the last digits, not bit for bit (the
+    # row selection copies the frame, and BLAS rounds a copy differently on
+    # some NumPy versions -- 1e-16 on Python 3.10's)
+    np.testing.assert_allclose(m.predict(X).to_numpy(), direct, rtol=0, atol=1e-12)
+
+
+def test_phase_models_each_take_every_kth_date_and_are_averaged():
+    """KNOWN ANSWER: with k phases, date i of the sorted training dates goes to
+    model i mod k (a date's cross-section is never split) and the prediction
+    is the plain mean of the k models."""
+    from sklearn.linear_model import Ridge
+    X, y = _dated_xy(n_dates=41)                       # 41: the phases are uneven
+    k = 3
+    m = RankingModel(alpha=1.0, phases=k).fit(X, y)
+    assert len(m._members) == k
+    dates = pd.Index(sorted(X.index.get_level_values("date").unique()))
+    row_dates = X.index.get_level_values("date")
+    expected = np.zeros(len(X))
+    seen = 0
+    for p in range(k):
+        rows = row_dates.isin(dates[p::k])
+        seen += int(rows.sum())
+        expected += Ridge(alpha=1.0, random_state=42).fit(X[rows], y[rows]).predict(X)
+    assert seen == len(X)                              # every date used exactly once
+    np.testing.assert_allclose(m.predict(X).to_numpy(), expected / k, rtol=0, atol=1e-12)
+    # the ridge "importance" of the averaged model is the mean coefficient
+    coefs = np.mean([Ridge(alpha=1.0, random_state=42).fit(
+        X[row_dates.isin(dates[p::k])], y[row_dates.isin(dates[p::k])]).coef_
+        for p in range(k)], axis=0)
+    np.testing.assert_allclose(m.feature_importance().reindex(list("abc")).to_numpy(),
+                               coefs, atol=1e-12)
+
+
+def test_the_ensemble_is_the_mean_of_the_single_phase_models(planted_signal_prices):
+    """Each member is EXACTLY the pre-4.28 model on its own sample: the gbm
+    ensemble on the dense training set equals the mean of five single models,
+    each fitted on the sample build_training_set gives with that offset."""
+    from umushroom.features import build_features_at_index
+    px = planted_signal_prices
+    kw = {"forward_return_days": 5, "min_history_days": 300, "target": "rank"}
+    Xd, yd = build_training_set(px, step=1, **kw)
+    ens = RankingModel(model_type="gbm", gbm_bins="fixed", phases=5).fit(Xd, yd)
+    feats = build_features_at_index(px, len(px) - 1).dropna()
+    singles = []
+    for p in range(5):
+        Xp, yp = build_training_set(px, step=5, offset=p, **kw)
+        singles.append(RankingModel(model_type="gbm", gbm_bins="fixed").fit(Xp, yp)
+                       .predict(feats).to_numpy())
+    np.testing.assert_allclose(ens.predict(feats).to_numpy(), np.mean(singles, axis=0),
+                               rtol=0, atol=1e-12)
+    # and the five single models genuinely differ (that is the problem being fixed)
+    assert not np.allclose(singles[0], singles[1])
+
+
+@pytest.mark.parametrize("bad", [0, -1, 2.5, True, "5"])
+def test_phases_must_be_a_positive_whole_number(bad):
+    with pytest.raises(ValueError, match="phases"):
+        RankingModel(phases=bad)
+
+
+def test_fewer_dates_than_phases_gives_fewer_members_not_an_error():
+    X, y = _dated_xy(n_dates=3)
+    m = RankingModel(phases=5).fit(X, y)
+    assert len(m._members) == 3 and np.isfinite(m.predict(X)).all()
+
+
+def test_phase_models_survive_save_and_load_and_one_model_is_stored_as_before(tmp_path):
+    import joblib
+    X, y = _dated_xy()
+    for phases in (1, 4):
+        m = RankingModel(model_type="gbm", gbm_bins="fixed", phases=phases).fit(X, y)
+        m.save(tmp_path / f"m{phases}")
+        again = RankingModel.load(tmp_path / f"m{phases}")
+        assert again.phases == phases
+        np.testing.assert_array_equal(again.predict(X).to_numpy(), m.predict(X).to_numpy())
+    assert not isinstance(joblib.load(tmp_path / "m1.joblib"), list)      # bare estimator
+    assert len(joblib.load(tmp_path / "m4.joblib")) == 4
+
+
+def test_cross_validation_scores_the_phase_ensemble(planted_signal_prices):
+    X, y = build_training_set(planted_signal_prices, forward_return_days=5, step=1,
+                              min_history_days=300)
+    stats = RankingModel(phases=5).cross_validate(X, y, purge_dates=5)
+    assert np.isfinite(stats["ic_mean"]) and stats["ic_n_dates"] > 100
+    # daily dates share four fifths of their 5-day label window: the t-statistic
+    # counts every 5th date only, not five times as many "independent" ones
+    naive = RankingModel(phases=5).cross_validate(X, y, purge_dates=1)
+    assert stats["ic_n_dates"] <= naive["ic_n_dates"] / 5 + 1

@@ -482,3 +482,119 @@ def test_cli_compare_gbm_bins_prints_verdict(tmp_path, monkeypatch, capsys):
                    "--skip-backtest", "--compare-gbm-bins", "equity:fixed,subsample"])
     out = capsys.readouterr().out
     assert rc == 0 and "does not use gbm" in out
+
+
+# ---------------------------------------------------------------------------
+# v4.28: phase models
+# ---------------------------------------------------------------------------
+
+def test_phases_verdict_adopts_only_when_nothing_is_lost():
+    """The rule declared before the first result: the ensemble needs IC t >= 2,
+    contest-window active t >= 2, an IC at least the MEAN of the single-phase
+    ICs and a contest-window active t at least their MEDIAN."""
+    from umushroom.cli import phases_verdict
+
+    def row(ic, ic_t, w_t):
+        return {"ic": ic, "ic_t": ic_t, "w_t": w_t}
+    singles = {f"phase {p}": row(ic, 5.0, t) for p, (ic, t) in enumerate(
+        [(0.039, 3.3), (0.042, 3.3), (0.041, 2.7), (0.039, 2.9), (0.040, 4.2)])}
+    # single phases: mean IC 0.0402, median contest-window active t 3.3
+    ok, why = phases_verdict({**singles, "ensemble5": row(0.043, 6.1, 5.1)}, "ensemble5")
+    assert ok and why.startswith("ADOPT ensemble5")
+    for bad, text in ((row(0.043, 1.9, 5.1), "IC t +1.90 < 2"),
+                      (row(0.043, 6.1, 1.9), "contest-window active t +1.90 < 2"),
+                      (row(0.039, 6.1, 5.1), "below the single-phase mean"),
+                      (row(0.043, 6.1, 3.2), "below the single-phase median")):
+        ok, why = phases_verdict({**singles, "ensemble5": bad}, "ensemble5")
+        assert not ok and why.startswith("KEEP one model") and text in why, why
+    # exactly the median t (and an IC above the mean): nothing is lost -> adopted
+    assert phases_verdict({**singles, "ensemble5": row(0.0403, 6.1, 3.3)}, "ensemble5")[0]
+    # no result, or no contest-window statistics: never adopted
+    assert not phases_verdict(singles, "ensemble5")[0]
+    assert not phases_verdict({**singles, "ensemble5": row(0.05, 6.0, float("nan"))},
+                              "ensemble5")[0]
+
+
+def _gbm_config(tmp_path, extra=""):
+    stocks = [f"B{i}.L" for i in range(8)] + [f"T{i}" for i in range(8)]
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(textwrap.dedent(f"""\
+        tickers: {stocks}
+        starting_balance: 100000
+        top_n_holdings: 5
+        lookback_period: "10y"
+        forward_return_days: 5
+        rebalance_days: 5
+        min_history_days: 300
+        model_alpha: 1.0
+        random_seed: 42
+        cache_dir: "{tmp_path / '.cache'}"
+        cache_max_age_hours: 12
+        log_level: "WARNING"
+        purged_test_window_days: 21
+        purged_purge_days: 5
+        purged_embargo_days: 5
+        purged_min_train_days: 504
+        prediction_log_path: "{tmp_path / 'pred.csv'}"
+        model_type: gbm
+        gbm_bins: fixed
+    """) + extra)
+    return cfg
+
+
+def test_cli_compare_train_phases_prints_every_phase_and_a_verdict(tmp_path, monkeypatch,
+                                                                    capsys):
+    """v4.28: the head-to-head runs each single-phase model and the ensemble on
+    identical data and judges them by the pre-declared rule."""
+    cfg = _gbm_config(tmp_path)
+    real = data_mod.get_market_data
+    monkeypatch.setattr(data_mod, "get_market_data",
+                        lambda **kw: real(**kw, fetcher=_fake_fetcher_7day))
+    rc = cli.main(["--config", str(cfg), "--output", str(tmp_path / "a.csv"),
+                   "--skip-backtest", "--compare-train-phases", "equity"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "Phase models: head-to-head on identical data (sleeve equity)" in out
+    assert "Rule (decided BEFORE the results)" in out
+    for name in ("phase 0", "phase 1", "phase 2", "phase 3", "phase 4", "ensemble5"):
+        assert f"\n{name} " in out, name
+    assert "VERDICT: ADOPT ensemble5" in out or "VERDICT: KEEP one model" in out
+    assert "Phase models: 5" not in out                 # the live run itself: one model
+
+
+def test_cli_trades_the_phase_ensemble_when_configured(tmp_path, monkeypatch, capsys):
+    """v4.28: `train_phases: 5` fits five models for the live orders, scores the
+    same ensemble in the walk-forward, and the report records it."""
+    import json
+    import re
+    cfg = _gbm_config(tmp_path, extra="train_phases: 5\n")
+    real = data_mod.get_market_data
+    monkeypatch.setattr(data_mod, "get_market_data",
+                        lambda **kw: real(**kw, fetcher=_fake_fetcher_7day))
+    seen: list[int] = []
+    real_wf = cli.run_purged_walk_forward
+    monkeypatch.setattr(cli, "run_purged_walk_forward",
+                        lambda *a, **kw: (seen.append(kw.get("train_phases")),
+                                          real_wf(*a, **kw))[1])
+    report = tmp_path / "report.html"
+    rc = cli.main(["--config", str(cfg), "--output", str(tmp_path / "a.csv"),
+                   "--skip-backtest", "--skip-prediction-check", "--report", str(report)])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "Phase models: 5, one per phase of the 5-day rebalance cycle" in out
+    assert seen and set(seen) == {5}                    # every walk-forward of the sleeve
+    orders = pd.read_csv(tmp_path / "a.csv", index_col=0)
+    assert len(orders) == 5 and orders["allocated_value"].sum() <= 100000
+    found = re.search(r'<script[^>]*id="report-data"[^>]*>(.*?)</script>',
+                      report.read_text(), re.DOTALL)
+    assert found is not None
+    payload = json.loads(found.group(1))
+    assert payload["sleeves"][0]["train_phases"] == 5
+    # one model (the default) on the same data gives different scores
+    one = _gbm_config(tmp_path)
+    rc = cli.main(["--config", str(one), "--output", str(tmp_path / "b.csv"),
+                   "--skip-backtest", "--skip-prediction-check", "--skip-purged-backtest"])
+    assert rc == 0
+    single = pd.read_csv(tmp_path / "b.csv", index_col=0)
+    assert not np.allclose(sorted(single["predicted_score"]),
+                           sorted(orders["predicted_score"]))

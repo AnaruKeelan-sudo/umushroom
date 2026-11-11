@@ -96,6 +96,21 @@ GBM_L2 = 1.0
 # and the same 255-level resolution the learner had anyway.
 GBM_BINS = 255
 GBM_BIN_MODES: tuple[str, ...] = ("fixed", "subsample")
+# v4.28 -- `phases`. The training set used to hold every 5th trading day (one
+# sample per rebalance period), i.e. ONE of five equally valid samples of the
+# same history, and the fitted trees depended heavily on which: on the live
+# stock sleeve of 2026-11-09 a one-day shift of the sample changed 6 of the 10
+# picks (rank correlation of the scores 0.86), and a price revision of one
+# part in a BILLION -- far less than Yahoo's daily dividend re-adjustment of
+# old prices -- changed 3 to 4 of them. The cloud and a laptop therefore
+# disagreed on the picks for the same close, and the cloud's own 8-year
+# walk-forward alpha read +21%/yr (t 4.15), +19% and +14% (t 2.96) on three
+# consecutive runs of the same code. With `phases` = k the model is k estimators, each
+# fitted on every k-th training DATE (date i of the sorted training dates goes
+# to estimator i mod k) and their predictions are averaged: every trading day
+# is used, each estimator is exactly the pre-4.28 model on its own sample, and
+# 8 to 9 of 10 picks survive the same revisions (rank correlation 0.993).
+# Nothing is tuned: same learner, same hyper-parameters. 1 = the old behaviour.
 
 
 def quantize_ranks(X: pd.DataFrame, levels: int = GBM_BINS) -> pd.DataFrame:
@@ -128,7 +143,7 @@ def mean_date_ic(preds: pd.Series, y: pd.Series) -> float:
 class RankingModel:
     def __init__(self, alpha: float = 1.0, random_seed: int = 42,
                  n_cv_splits: int = 5, model_type: str = "ridge",
-                 purge_dates: int = 1, gbm_bins: str = "subsample"):
+                 purge_dates: int = 1, gbm_bins: str = "subsample", phases: int = 1):
         if model_type not in MODEL_TYPES:
             raise ValueError(f"model_type must be one of {MODEL_TYPES}, "
                              f"got {model_type!r}")
@@ -136,13 +151,19 @@ class RankingModel:
             raise ValueError("purge_dates must be >= 0")
         if gbm_bins not in GBM_BIN_MODES:
             raise ValueError(f"gbm_bins must be one of {GBM_BIN_MODES}, got {gbm_bins!r}")
+        if (not isinstance(phases, (int, np.integer)) or isinstance(phases, bool)
+                or phases < 1):
+            raise ValueError(f"phases must be a whole number >= 1, got {phases!r}")
+        phases = int(phases)
         self.alpha = alpha
         self.random_seed = random_seed
         self.n_cv_splits = n_cv_splits
         self.model_type = model_type
         self.purge_dates = purge_dates
         self.gbm_bins = gbm_bins
-        self._model = self._make_estimator()
+        self.phases = phases
+        # v4.28: the fitted estimator(s) -- one, or one per phase (see `phases`)
+        self._members: list = []
         self._is_fitted = False
         self._feature_names: list[str] | None = None
         self._cv_rmse_mean: float | None = None
@@ -174,6 +195,42 @@ class RankingModel:
         if self.model_type == "gbm" and self.gbm_bins == "fixed":
             return quantize_ranks(X)
         return X
+
+    def _phase_masks(self, X: pd.DataFrame) -> list[np.ndarray]:
+        """v4.28: one boolean row mask per phase. The training DATES, in
+        order, are dealt out in turn -- date i goes to phase i mod `phases` --
+        so with daily dates each phase holds every `phases`-th trading day,
+        and a date's whole cross-section stays together. (A flat index has no
+        dates: its rows are dealt out in turn.) Phases without rows are
+        dropped, so short histories simply get fewer members."""
+        if self.phases == 1:
+            return [np.ones(len(X), dtype=bool)]
+        dates = pd.Index(_row_dates(X))
+        unique = pd.Index(sorted(dates.unique()))
+        phase_of = pd.Series(np.arange(len(unique)) % self.phases, index=unique)
+        row_phase = phase_of.reindex(dates).to_numpy()
+        masks = [row_phase == p for p in range(self.phases)]
+        return [m for m in masks if m.any()]
+
+    def _fit_all(self, X: pd.DataFrame, y: pd.Series
+                 ) -> tuple[list, dict[str, float | str]]:
+        """Fit the estimator(s): one per phase. The summary is the last
+        member's (mlp only; identical in kind for every member)."""
+        members: list = []
+        summary: dict[str, float | str] = {}
+        for mask in self._phase_masks(X):
+            est = self._make_estimator()
+            summary = self._fit_estimator(est, X[mask], y[mask])
+            members.append(est)
+        return members, summary
+
+    def _predict_with(self, members: list, X: pd.DataFrame) -> np.ndarray:
+        """Mean prediction of the members (one member: its prediction)."""
+        Xp = self._prep(X)
+        total = np.asarray(members[0].predict(Xp), dtype=float)
+        for est in members[1:]:
+            total = total + np.asarray(est.predict(Xp), dtype=float)
+        return total / len(members)
 
     def _fit_estimator(self, est, X: pd.DataFrame, y: pd.Series
                        ) -> dict[str, float | str]:
@@ -250,9 +307,8 @@ class RankingModel:
                 continue
             tr_mask = row_dates.isin(unique_dates[tr_d])
             te_mask = row_dates.isin(unique_dates[te_d])
-            fold_model = self._make_estimator()
-            self._fit_estimator(fold_model, X[tr_mask], y[tr_mask])
-            preds = pd.Series(fold_model.predict(self._prep(X[te_mask])),
+            members, _ = self._fit_all(X[tr_mask], y[tr_mask])
+            preds = pd.Series(self._predict_with(members, X[te_mask]),
                               index=X.index[te_mask])
             y_te = y[te_mask]
             fold_rmse.append(float(np.sqrt(mean_squared_error(y_te, preds))))
@@ -270,7 +326,13 @@ class RankingModel:
         self._cv_rmse_std = float(np.std(fold_rmse))
         ic_arr = np.array(date_ics)
         ic_mean = float(ic_arr.mean()) if len(ic_arr) else float("nan")
-        ic_t = (float(ic_mean / ic_arr.std(ddof=1) * np.sqrt(len(ic_arr)))
+        # v4.28: dates closer together than the label horizon (phase models
+        # train on every day) share most of their label window, so their ICs
+        # are not independent. The t-statistic rests on every `purge_dates`-th
+        # date only -- the dates whose labels do not overlap (purge_dates 1,
+        # one sample per period: every date, as before).
+        ic_arr = ic_arr[::max(1, purge_dates)]
+        ic_t = (float(ic_arr.mean() / ic_arr.std(ddof=1) * np.sqrt(len(ic_arr)))
                 if len(ic_arr) > 1 and ic_arr.std(ddof=1) > 0 else float("nan"))
         self._cv_ic_mean, self._cv_ic_tstat = ic_mean, ic_t
         logger.info(f"Cross-validated over {n_splits} date-folds: "
@@ -285,8 +347,7 @@ class RankingModel:
         if len(X) != len(y):
             raise ValueError(f"X and y length mismatch: {len(X)} vs {len(y)}")
 
-        self._model = self._make_estimator()
-        self.training_summary = self._fit_estimator(self._model, X, y)
+        self._members, self.training_summary = self._fit_all(X, y)
         self._is_fitted = True
         self._feature_names = list(X.columns)
         self._train_ref = (X, y)
@@ -295,6 +356,8 @@ class RankingModel:
         if self.model_type == "mlp" and self.training_summary:
             extra = (f", early-stopped at epoch {self.training_summary['best_epoch']}"
                      f" (validation IC {self.training_summary['validation_ic']:+.4f})")
+        if len(self._members) > 1:
+            extra += f", {len(self._members)} phase models averaged"
         logger.info(f"Model fit on {len(X)} samples, {X.shape[1]} features "
                     f"({self.model_type}{extra})")
         return self
@@ -307,7 +370,7 @@ class RankingModel:
                 f"Feature columns at predict time {list(X.columns)} don't "
                 f"match training-time columns {self._feature_names}"
             )
-        preds = self._model.predict(self._prep(X))
+        preds = self._predict_with(self._members, X)
         return pd.Series(preds, index=X.index, name="predicted_return")
 
     @property
@@ -321,8 +384,10 @@ class RankingModel:
         if not self._is_fitted:
             raise ModelNotFittedError("Call fit() before feature_importance()")
         if self.model_type == "ridge":
+            # several phase models: the mean coefficient IS the averaged model
+            coef = np.mean([est.coef_ for est in self._members], axis=0)
             return pd.Series(
-                self._model.coef_, index=self._feature_names, name="coefficient"
+                coef, index=self._feature_names, name="coefficient"
             ).sort_values(key=abs, ascending=False)
         if self._importance is None:
             if self._train_ref is None:
@@ -349,13 +414,16 @@ class RankingModel:
             raise ModelNotFittedError("Cannot save an unfitted model")
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(self._model, path.with_suffix(".joblib"))
+        # one estimator is stored bare, exactly as before v4.28
+        joblib.dump(self._members[0] if len(self._members) == 1 else self._members,
+                    path.with_suffix(".joblib"))
         meta = {
             "alpha": self.alpha,
             "random_seed": self.random_seed,
             "model_type": self.model_type,
             "purge_dates": self.purge_dates,
             "gbm_bins": self.gbm_bins,
+            "phases": self.phases,
             "feature_names": self._feature_names,
             "cv_rmse_mean": self._cv_rmse_mean,
             "cv_rmse_std": self._cv_rmse_std,
@@ -371,8 +439,10 @@ class RankingModel:
         instance = cls(alpha=meta["alpha"], random_seed=meta["random_seed"],
                        model_type=meta.get("model_type", "ridge"),
                        purge_dates=int(meta.get("purge_dates", 1)),
-                       gbm_bins=str(meta.get("gbm_bins", "subsample")))
-        instance._model = joblib.load(path.with_suffix(".joblib"))
+                       gbm_bins=str(meta.get("gbm_bins", "subsample")),
+                       phases=int(meta.get("phases", 1)))
+        stored = joblib.load(path.with_suffix(".joblib"))
+        instance._members = list(stored) if isinstance(stored, list) else [stored]
         instance._feature_names = meta["feature_names"]
         instance._cv_rmse_mean = meta.get("cv_rmse_mean")
         instance._cv_rmse_std = meta.get("cv_rmse_std")

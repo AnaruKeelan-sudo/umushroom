@@ -94,6 +94,7 @@ def test_build_runs_and_writes_every_page_encrypted(tmp_path):
     assert 'data-key="stocks"' in home and "AAA.L" in home          # the Stocks pane
     assert "+10.00%" in home                                        # the Tracker pane
     assert 'class="pal"' in home and "Find a ticker" in home       # command palette
+    assert 'id="stale"' in home and "data-asof=" in home              # v4.27 age check
     # the old per-section files are contentless redirects into the dashboard
     stub = (out / "stocks.html").read_text()
     assert "url=index.html#stocks" in stub and "AAA.L" not in stub
@@ -173,7 +174,15 @@ def test_not_ready_run_returns_3_and_keeps_the_last_good_site(tmp_path):
     rc = build(site, out, PW, fetch=_yahoo, command=not_ready, run_first=True,
                run_timeout=60, iterations=FAST)
     assert rc == NOT_READY_CODE == 3
-    assert "last good" in _open((out / "index.html").read_text(), PW)
+    home = _open((out / "index.html").read_text(), PW)
+    assert "last good" in home
+    # v4.28: a wait is worded as a wait -- it now happens most mornings, until
+    # Yahoo has the ETFs' closes -- and History says "not ready", not "failed"
+    assert "The prices were not complete yet at" in home
+    assert "The next scheduled run tries again" in home
+    assert "The latest run failed" not in home
+    assert '<td class="waiting">not ready</td>' in home
+    assert '<td class="failed">failed</td>' not in home
 
 
 # ------------------------------------------------- v4.21: the Tracker's book
@@ -272,3 +281,82 @@ def test_tracker_pane_shows_the_live_record_of_the_latest_run(tmp_path):
         '<section class="pane"')[0]
     assert "Is the model right? The live record" in tracker
     assert "2026-10-14" in tracker and "-0.106" in tracker
+
+
+def test_pruning_keeps_every_weekly_book(tmp_path):
+    """v4.27: KEEP_RUNS counted every run (two a day, failed ones included), so
+    the week-by-week record only ever covered ~20 trading days. The runs that
+    are a period's book are never pruned."""
+    from umushroom.static_site import prune
+    r = Runner(tmp_path / "site", _fake_cmd(tmp_path))
+    for i in range(6):
+        (r.reports / f"2026010{i}-000000.json").write_text('{"status": "succeeded"}')
+        (r.reports / f"2026010{i}-000000.html").write_text("x")
+    prune(r, keep=2, protect={"20260101-000000"})
+    left = sorted(p.stem for p in r.reports.glob("*.json"))
+    assert left == ["20260101-000000", "20260104-000000", "20260105-000000"]
+    assert (r.reports / "20260101-000000.html").exists()
+
+
+def test_book_stamps_are_the_first_run_of_each_period(tmp_path):
+    import time
+
+    from tests.test_web import _fake
+    from umushroom.static_site import book_stamps
+    from umushroom.web import Site
+    runner = Runner(tmp_path / "site", _fake(as_of="2026-10-02"))
+    stamps = []
+    for as_of in ("2026-10-02", "2026-10-09", "2026-10-09"):
+        runner.command = _fake(as_of=as_of)
+        runner.start()
+        runner.wait()
+        stamps.append(runner.latest_report())
+        time.sleep(1.1)
+    assert book_stamps(Site(runner, lambda s, d: None)) == {stamps[0], stamps[1]}
+
+
+def test_the_page_warns_when_it_is_out_of_date():
+    """v4.27: a frozen site (a crashed or never-started build) showed old orders
+    as current. The reader's browser now warns once 2+ weekdays have closed
+    since the page's close."""
+    from umushroom.static_site import stale_banner
+    b = stale_banner("2026-11-02")
+    assert 'data-asof="2026-11-02"' in b and "hidden" in b and "out of date" in b
+    assert "n>=2" in b
+    assert stale_banner("") == "" and stale_banner("<script>") == ""
+
+
+def test_a_run_that_outlasts_its_limit_is_stopped_and_the_site_still_published(tmp_path):
+    """v4.28: static_site waited for the pipeline and, at its limit, died with a
+    traceback before writing a page -- nothing published, and the run left
+    going while the workflow packed the state it was still writing into. Now
+    the run is stopped and recorded as failed, and the last good run is
+    published as after any failed run."""
+    import time
+    site, out = tmp_path / "site", tmp_path / "public"
+    assert build(site, out, PW, fetch=_yahoo, command=_fake_cmd(tmp_path),
+                 run_first=True, run_timeout=60, iterations=FAST) == 0
+    time.sleep(1.1)
+
+    def slow(report, orders):
+        return [sys.executable, "-c", "import time; time.sleep(60)"]
+    t0 = time.time()
+    rc = build(site, out, PW, fetch=_yahoo, command=slow, run_first=True,
+               run_timeout=1.0, iterations=FAST)
+    assert rc == 1 and time.time() - t0 < 30                 # not the pipeline's 60 s
+    newest = Runner(site, slow).history()[0]
+    assert newest["status"] == "failed" and newest["returncode"] != 0
+    home = _open((out / "index.html").read_text(), PW)
+    assert "The latest run failed" in home and "Invested today" in home
+
+
+def test_run_timeout_is_given_in_minutes_on_the_command_line(tmp_path, monkeypatch):
+    from umushroom import static_site
+    seen = {}
+    monkeypatch.setenv("UMUSHROOM_PASSWORD", PW)
+    monkeypatch.setattr(static_site, "build",
+                        lambda *a, **kw: seen.update(kw) or 0)
+    assert static_site.main(["--run", "--run-timeout", "120"]) == 0
+    assert seen["run_timeout"] == 120 * 60 and seen["run_first"] is True
+    assert static_site.main([]) == 0
+    assert seen["run_timeout"] == 180 * 60                   # the default, as before

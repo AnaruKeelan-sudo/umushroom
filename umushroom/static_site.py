@@ -37,15 +37,18 @@ from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 
+from umushroom.rebalance import books
 from umushroom.report import render_page, section_bodies
 from umushroom.shell import LABELS, Shell, pane, redirect_stub, report_bar
 from umushroom.tracker import FetchFn, yahoo_closes
 from umushroom.web import (
     Runner,
     Site,
+    _as_of,
     _days,
     _default_held,
     _pretty,
+    _runs_for,
     _short_stamp,
     default_command,
     live_body,
@@ -126,9 +129,18 @@ def build_pages(site: Site, run_url: str | None = None,
     bodies = section_bodies(payload)
     warn = ""
     if newest and newest["stamp"] != latest and newest.get("status") != "succeeded":
-        warn = (f"<b>The latest run failed.</b> The run of "
-                f"{html.escape(_pretty(newest['stamp']))} did not finish, so this shows "
-                f"the last good one ({html.escape(_pretty(latest))}). See History.")
+        if newest.get("returncode") == NOT_READY_CODE:
+            # v4.28: "not ready" is a wait, not a failure -- and an everyday one
+            # now that a run also waits for the ETFs' closes (max_stale_fraction)
+            warn = (f"<b>The prices were not complete yet at "
+                    f"{html.escape(_pretty(newest['stamp']))}.</b> Yahoo had not published "
+                    f"the latest close for every sleeve, so no new run was made and this "
+                    f"shows the last good run ({html.escape(_pretty(latest))}). The next "
+                    f"scheduled run tries again.")
+        else:
+            warn = (f"<b>The latest run failed.</b> The run of "
+                    f"{html.escape(_pretty(newest['stamp']))} did not finish, so this shows "
+                    f"the last good one ({html.escape(_pretty(latest))}). See History.")
 
     panes: list[str] = []
     for key, label, fname in PAGES:
@@ -168,8 +180,12 @@ def build_pages(site: Site, run_url: str | None = None,
         st = str(r.get("status", "unknown"))
         link = (f'<a href="reports/{r["stamp"]}.html">Full report</a>'
                 if r["has_report"] and st == "succeeded" else "")
+        # v4.28: a run that waited for Yahoo is "not ready", not "failed"
+        waited = st != "succeeded" and r.get("returncode") == NOT_READY_CODE
+        shown, css = ("not ready", "waiting") if waited else (st, st)
         rows.append(f"<tr><td>{html.escape(_pretty(r['stamp']))}</td>"
-                    f'<td class="{html.escape(st)}">{html.escape(st)}</td><td>{link}</td></tr>')
+                    f'<td class="{html.escape(css)}">{html.escape(shown)}</td>'
+                    f"<td>{link}</td></tr>")
         if link:
             src = runner.path(r["stamp"], "html").read_text(errors="replace")
             out[f"reports/{r['stamp']}.html"] = _with_nav(
@@ -182,9 +198,29 @@ def build_pages(site: Site, run_url: str | None = None,
     # v4.22: ONE encrypted page with every section as a pane (the hash picks
     # it); the per-section files are plain redirects into it (stubs())
     out["index.html"] = render_page(
-        payload, "".join(panes), title="UMushroom",
+        payload, stale_banner(_as_of(payload)) + "".join(panes), title="UMushroom",
         nav=static_shell("overview", updated, run_url, payload, hist, notice=warn))
     return out
+
+
+def stale_banner(as_of: str) -> str:
+    """v4.27: a warning the READER's browser shows when the page is old. A
+    failed, crashed, timed-out or never-started build leaves the last site up
+    with no sign that it is old (the "latest run failed" notice only appears
+    when a later build deploys). Shown once two or more weekdays have closed
+    since the close the page is built on: normally there is at most one
+    (before the morning run). A market holiday can trigger it a day early."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", as_of or ""):
+        return ""
+    return (f'<div class="notice" id="stale" hidden data-asof="{as_of}"></div>'
+            "<script>(function(){var e=document.getElementById('stale');"
+            "var a=new Date(e.dataset.asof+'T00:00:00'),t=new Date();t.setHours(0,0,0,0);"
+            "var d=new Date(a),n=0;d.setDate(d.getDate()+1);"
+            "while(d<t){if(d.getDay()%6){n++;}d.setDate(d.getDate()+1);}"
+            "if(n>=2){e.innerHTML='<b>This page may be out of date.</b> It is built on the '"
+            "+'close of '+e.dataset.asof+', and '+n+' trading days have closed since. The daily '"
+            "+'update may have stopped: check GitHub Actions before trading on it.';"
+            "e.hidden=false;}})();</script>")
 
 
 # ----------------------------------------------------------- encryption
@@ -304,9 +340,25 @@ def site_salt(site_dir: Path) -> bytes:
     return raw
 
 
-def prune(runner: Runner, keep: int = KEEP_RUNS) -> None:
-    """Keep the newest `keep` runs (site size and cache stay bounded)."""
+def book_stamps(site: Site) -> set[str]:
+    """v4.27: every holding period's book (the first successful run of each
+    period) -- the runs the Tracker's week-by-week record is built from."""
+    latest = site.runner.latest_report()
+    payload = site.payload(latest) if latest else None
+    if not latest or payload is None:
+        return set()
+    return {b.stamp for b in books(_runs_for(site, latest, payload), _days(payload))}
+
+
+def prune(runner: Runner, keep: int = KEEP_RUNS,
+          protect: set[str] | frozenset[str] = frozenset()) -> None:
+    """Keep the newest `keep` runs (site size and cache stay bounded), and
+    every run in `protect` (v4.27: the weekly books, so the week-by-week
+    record keeps its whole history instead of the last ~20 trading days --
+    two runs a day, failed and not-ready ones included, filled the 40)."""
     for r in runner.history()[keep:]:
+        if r["stamp"] in protect:
+            continue
         for ext in ("html", "csv", "log", "json"):
             runner.path(r["stamp"], ext).unlink(missing_ok=True)
 
@@ -347,7 +399,16 @@ def build(site_dir: Path, out: Path, password: str, run_url: str | None = None,
     if run_first:
         if runner.start() is None:
             raise RuntimeError("a run is already in progress")
-        runner.wait(timeout=run_timeout)
+        try:
+            runner.wait(timeout=run_timeout)
+        except TimeoutError:
+            # v4.28: the run outlasted its limit. It used to be left running
+            # while this build died with a traceback BEFORE writing the site:
+            # nothing published, and the workflow packed the saved state while
+            # the orphan was still writing into it. Now it is stopped, recorded
+            # as failed, and the site is built from the last good run.
+            runner.stop()
+            print(f"The run was stopped after {run_timeout / 60:.0f} minutes (its limit).")
         ok = runner.history()[0].get("status") == "succeeded"
         log = runner.path(runner.history()[0]["stamp"], "log")
         # Only the end of a FAILED run's log is printed: CI logs of a public
@@ -355,7 +416,7 @@ def build(site_dir: Path, out: Path, password: str, run_url: str | None = None,
         if not ok and log.exists():
             tail = log.read_text(errors="replace").splitlines()[-40:]
             print("Run failed. End of its log:\n" + "\n".join(tail))
-    prune(runner)
+    prune(runner, protect=book_stamps(Site(runner, fetch)))
     site = Site(runner, fetch)
     write_site(build_pages(site, run_url), out, password, site_salt(site_dir), iterations,
                plain=stubs())
@@ -378,6 +439,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="include the validation suite in the run (slower)")
     p.add_argument("--run-url", default=None,
                    help="link for the 'Run now (GitHub)' button")
+    p.add_argument("--run-timeout", type=float, default=180.0, metavar="MINUTES",
+                   help="stop the run after this many minutes and publish the last "
+                        "good one (default 180); keep it below the job's own limit")
     args = p.parse_args(argv)
     password = os.environ.get("UMUSHROOM_PASSWORD", "")
     if not password:
@@ -386,7 +450,7 @@ def main(argv: list[str] | None = None) -> int:
     cmd = default_command(args.config, ["--validate"] if args.validate else [])
     try:
         return build(Path(args.site_dir), Path(args.out), password, args.run_url,
-                     command=cmd, run_first=args.run)
+                     command=cmd, run_first=args.run, run_timeout=args.run_timeout * 60)
     except ValueError as e:
         print(f"Error: {e}")
         return 2

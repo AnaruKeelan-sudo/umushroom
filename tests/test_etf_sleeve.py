@@ -14,6 +14,7 @@ import pytest
 from umushroom import cli
 from umushroom import data as data_mod
 from umushroom.config import SleeveConfig
+from umushroom.exceptions import DataError
 from umushroom.purged_backtest import PurgedWalkForwardResult
 from umushroom.report import section_bodies
 from umushroom.window import FAIL, PASS, WARN, WindowResult
@@ -525,3 +526,78 @@ def test_a_later_run_scores_the_earlier_runs_forecasts(tmp_path, monkeypatch, ca
         row = live["rows"][0]
         assert row["independent"] and -1 <= row["ic"] <= 1 and row["n"] >= 5
     assert "Is the model right? The live record" in live_body(_payload(report))
+
+
+def test_a_skipped_sleeve_and_stale_prices_are_recorded_for_the_sell_tab(
+        tmp_path, monkeypatch, capsys):
+    """v4.26: the report says which configured sleeves did not run and which
+    instruments had no fresh close, so rebalance.plan holds them instead of
+    turning them into SELL ALL."""
+    cfg = _config(tmp_path)
+    base = _fetch_factory(seed=2)
+    real_sleeve = cli._run_sleeve
+
+    def run_sleeve(cfg_, args, sleeve, *a, **kw):
+        if sleeve.name == "etf":
+            raise DataError("a transient Yahoo error")       # the sleeve fails this run
+        return real_sleeve(cfg_, args, sleeve, *a, **kw)
+    monkeypatch.setattr(cli, "_run_sleeve", run_sleeve)
+
+    def fetch(symbols, period):
+        f = base(symbols, period)
+        f.iloc[-1, f.columns.get_loc("U3")] = np.nan          # U3: no close on the last day
+        return f
+    rc, _, report = _run(monkeypatch, cfg, tmp_path, fetch, "--skip-purged-backtest")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    meta = _payload(report)["meta"]
+    assert meta["skipped_sleeves"] == ["etf"]
+    assert meta["stale_last"] == ["U3"]
+
+
+def test_orders_are_sized_on_the_account_value(tmp_path, monkeypatch, capsys):
+    """v4.27: every sleeve's budget is its weight of the account value, and the
+    report says what the orders were sized on."""
+    cfg = _config(tmp_path)
+    monkeypatch.setenv("UMUSHROOM_ACCOUNT_VALUE", "40000")
+    rc, out_csv, report = _run(monkeypatch, cfg, tmp_path, _fetch_factory(seed=2),
+                               "--skip-purged-backtest")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    orders = pd.read_csv(out_csv, index_col=0)
+    assert 30000 < orders["allocated_value"].sum() <= 40000
+    meta = _payload(report)["meta"]
+    assert meta["capital"] == 40000 and meta["capital_source"] == "account_value"
+    assert "sized on the account value" in out
+
+
+def test_a_run_whose_etf_closes_are_not_published_yet_is_not_ready(tmp_path, monkeypatch,
+                                                                    capsys):
+    """v4.28: with the stocks' closes in and the ETFs' not (what Yahoo served
+    every Tue-Fri morning of 3-10 Nov 2026) the run is "not ready" (exit 3)
+    instead of sizing and scoring the ETF sleeve on the day before's close."""
+    from datetime import date
+    cfg = _config(tmp_path)
+    text = cfg.read_text() + "require_fresh_data: true\nmax_stale_fraction: 0.5\n"
+    cfg.write_text(text)
+    base = _fetch_factory(seed=2)
+    etfs = set(CORE + UNIVERSE)
+
+    def fetch(symbols, period):
+        f = base(symbols, period)
+        f.loc[f.index[-1], [s for s in symbols if s in etfs]] = np.nan
+        return f
+    last = base(["U0"], "5y").index[-1].date()
+    today = np.busday_offset(np.datetime64(last), 1, roll="forward").astype(date)
+    real = data_mod.__dict__.setdefault("_real_get_market_data", data_mod.get_market_data)
+    monkeypatch.setattr(data_mod, "get_market_data",
+                        lambda **kw: real(**kw, fetcher=fetch, today=today))
+    args = ["--config", str(cfg), "--output", str(tmp_path / "alloc.csv"), "--skip-backtest",
+            "--skip-prediction-check", "--skip-purged-backtest"]
+    assert cli.main(args) == 3
+    err = capsys.readouterr().err
+    assert "NOT READY" in err and "'etf' instruments" in err
+    assert not (tmp_path / "alloc.csv").exists()            # no orders were written
+    # the same data with the check off -- the pre-4.28 behaviour -- still runs
+    cfg.write_text(text.replace("max_stale_fraction: 0.5", "max_stale_fraction: 1.0"))
+    assert cli.main(args) == 0

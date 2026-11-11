@@ -320,3 +320,22 @@ def test_hierarchical_groups_falls_back_from_fine_to_coarse():
     assert g["B5"] == "bank"              # lone SIX bank -> all banks
     assert g["U1"] == POOLED_GROUP        # only 2 utilities -> global pool
     assert g["X1"] == POOLED_GROUP        # no sector at all
+
+
+def test_offset_shifts_the_training_sample_by_whole_days(synthetic_prices):
+    """v4.28: the `step` offsets are the phases of one history -- disjoint,
+    and together every trading day the dense (step 1) sample holds."""
+    from umushroom.features import build_training_set
+    kw = {"forward_return_days": 5, "min_history_days": 300}
+    dense, _ = build_training_set(synthetic_prices, step=1, **kw)
+    dense_dates = pd.Index(sorted(dense.index.get_level_values("date").unique()))
+    seen: list[pd.Timestamp] = []
+    for p in range(5):
+        X, _ = build_training_set(synthetic_prices, step=5, offset=p, **kw)
+        dates = pd.Index(sorted(X.index.get_level_values("date").unique()))
+        assert list(dates) == list(dense_dates[p::5])
+        seen.extend(dates)
+    assert sorted(seen) == list(dense_dates)
+    for bad in (-1, 5):
+        with pytest.raises(ValueError, match="offset"):
+            build_training_set(synthetic_prices, step=5, offset=bad, **kw)

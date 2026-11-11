@@ -14,11 +14,26 @@ on:
     # v4.21: two weekday slots. At 06:20 UTC Yahoo had not yet published the
     # previous day's European closes, so every Tue-Fri run of 20-27 Oct 2026
     # used two-day-old signals. The pipeline now refuses stale data (exit 3,
-    # "not ready"); the first slot that finds yesterday's closes publishes,
-    # the other keeps the last good run. UMushroom fills at the previous
+    # "not ready") and deletes that download from the cache (v4.26), so the
+    # 11:40 slot asks Yahoo again. When both slots find the closes, both
+    # publish; on a rebalance day the second still shows the trade list,
+    # against the first run's book (v4.26). UMushroom fills at the previous
     # close whenever the orders are entered, so a later run costs nothing.
+    # v4.28: five slots. GitHub starts scheduled runs about 50 minutes late,
+    # and at ~09:30 UTC Yahoo has the stocks' closes of the day before but not
+    # yet the ETFs': every Tue-Fri run of 3-10 Nov 2026 sized and scored the
+    # ETF sleeve on the close of the day before (and the 11:40 slot reused that
+    # download). Such a run is now "not ready" as well (max_stale_fraction), so
+    # a later slot fetches again. WHEN Yahoo publishes the ETFs' closes varies:
+    # they were in by 12:35 UTC on 10 Nov and by 14:23 on 27 Oct, but still
+    # missing at 16:35 on 8 Oct -- hence slots into the evening. Once one slot
+    # has succeeded, the later ones reuse its download and change nothing.
+    # Mondays use Friday's closes, which are complete by the weekend.
     - cron: "40 8 * * 1-5"     # 08:40 UTC = 09:40 London (summer) / 08:40 (winter)
     - cron: "40 11 * * 1-5"    # 11:40 UTC = 12:40 London (summer) / 11:40 (winter)
+    - cron: "40 14 * * 1-5"    # 14:40 UTC
+    - cron: "40 17 * * 1-5"    # 17:40 UTC
+    - cron: "40 20 * * 1-5"    # 20:40 UTC = 21:40 London (summer) / 20:40 (winter)
   workflow_dispatch:
     inputs:
       validate:
@@ -30,6 +45,7 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  actions: read              # v4.28: to see whether a saved state exists (below)
 
 concurrency:
   group: website
@@ -41,9 +57,15 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    # v4.28: a hung scheduled run must free the next slot (150 minutes); a
+    # manual run WITH the validation suite needs longer now that every
+    # walk-forward fits five models (20 placebo runs alone: about 3 hours).
+    # The run itself is stopped 30 minutes earlier (--run-timeout below), so
+    # the last good site is still published and the state still saved.
+    timeout-minutes: ${{ inputs.validate && 360 || 150 }}
     outputs:
       run_ok: ${{ steps.site.outputs.run_ok }}
+      state_ok: ${{ steps.pack.outputs.state_ok }}
     steps:
       - uses: actions/checkout@v4
 
@@ -55,9 +77,50 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[site]"
+          # v4.28: the numerical libraries are pinned to the versions the model
+          # was validated on (constraints-site.txt), so a new pandas / NumPy /
+          # scikit-learn release cannot change or break the orders mid-contest
+          pip install -c constraints-site.txt -e ".[site]"
 
-      - name: Restore past runs and the price cache
+      # v4.27: the saved state (past runs, their plaintext reports, the price
+      # cache) is stored ENCRYPTED with the team password. This repository is
+      # public and Actions caches can be restored by pull-request workflows,
+      # so a plaintext cache bypassed the site's encryption.
+      - name: Restore past runs and the price cache (encrypted)
+        uses: actions/cache/restore@v4
+        with:
+          path: state.enc
+          # v4.28: the attempt is part of the key. A RE-RUN of a workflow run
+          # has the same run_id, caches are immutable, and the save step only
+          # warns when its key exists: a re-run after a failed Monday run would
+          # publish the book and silently not save it (the next run would then
+          # take ITS orders for the book the team holds).
+          key: umushroom-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: umushroom-state-
+
+      # v4.28: a state.enc that is missing because the cache SERVICE failed must
+      # not be taken for "first run": the run would start from the pre-4.27
+      # cache (or empty) and THAT would be saved as the newest state, for good.
+      # If the check itself cannot be made, the run goes on as before.
+      - name: Stop if a saved state exists but was not restored
+        if: hashFiles('state.enc') == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh cache list --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF" \
+                --key umushroom-state- --limit 1 --json id --jq 'length' 2>/dev/null) || n=unknown
+          case "$n" in
+            0) echo "No encrypted state yet: the first run after the upgrade (or the caches were deleted)." ;;
+            unknown|"") echo "::warning::Could not check whether a saved state exists; continuing." ;;
+            *) echo "::error::A saved state exists but could not be restored (a cache service error). Nothing was run or saved: run the workflow again."
+               exit 1 ;;
+          esac
+
+      # One-time migration: the pre-4.27 plaintext cache, read only when no
+      # encrypted state exists yet. Delete the old umushroom-data-* caches
+      # (Actions -> Caches) once an encrypted one has been saved.
+      - name: Restore pre-4.27 state (migration)
+        if: hashFiles('state.enc') == ''
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -66,14 +129,36 @@ jobs:
           key: umushroom-data-${{ github.run_id }}
           restore-keys: umushroom-data-
 
+      - name: Decrypt the saved state
+        id: unpack
+        env:
+          UMUSHROOM_PASSWORD: ${{ secrets.UMUSHROOM_PASSWORD }}
+        run: |
+          set -o pipefail
+          if [ -f state.enc ]; then
+            # never run (and then save over it) on state we could not read
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass env:UMUSHROOM_PASSWORD \
+              -in state.enc | tar -xzf - \
+              || { echo "::error::Cannot decrypt the saved state (was UMUSHROOM_PASSWORD changed?). Nothing was overwritten."; exit 1; }
+            rm state.enc
+          fi
+          if [ ! -d site/reports ]; then
+            echo "::warning::No saved run history was restored: the site starts empty (first run, or the cache was evicted)."
+          fi
+
       - name: Run the model and build the encrypted site
         id: site
         env:
           UMUSHROOM_PASSWORD: ${{ secrets.UMUSHROOM_PASSWORD }}
+          # v4.27: orders are sized on the account's current total value
+          # (Settings -> Secrets and variables -> Actions -> Variables ->
+          # ACCOUNT_VALUE, e.g. 98500). Unset = the config's starting_balance.
+          UMUSHROOM_ACCOUNT_VALUE: ${{ vars.ACCOUNT_VALUE }}
         run: |
           set +e
           python -m umushroom.static_site --run --out public \
             ${{ inputs.validate && '--validate' || '' }} \
+            --run-timeout ${{ inputs.validate && 330 || 120 }} \
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/workflows/website.yml"
           code=$?
           if [ "$code" = "2" ]; then exit 2; fi        # setup error: nothing to publish
@@ -84,14 +169,45 @@ jobs:
             echo "run_ok=$([ "$code" = "0" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Save past runs and the price cache
-        if: always()
+      # v4.28: packing never stops the site from being published. If it goes
+      # wrong, nothing is saved (the last saved state stays the newest), the
+      # deploy job turns the workflow red, and GitHub emails you.
+      - name: Encrypt the state to save
+        id: pack
+        if: always() && steps.unpack.outcome == 'success'
+        env:
+          UMUSHROOM_PASSWORD: ${{ secrets.UMUSHROOM_PASSWORD }}
+        run: |
+          set -o pipefail
+          unsaved() {
+            rm -f state.enc
+            echo "::error::$1 The state was NOT saved: the next run starts from the last saved state."
+            echo "state_ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          dirs=$(ls -d site .cache 2>/dev/null || true)
+          if [ -z "$dirs" ]; then echo "Nothing to save."; exit 0; fi
+          # never save under a missing or short password: the archive would be
+          # readable by anyone and unreadable by the next run
+          if [ "${#UMUSHROOM_PASSWORD}" -lt 12 ]; then
+            unsaved "UMUSHROOM_PASSWORD is missing or shorter than 12 characters."
+          fi
+          tar -czf - $dirs | openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt \
+            -pass env:UMUSHROOM_PASSWORD -out state.enc \
+            || unsaved "Could not pack the state."
+          # never save an archive the next run could not read back: one
+          # truncated save would stop every later build at "Cannot decrypt"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass env:UMUSHROOM_PASSWORD \
+            -in state.enc | tar -tzf - > /dev/null \
+            || unsaved "The packed state does not read back."
+          echo "state_ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Save past runs and the price cache (encrypted)
+        if: always() && steps.unpack.outcome == 'success' && hashFiles('state.enc') != ''
         uses: actions/cache/save@v4
         with:
-          path: |
-            site
-            .cache
-          key: umushroom-data-${{ github.run_id }}
+          path: state.enc
+          key: umushroom-state-${{ github.run_id }}-${{ github.run_attempt }}
 
       - uses: actions/configure-pages@v5
 
@@ -115,4 +231,12 @@ jobs:
         if: needs.build.outputs.run_ok != 'true'
         run: |
           echo "::error::The model run failed - the site shows the last good run. Open the build job's log."
+          exit 1
+
+      # v4.28: the site is published, but the run history was not saved, so the
+      # next run would not know this one (on a rebalance day: which book you hold).
+      - name: Report a state that could not be saved
+        if: always() && needs.build.outputs.state_ok == 'false'
+        run: |
+          echo "::error::The run history could not be saved - open the build job's log (step 'Encrypt the state to save')."
           exit 1

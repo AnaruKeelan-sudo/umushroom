@@ -98,12 +98,24 @@ def next_rebalance(as_of: str | date, rebalance_days: int = DEFAULT_REBALANCE_DA
     return np.busday_offset(np.datetime64(start), rebalance_days).astype(date)
 
 
+def _on_or_before_trade_day(stamp: str, as_of: str) -> bool:
+    """Was the run `stamp` (YYYYMMDD-hhmmss) made no later than the trade day
+    of the close it was built on? False for a stamp that is not a date."""
+    try:
+        made = date(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:8]))
+    except ValueError:
+        return False
+    return made <= trade_day(as_of)
+
+
 @dataclass(frozen=True)
 class Cadence:
     held: str | None          # the run whose orders you hold (None = nothing yet)
-    rebalance_now: bool       # is the latest run the first of a new period?
+    rebalance_now: bool       # does the latest run open a new period?
     period_start: date        # first trading day of the latest run's period
     next_rebalance: date      # first trading day of the next period
+    book: str | None = None   # v4.26: the run whose orders this period buys
+                              # (the period's first run) when rebalance_now
 
 
 def cadence(runs: Iterable[tuple[str, str]], latest: str,
@@ -123,14 +135,28 @@ def cadence(runs: Iterable[tuple[str, str]], latest: str,
     same = sorted(s for s, k in idx.items() if k == p)
     start = period_start(trade_day(table[latest]), rebalance_days)
     nxt = np.busday_offset(np.datetime64(start), rebalance_days).astype(date)
-    if same[0] != latest:
-        return Cadence(same[0], False, start, nxt)
+    first = same[0]
+    # v4.26: a later run on the SAME day and the SAME close as the period's
+    # first run (the 11:40 slot after a successful 08:40 one) is still the
+    # rebalance. Before, it said "nothing to do until the next period" and the
+    # Sell tab lost its trade list for anyone who looked after midday. A run on
+    # a later day holds, even on the same close (the pre-4.21 stale reruns).
+    # v4.28: "the same day" was too narrow. A run at the WEEKEND (say after
+    # setting ACCOUNT_VALUE, as the site asks before a rebalance) opens the
+    # period on Friday's close; Monday's scheduled runs, on that same close,
+    # then read "nothing to do until the next period" on the very day the team
+    # trades. Any run on the first run's close counts as the rebalance up to
+    # and including that close's trade day -- the period's first trading day.
+    repeat = table[first] == table[latest] and (
+        first[:8] == latest[:8] or _on_or_before_trade_day(latest, table[latest]))
+    if first != latest and not repeat:
+        return Cadence(first, False, start, nxt)
     earlier = [k for k in idx.values() if k < p]
     if not earlier:
-        return Cadence(None, True, start, nxt)
+        return Cadence(None, True, start, nxt, book=first)
     prev = max(earlier)
     held = min(s for s, k in idx.items() if k == prev)
-    return Cadence(held, True, start, nxt)
+    return Cadence(held, True, start, nxt, book=first)
 
 
 @dataclass(frozen=True)
@@ -190,6 +216,14 @@ def plan(held: dict, latest: dict, band: float = 0.02) -> list[Action]:
     have, want = _by_ticker(held), _by_ticker(latest)
     ranks = _ranks(latest)
     sel = {s["name"]: s.get("selection", "model") for s in latest.get("sleeves") or []}
+    meta = latest.get("meta") or {}
+    # v4.26: a holding the latest run could not judge is kept, not sold. A
+    # sleeve that failed this run (a Yahoo hiccup, too few instruments) has no
+    # orders at all, and a model sleeve never picks a name without a fresh close
+    # -- before, both turned every such holding into SELL ALL with the reason
+    # "dropped out of the picks", which the model never said.
+    skipped = {str(x) for x in meta.get("skipped_sleeves") or []}
+    stale = {str(x) for x in meta.get("stale_last") or []}
     out: list[Action] = []
 
     for t in sorted(set(have) | set(want)):
@@ -204,7 +238,15 @@ def plan(held: dict, latest: dict, band: float = 0.02) -> list[Action]:
                 held_sh: float = held_sh, tgt_sh: float = tgt_sh,
                 price: float | None = price, ccy: str = ccy) -> Action:
             return Action(sleeve, t, name, kind, held_sh, tgt_sh, price, ccy, why)
-        if h and not w:
+        if h and not w and sleeve in skipped:
+            out.append(act("HOLD", "This sleeve did not run today (it failed or was "
+                                   "skipped), so it made no judgement: keep it until a "
+                                   "run includes the sleeve again.", tgt_sh=held_sh))
+        elif h and not w and t in stale:
+            out.append(act("HOLD", "No fresh price today, so the model could not "
+                                   "re-score it: keep it until it has one.",
+                           tgt_sh=held_sh))
+        elif h and not w:
             if sel.get(sleeve, "model") == "model":
                 r = ranks.get(t)
                 why = (f"Dropped out of the picks: the model now ranks it #{r}." if r
