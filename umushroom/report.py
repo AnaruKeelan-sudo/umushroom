@@ -64,6 +64,8 @@ class SleeveReport:
     weighting: str = "equal"                # equal | hrp | factor
     max_pick_correlation: float | None = None   # near-duplicate guard, None = off
     factor_risk: dict | None = None         # factor_risk_payload(), when sized by it
+    # ---- v4.28 ----
+    train_phases: int = 1                   # phase models averaged (model.py)
     # ---- v4.25 ----
     live: dict | None = None                # prediction_log.live_payload()
 
@@ -187,6 +189,7 @@ def _sleeve_payload(s: SleeveReport, periods_per_year: float) -> dict:
                            "contest_window_days": s.contest_window_days,
                            "window": _window_payload(s.window),
                            "model_type": s.model_type, "weighting": s.weighting,
+                           "train_phases": s.train_phases,
                            "max_pick_correlation": _clean(s.max_pick_correlation),
                            "factor_risk": s.factor_risk, "live": s.live}
     r = s.backtest
@@ -916,7 +919,9 @@ def _etf_section(payload: dict) -> str:
                   f"{s.get('horizon_days') or '?'} trading days",
                   f"inside the {s.get('contest_window_days') or '?'}-day contest window"),
             _tile("Learner and weights",
-                  f"{s.get('model_type') or 'ridge'} / {s.get('weighting') or 'equal'}",
+                  f"{s.get('model_type') or 'ridge'}"
+                  + (f" x{s['train_phases']}" if (s.get("train_phases") or 1) > 1 else "")
+                  + f" / {s.get('weighting') or 'equal'}",
                   ("near-duplicate guard: max correlation "
                    f"{s['max_pick_correlation']:.2f}"
                    if s.get("max_pick_correlation") else "near-duplicate guard off")),

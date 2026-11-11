@@ -68,10 +68,22 @@ def _cache_path(cache_dir: Path, tickers: list[str], period: str) -> Path:
 
 
 def _cache_is_fresh(path: Path, max_age_hours: float) -> bool:
+    """A cached download is reused while it is younger than `max_age_hours`
+    AND was fetched on the same London calendar day (v4.28). A download made
+    while a market is open holds a part-day bar dated that day.
+    drop_incomplete_last_bar removes it on that day, but a run after midnight
+    kept it as a completed close: signals and order prices were then built on
+    a mid-session snapshot, with every market that had not opened yet carried
+    forward. (Seen offline on 2026-11-11 00:14 with the 13:57 download of the
+    10th; the afternoon and evening slots make that window reachable by a
+    "Run now" after midnight.)"""
     if not path.exists():
         return False
-    age_hours = (time.time() - path.stat().st_mtime) / 3600
-    return age_hours < max_age_hours
+    fetched = path.stat().st_mtime
+    if (time.time() - fetched) / 3600 >= max_age_hours:
+        return False
+    return (datetime.fromtimestamp(fetched, LOCAL_TZ).date()
+            == datetime.now(LOCAL_TZ).date())
 
 
 START_PREFIX = "start:"     # period "start:2016-10-01" = a FIXED first date
@@ -604,6 +616,42 @@ def check_freshness(last_date: date, today: date) -> None:
             f"set require_fresh_data: false to override.")
 
 
+def stale_shares(stale: frozenset[str] | set[str], groups: dict[str, list[str]],
+                 available: set[str]) -> dict[str, tuple[int, int]]:
+    """{group: (instruments with no close on the latest day, instruments the
+    run kept)} for every group that has at least one kept instrument."""
+    out: dict[str, tuple[int, int]] = {}
+    for name, tickers in groups.items():
+        have = [t for t in tickers if t in available]
+        if have:
+            out[name] = (sum(t in stale for t in have), len(have))
+    return out
+
+
+def check_group_freshness(stale: frozenset[str] | set[str], groups: dict[str, list[str]],
+                          available: set[str], max_stale_fraction: float,
+                          last_date: date) -> None:
+    """v4.28: raise StaleDataError when more than `max_stale_fraction` of ANY
+    group's (sleeve's) instruments have no close on `last_date`.
+
+    check_freshness only asks whether the latest ROW is recent, and a row
+    exists as soon as half the STOCKS have traded. Every Tuesday-to-Friday
+    GitHub run of 3-10 Nov 2026 passed it with the stocks' closes in and the
+    ETFs' not yet published by Yahoo: 10 to 12 of the 11-13 ETFs were sized on
+    the close of the day before, the ETF model's scores (and its live record)
+    were built on day-old prices, and nothing said so. A single market's
+    holiday leaves that market's listings without a close too, which is why
+    the limit is a share of the sleeve and not zero."""
+    for name, (n_stale, n) in stale_shares(stale, groups, available).items():
+        if n_stale > max_stale_fraction * n:
+            raise StaleDataError(
+                f"{n_stale} of the {n} '{name}' instruments ({n_stale / n:.0%}) have no "
+                f"close for {last_date} yet -- Yahoo has published that day for the "
+                f"others only (limit {max_stale_fraction:.0%}). Refusing to build that "
+                f"sleeve on older prices -- run again later, or raise "
+                f"max_stale_fraction to override.")
+
+
 def drop_incomplete_last_bar(data: pd.DataFrame, today: date) -> pd.DataFrame:
     """Drop any bar dated `today` or later.
 
@@ -701,6 +749,8 @@ def get_market_data(
     max_missing_fraction: float = MAX_MISSING_FRACTION,
     require_fresh: bool = False,
     repair: bool = False,
+    fresh_groups: dict[str, list[str]] | None = None,
+    max_stale_fraction: float = 1.0,
 ) -> MarketData:
     """Fetch, validate and currency-convert the full universe.
 
@@ -711,6 +761,9 @@ def get_market_data(
     taken as deliberately complete. `repair` (v4.25) fixes listing
     artefacts, pence/pound flips and bad prints before validation
     (repair_price_errors); the raw download is what gets cached.
+    `fresh_groups` (v4.28: {sleeve: its tickers}) with `max_stale_fraction`
+    extends `require_fresh` from "the latest row is recent" to "and each
+    sleeve has that day's closes" (check_group_freshness); 1.0 = off.
     """
     listings = resolve_universe(tickers, currency_overrides)
     fx_tickers = required_fx_tickers(listings, base_currency)
@@ -826,10 +879,20 @@ def get_market_data(
             f"Only {len(prices)} days remain after FX alignment; "
             f"need {min_history_days}")
 
+    raw_last = equities.reindex(index=prices.index, columns=prices.columns).iloc[-1]
+    stale = frozenset(raw_last[raw_last.isna()].index)
+    if stale:
+        logger.warning(f"No fresh close on {prices.index[-1].date()} for "
+                       f"{len(stale)} instrument(s) (last price carried forward): "
+                       f"{sorted(stale)}")
+
     if require_fresh:
         try:
             check_freshness(prices.index[-1].date(),
                             today or datetime.now(LOCAL_TZ).date())
+            # v4.28: ... and every sleeve has that day's closes, not just the stocks
+            check_group_freshness(stale, fresh_groups or {}, set(prices.columns),
+                                  max_stale_fraction, prices.index[-1].date())
         except StaleDataError:
             # v4.26: a stale Yahoo download must not be cached. It was written
             # above, and within cache_max_age_hours the 11:40 retry slot would
@@ -840,13 +903,6 @@ def get_market_data(
                 logger.warning(f"Deleted the stale cached download {cache_path.name} "
                                f"so the next run fetches again")
             raise
-
-    raw_last = equities.reindex(index=prices.index, columns=prices.columns).iloc[-1]
-    stale = frozenset(raw_last[raw_last.isna()].index)
-    if stale:
-        logger.warning(f"No fresh close on {prices.index[-1].date()} for "
-                       f"{len(stale)} instrument(s) (last price carried forward): "
-                       f"{sorted(stale)}")
 
     dollar_volume = None
     if volumes is not None:

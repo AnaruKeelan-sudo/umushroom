@@ -147,6 +147,25 @@ class Runner:
         d.update(status="succeeded" if ok else "failed", returncode=rc, finished=_now())
         self.path(stamp, "json").write_text(json.dumps(d))
 
+    def stop(self, grace: float = 10.0) -> None:
+        """v4.28: end the current run (terminate, then kill) and wait until it
+        is recorded -- as failed, like any run that did not finish. Before, a
+        run that outlasted static_site's limit was left running while the
+        build crashed without writing a page."""
+        proc, stamp = self._proc, self._stamp
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        end = time.time() + 5
+        while (stamp and time.time() < end
+               and _read_json(self.path(stamp, "json")).get("status") == "running"):
+            time.sleep(0.05)
+
     def wait(self, timeout: float = 60) -> None:
         """Block until the current run ends (used by tests)."""
         end = time.time() + timeout
@@ -679,6 +698,16 @@ def _due_box(cad: Cadence, days: int, today: date) -> str:
         return (f'<div class="due now"><b>Sell / rebalance now</b>This run opens a new '
                 f"{days}-trading-day holding period (from {cad.period_start.strftime('%a %d %b')}"
                 f"). Do the sells below first, then the buys; then hold until {when}.</div>")
+    if today >= cad.next_rebalance:
+        # v4.28: the new period has begun but no run of it has succeeded yet (the
+        # morning run failed, or is waiting for Yahoo). The box used to read "0
+        # trading days to go ... no sells" on the very day a rebalance is due.
+        since = "today" if today == cad.next_rebalance else f"since {when}"
+        return (f'<div class="due now"><b>A rebalance is due {since} -- its trade list is '
+                "not ready yet</b>The run that opens the new holding period has not "
+                "succeeded (see the notice at the top of the page, or History). Do not "
+                "trade from this page yet: the sells and buys appear here when the next "
+                "scheduled run succeeds.</div>")
     left = max(0, int(np.busday_count(today, cad.next_rebalance)))
     return (f'<div class="due"><b>Holding period in progress -- next sell / rebalance: '
             f"{when}</b>{left} trading day{'s' if left != 1 else ''} to go. The strategy "
@@ -686,13 +715,34 @@ def _due_box(cad: Cadence, days: int, today: date) -> str:
             "Stocks tab are for anyone entering now, not a signal to trade.</div>")
 
 
-def _capital_note(meta: dict) -> str:
+def _capital_note(meta: dict, later: dict | None = None) -> str:
     """v4.27: what the orders were sized on -- the account value, or the fixed
-    starting balance (then the buys can cost more than the account holds)."""
+    starting balance (then the buys can cost more than the account holds).
+    v4.28: `meta` is the run the trade list is taken from; `later` a later run
+    of the same day, named when it was sized on something else (the list of a
+    period that has opened does not change, so a variable set after the first
+    run does not reach it)."""
     cap, src = meta.get("capital"), meta.get("capital_source")
     if cap is None:
         return ""
     amount = html.escape(f"{float(cap):,.0f} {meta.get('base_currency', '')}".strip())
+    return _sized_on(amount, src) + _resized_later(meta, later)
+
+
+def _resized_later(meta: dict, later: dict | None) -> str:
+    cap, new = meta.get("capital"), (later or {}).get("capital")
+    if new is None or cap is None or abs(float(new) - float(cap)) < 0.005:
+        return ""
+    ccy = html.escape(str(meta.get("base_currency", "")))
+    return (f'<p class="note"><b>A later run today was sized on {float(new):,.0f} {ccy}, '
+            f"this list on {float(cap):,.0f} {ccy}.</b> The trade list of a period does not "
+            "change once the period has opened (it is what the record scores), so the new "
+            f"amount is not in it: multiply the share counts below by "
+            f"{float(new) / float(cap):.3f}, or set ACCOUNT_VALUE before the first run of "
+            "the next period.</p>")
+
+
+def _sized_on(amount: str, src: object) -> str:
     if src == "account_value":
         return (f'<p class="note">Orders are sized on the account value <b>{amount}</b> '
                 "(the ACCOUNT_VALUE repository variable). Update it to the UMushroom "
@@ -715,7 +765,8 @@ def sell_body(site: Site, run: str, latest_payload: dict, held: str | None,
              "that is no longer a pick is sold and the money moves to the new picks. "
              "There is no stop-loss or profit target -- none was tested, and an untested "
              "rule can quietly wipe out the measured alpha. This is the contest "
-             "strategy's output, not financial advice.</p>") + _capital_note(meta)
+             "strategy's output, not financial advice.</p>")
+    lead, intro = intro, intro + _capital_note(meta)
     cad = _cadence_for(site, run, latest_payload)
     explicit = held is not None and held != cad.held      # the picker overrides
     held = held or cad.held
@@ -730,7 +781,9 @@ def sell_body(site: Site, run: str, latest_payload: dict, held: str | None,
                 + _due_box(cad, days, today)
                 + f'<p class="note">Your book is the orders of {html.escape(_pretty(str(held)))} '
                   f"(signals of {html.escape(_as_of(held_payload))}), the first run of "
-                  "this period. Nothing to do until the next period starts.</p>")
+                  + ("the period that has just ended. Keep it until the new period's "
+                     "trade list appears here.</p>" if today >= cad.next_rebalance else
+                     "this period. Nothing to do until the next period starts.</p>"))
 
     # v4.26: on a same-day repeat run, the period's book is the FIRST run's
     # orders (what the record scores and what the morning's readers bought)
@@ -740,6 +793,9 @@ def sell_body(site: Site, run: str, latest_payload: dict, held: str | None,
         if book_payload is not None:
             target, target_payload = cad.book, book_payload
     actions = plan(held_payload, target_payload)
+    if target != run:
+        # v4.28: say what THIS list was sized on, not what the latest run was
+        intro = lead + _capital_note(target_payload.get("meta", {}), later=meta)
     out = [intro, _held_picker(site, run, held) if picker else "", _due_box(cad, days, today)]
 
     gains: dict[str, float] = {}

@@ -569,3 +569,35 @@ def test_orders_are_sized_on_the_account_value(tmp_path, monkeypatch, capsys):
     meta = _payload(report)["meta"]
     assert meta["capital"] == 40000 and meta["capital_source"] == "account_value"
     assert "sized on the account value" in out
+
+
+def test_a_run_whose_etf_closes_are_not_published_yet_is_not_ready(tmp_path, monkeypatch,
+                                                                    capsys):
+    """v4.28: with the stocks' closes in and the ETFs' not (what Yahoo served
+    every Tue-Fri morning of 3-10 Nov 2026) the run is "not ready" (exit 3)
+    instead of sizing and scoring the ETF sleeve on the day before's close."""
+    from datetime import date
+    cfg = _config(tmp_path)
+    text = cfg.read_text() + "require_fresh_data: true\nmax_stale_fraction: 0.5\n"
+    cfg.write_text(text)
+    base = _fetch_factory(seed=2)
+    etfs = set(CORE + UNIVERSE)
+
+    def fetch(symbols, period):
+        f = base(symbols, period)
+        f.loc[f.index[-1], [s for s in symbols if s in etfs]] = np.nan
+        return f
+    last = base(["U0"], "5y").index[-1].date()
+    today = np.busday_offset(np.datetime64(last), 1, roll="forward").astype(date)
+    real = data_mod.__dict__.setdefault("_real_get_market_data", data_mod.get_market_data)
+    monkeypatch.setattr(data_mod, "get_market_data",
+                        lambda **kw: real(**kw, fetcher=fetch, today=today))
+    args = ["--config", str(cfg), "--output", str(tmp_path / "alloc.csv"), "--skip-backtest",
+            "--skip-prediction-check", "--skip-purged-backtest"]
+    assert cli.main(args) == 3
+    err = capsys.readouterr().err
+    assert "NOT READY" in err and "'etf' instruments" in err
+    assert not (tmp_path / "alloc.csv").exists()            # no orders were written
+    # the same data with the check off -- the pre-4.28 behaviour -- still runs
+    cfg.write_text(text.replace("max_stale_fraction: 0.5", "max_stale_fraction: 1.0"))
+    assert cli.main(args) == 0

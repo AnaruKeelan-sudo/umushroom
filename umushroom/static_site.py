@@ -129,9 +129,18 @@ def build_pages(site: Site, run_url: str | None = None,
     bodies = section_bodies(payload)
     warn = ""
     if newest and newest["stamp"] != latest and newest.get("status") != "succeeded":
-        warn = (f"<b>The latest run failed.</b> The run of "
-                f"{html.escape(_pretty(newest['stamp']))} did not finish, so this shows "
-                f"the last good one ({html.escape(_pretty(latest))}). See History.")
+        if newest.get("returncode") == NOT_READY_CODE:
+            # v4.28: "not ready" is a wait, not a failure -- and an everyday one
+            # now that a run also waits for the ETFs' closes (max_stale_fraction)
+            warn = (f"<b>The prices were not complete yet at "
+                    f"{html.escape(_pretty(newest['stamp']))}.</b> Yahoo had not published "
+                    f"the latest close for every sleeve, so no new run was made and this "
+                    f"shows the last good run ({html.escape(_pretty(latest))}). The next "
+                    f"scheduled run tries again.")
+        else:
+            warn = (f"<b>The latest run failed.</b> The run of "
+                    f"{html.escape(_pretty(newest['stamp']))} did not finish, so this shows "
+                    f"the last good one ({html.escape(_pretty(latest))}). See History.")
 
     panes: list[str] = []
     for key, label, fname in PAGES:
@@ -171,8 +180,12 @@ def build_pages(site: Site, run_url: str | None = None,
         st = str(r.get("status", "unknown"))
         link = (f'<a href="reports/{r["stamp"]}.html">Full report</a>'
                 if r["has_report"] and st == "succeeded" else "")
+        # v4.28: a run that waited for Yahoo is "not ready", not "failed"
+        waited = st != "succeeded" and r.get("returncode") == NOT_READY_CODE
+        shown, css = ("not ready", "waiting") if waited else (st, st)
         rows.append(f"<tr><td>{html.escape(_pretty(r['stamp']))}</td>"
-                    f'<td class="{html.escape(st)}">{html.escape(st)}</td><td>{link}</td></tr>')
+                    f'<td class="{html.escape(css)}">{html.escape(shown)}</td>'
+                    f"<td>{link}</td></tr>")
         if link:
             src = runner.path(r["stamp"], "html").read_text(errors="replace")
             out[f"reports/{r['stamp']}.html"] = _with_nav(
@@ -386,7 +399,16 @@ def build(site_dir: Path, out: Path, password: str, run_url: str | None = None,
     if run_first:
         if runner.start() is None:
             raise RuntimeError("a run is already in progress")
-        runner.wait(timeout=run_timeout)
+        try:
+            runner.wait(timeout=run_timeout)
+        except TimeoutError:
+            # v4.28: the run outlasted its limit. It used to be left running
+            # while this build died with a traceback BEFORE writing the site:
+            # nothing published, and the workflow packed the saved state while
+            # the orphan was still writing into it. Now it is stopped, recorded
+            # as failed, and the site is built from the last good run.
+            runner.stop()
+            print(f"The run was stopped after {run_timeout / 60:.0f} minutes (its limit).")
         ok = runner.history()[0].get("status") == "succeeded"
         log = runner.path(runner.history()[0]["stamp"], "log")
         # Only the end of a FAILED run's log is printed: CI logs of a public
@@ -417,6 +439,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="include the validation suite in the run (slower)")
     p.add_argument("--run-url", default=None,
                    help="link for the 'Run now (GitHub)' button")
+    p.add_argument("--run-timeout", type=float, default=180.0, metavar="MINUTES",
+                   help="stop the run after this many minutes and publish the last "
+                        "good one (default 180); keep it below the job's own limit")
     args = p.parse_args(argv)
     password = os.environ.get("UMUSHROOM_PASSWORD", "")
     if not password:
@@ -425,7 +450,7 @@ def main(argv: list[str] | None = None) -> int:
     cmd = default_command(args.config, ["--validate"] if args.validate else [])
     try:
         return build(Path(args.site_dir), Path(args.out), password, args.run_url,
-                     command=cmd, run_first=args.run)
+                     command=cmd, run_first=args.run, run_timeout=args.run_timeout * 60)
     except ValueError as e:
         print(f"Error: {e}")
         return 2

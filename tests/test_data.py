@@ -696,3 +696,119 @@ def test_get_market_data_reports_only_the_repairs_it_keeps(tmp_path):
                          drop_today_bar=False, repair=True)
     assert "MSFT" not in md.prices.columns and "AZN.L" in md.prices.columns
     assert repair_summary(md.repairs) == {"pence/pound flip": ["AZN.L"]}
+
+
+# ---------------------------------------------------------------------------
+# v4.28: "fresh" means every sleeve has the latest day's closes
+# ---------------------------------------------------------------------------
+# check_freshness only asks whether the latest ROW is recent, and a row exists
+# as soon as half the stocks have traded. Every Tuesday-to-Friday GitHub run
+# of 3-10 Nov 2026 passed it with the ETFs' closes not yet published: 10-12 of
+# the 11-13 ETFs were sized on the close of the day before.
+
+def test_stale_shares_and_the_group_freshness_rule():
+    from umushroom.data import check_group_freshness, stale_shares
+    groups = {"equity": ["A", "B", "C", "D"], "etf": ["E", "F", "G"], "gone": ["Z"]}
+    kept = {"A", "B", "C", "D", "E", "F"}            # G and Z did not survive validation
+    assert stale_shares({"A", "E", "F"}, groups, kept) == {"equity": (1, 4), "etf": (2, 2)}
+    day = date(2026, 11, 9)
+    check_group_freshness({"A", "B"}, groups, kept, 0.5, day)          # 2 of 4 = the limit
+    with pytest.raises(StaleDataError, match=r"2 of the 2 'etf' instruments \(100%\)"):
+        check_group_freshness({"A", "E", "F"}, groups, kept, 0.5, day)
+    with pytest.raises(StaleDataError, match=r"3 of the 4 'equity' instruments \(75%\)"):
+        check_group_freshness({"A", "B", "C"}, groups, kept, 0.5, day)
+    check_group_freshness({"A", "E", "F"}, groups, kept, 1.0, day)     # 1.0 = off
+    check_group_freshness({"E", "F"}, {}, kept, 0.0, day)              # no groups given
+
+
+def _etfs_not_published(base, etfs):
+    """The stocks' latest closes are in; the ETFs' are not (Yahoo, 09:30 UTC)."""
+    def fetch(symbols, period):
+        out = base(symbols, period)
+        frames = out if isinstance(out, tuple) else (out,)
+        for f in frames:
+            f.loc[f.index[-1], [s for s in symbols if s in etfs]] = np.nan
+        return out
+    return fetch
+
+
+def test_get_market_data_refuses_a_sleeve_without_the_latest_closes(tmp_path):
+    stocks, etfs = ["AAPL", "MSFT", "AZN.L"], ["SHEL.L", "NESN.SW"]
+    base = _fake_fetcher()
+    last = base(["AAPL"], "2y").index[-1].date()
+    today = np.busday_offset(np.datetime64(last), 1, roll="forward").astype(date)
+    groups = {"equity": stocks, "etf": etfs}
+
+    def run(fetch, **kw):
+        return get_market_data(stocks + etfs, "2y", tmp_path, 12, 70, "GBP", fetcher=fetch,
+                               drop_today_bar=False, require_fresh=True, today=today,
+                               calendar_tickers=stocks, **kw)
+    stale_etfs = _etfs_not_published(base, set(etfs))
+    with pytest.raises(StaleDataError, match=r"2 of the 2 'etf' instruments"):
+        run(stale_etfs, fresh_groups=groups, max_stale_fraction=0.5)
+    # the pre-4.28 behaviour (no sleeves given, or the check off): the run passes
+    # and the ETFs are only flagged
+    assert run(stale_etfs).stale_last == frozenset(etfs)
+    assert run(stale_etfs, fresh_groups=groups,
+               max_stale_fraction=1.0).stale_last == frozenset(etfs)
+    # one market's holiday: half the sleeve without a close is still a run
+    md = run(_etfs_not_published(base, {"SHEL.L"}), fresh_groups=groups,
+             max_stale_fraction=0.5)
+    assert md.stale_last == frozenset({"SHEL.L"})
+    # and without require_fresh nothing is refused (library default stays permissive)
+    get_market_data(stocks + etfs, "2y", tmp_path, 12, 70, "GBP", fetcher=stale_etfs,
+                    drop_today_bar=False, calendar_tickers=stocks, fresh_groups=groups,
+                    max_stale_fraction=0.5)
+
+
+def test_a_download_with_a_stale_sleeve_is_not_cached_either(tmp_path, monkeypatch):
+    """The v4.26 rule for a stale download (do not cache it, so the next slot
+    asks Yahoo again) holds for the v4.28 refusal too."""
+    stocks, etfs = ["AAPL", "MSFT", "AZN.L"], ["SHEL.L", "NESN.SW"]
+    dl = _flaky_download(set())
+    monkeypatch.setattr(data_mod, "_yf_download", _etfs_not_published(dl, set(etfs)))
+    monkeypatch.setattr(data_mod, "_sleep", lambda s: None)
+    last = pd.bdate_range("2025-01-01", periods=320)[-1].date()
+    today = np.busday_offset(np.datetime64(last), 1, roll="forward").astype(date)
+    for _ in range(2):                                   # two slots, the same stale data
+        with pytest.raises(StaleDataError, match="'etf' instruments"):
+            get_market_data(stocks + etfs, "2y", tmp_path, 12, 70, "GBP",
+                            drop_today_bar=False, require_fresh=True, today=today,
+                            calendar_tickers=stocks,
+                            fresh_groups={"equity": stocks, "etf": etfs},
+                            max_stale_fraction=0.5)
+        assert list(tmp_path.glob("*.parquet")) == []
+    assert len(dl.calls) == 2                            # the second slot fetched again
+
+
+def test_a_download_from_yesterday_is_never_reused_however_young(tmp_path, monkeypatch):
+    """v4.28: a download made while markets were open holds a part-day bar
+    dated that day. The same day it is dropped as incomplete; reused after
+    midnight it would pass as a completed close. So the cache is good for the
+    London day it was fetched on only -- even inside cache_max_age_hours."""
+    import os
+    import time
+
+    from umushroom.data import _cache_is_fresh
+    f = tmp_path / "x.parquet"
+    assert not _cache_is_fresh(f, 12)                              # no file
+    f.write_text("x")
+    assert _cache_is_fresh(f, 12)                                  # fetched just now
+    os.utime(f, (time.time() - 24 * 3600,) * 2)                    # yesterday, same time
+    assert not _cache_is_fresh(f, 48)                              # young enough, wrong day
+    os.utime(f, (time.time() - 13 * 3600,) * 2)
+    assert not _cache_is_fresh(f, 12)                              # too old, as before
+
+    # end to end: the second run asks Yahoo again instead of reusing yesterday's
+    tickers = ["AAPL", "MSFT", "AZN.L", "SHEL.L"]
+    dl = _flaky_download(set())
+    monkeypatch.setattr(data_mod, "_yf_download", dl)
+    monkeypatch.setattr(data_mod, "_sleep", lambda s: None)
+    cache = tmp_path / "cache"
+    get_market_data(tickers, "2y", cache, 48, 70, "GBP", drop_today_bar=False)
+    get_market_data(tickers, "2y", cache, 48, 70, "GBP", drop_today_bar=False)
+    assert len(dl.calls) == 1                                      # same day: reused
+    for p in cache.glob("*.parquet"):
+        os.utime(p, (time.time() - 24 * 3600,) * 2)
+    get_market_data(tickers, "2y", cache, 48, 70, "GBP", drop_today_bar=False)
+    assert len(dl.calls) == 2                                      # yesterday's: fetched again

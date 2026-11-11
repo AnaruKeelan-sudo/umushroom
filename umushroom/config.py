@@ -93,6 +93,11 @@ class SleeveConfig:
     # near-duplicate guard: skip a candidate whose trailing return correlation
     # with a name already picked exceeds this (None = global; 0 = off)
     max_pick_correlation: float | None = None
+    # ---- v4.28 ----
+    # how many phase models are averaged (model.py `phases`): 1, or
+    # rebalance_days. NOT inherited from the top-level setting, which is the
+    # stock sleeve's: a sleeve switches only on its own head-to-head.
+    train_phases: int = 1
 
 
 @dataclass(frozen=True)
@@ -178,6 +183,18 @@ class StrategyConfig:
     # starting_balance (the pre-4.27 behaviour). In the cloud it comes from the
     # repository variable ACCOUNT_VALUE (env UMUSHROOM_ACCOUNT_VALUE).
     account_value: float | None = None
+    # ---- v4.28 ----
+    # with require_fresh_data: refuse to run ("not ready", exit 3) when more
+    # than this share of ANY sleeve's instruments has no close for the latest
+    # day (data.check_group_freshness). 1.0 = the pre-4.28 behaviour, where a
+    # run passed as soon as the stocks' closes were in and the ETF sleeve was
+    # silently sized and scored on the close of the day before.
+    max_stale_fraction: float = 1.0
+    # the stock model as this many phase models, averaged (model.py `phases`):
+    # 1 = one model on every rebalance_days-th trading day (pre-4.28), or
+    # rebalance_days = one model per phase, so every trading day is used and
+    # the picks no longer depend on which fifth of the history was sampled.
+    train_phases: int = 1
 
     def __post_init__(self) -> None:
         _validate(self)
@@ -202,7 +219,8 @@ class StrategyConfig:
             max_per_sector=self.max_per_sector,
             model_type=self.model_type,
             max_pick_correlation=self.max_pick_correlation,
-            weighting=self.weighting)
+            weighting=self.weighting,
+            train_phases=self.train_phases)
         return [equity, *self.sleeves]
 
     @property
@@ -291,6 +309,15 @@ def _validate(cfg: StrategyConfig) -> None:
                       "the near-duplicate guard off)")
     if not 0 <= cfg.max_missing_fraction <= 1:
         errors.append("max_missing_fraction must be between 0 and 1")
+    if not 0 <= cfg.max_stale_fraction <= 1:
+        errors.append("max_stale_fraction must be between 0 and 1")
+    for owner, phases in [("train_phases", cfg.train_phases),
+                          *[(f"sleeve '{sl.name}' train_phases", sl.train_phases)
+                            for sl in cfg.sleeves]]:
+        if phases not in (1, cfg.rebalance_days):
+            errors.append(f"{owner} must be 1 or rebalance_days ({cfg.rebalance_days}): "
+                          f"one model, or one per phase of the rebalance cycle; "
+                          f"got {phases}")
     if cfg.weighting is not None and cfg.weighting not in WEIGHTINGS:
         errors.append(f"weighting must be one of {WEIGHTINGS}, got {cfg.weighting!r}")
     if cfg.history_start is not None:
@@ -489,6 +516,7 @@ def _parse_sleeves(raw: object, base_dir: Path,
             model_type=(None if spec.get("model_type") is None
                         else str(spec["model_type"])),
             max_pick_correlation=_optional_float(spec.get("max_pick_correlation")),
+            train_phases=int(spec.get("train_phases", 1)),
         ))
     return out
 
@@ -597,6 +625,8 @@ def load_config(path: str | Path = "config.yaml") -> StrategyConfig:
             auto_trade_on=str(raw.get("auto_trade_on", "pass")).lower(),
             repair_price_errors=_to_bool(raw.get("repair_price_errors", False)),
             account_value=_to_money(raw.get("account_value")),
+            max_stale_fraction=float(raw.get("max_stale_fraction", 1.0)),
+            train_phases=int(raw.get("train_phases", 1)),
         )
     except (TypeError, ValueError, KeyError) as e:
         raise ConfigError(f"Config file {path} has a field of the wrong type: {e}") from e
@@ -625,6 +655,13 @@ def data_period(cfg: StrategyConfig) -> str:
 
 def sleeve_model_type(cfg: StrategyConfig, sleeve: SleeveConfig) -> str:
     return sleeve.model_type or cfg.model_type
+
+
+def sleeve_train_phases(cfg: StrategyConfig, sleeve: SleeveConfig) -> int:
+    """v4.28: how many phase models a sleeve averages. The stock sleeve
+    carries the top-level `train_phases` (StrategyConfig.all_sleeves); every
+    other sleeve has its own, default 1."""
+    return int(sleeve.train_phases)
 
 
 def sleeve_pick_correlation(cfg: StrategyConfig, sleeve: SleeveConfig) -> float | None:

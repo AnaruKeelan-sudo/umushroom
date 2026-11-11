@@ -194,3 +194,31 @@ def test_a_same_day_repeat_run_is_still_the_rebalance():
     assert cadence(runs, "20261026-093500", 5).book == "20261026-093500"
     c = cadence(runs, "20261027-093500", 5)           # next day, same (stale) close
     assert not c.rebalance_now and c.held == "20261026-093500"
+
+
+def test_a_weekend_run_opens_the_period_and_mondays_runs_still_show_the_list():
+    """v4.28: a run made by hand at the weekend (say after setting ACCOUNT_VALUE,
+    as the site asks before a rebalance) opens the period on Friday's close.
+    Monday's scheduled runs are on that same close but another calendar day, and
+    used to read "nothing to do until the next period" on the day the team
+    trades. A run a day LATE on the same close still holds."""
+    from umushroom.rebalance import cadence
+    runs = [("20261109-094013", "2026-11-06"),           # the book the team holds
+            ("20261115-180000", "2026-11-13"),           # Sunday, by hand
+            ("20261116-093000", "2026-11-13"),           # Monday, slot 1
+            ("20261116-123000", "2026-11-13"),           # Monday, slot 2
+            ("20261117-093000", "2026-11-13")]           # Tuesday, still Friday's close
+    sunday = cadence(runs, "20261115-180000", 5)
+    assert sunday.rebalance_now and sunday.held == "20261109-094013"
+    for stamp in ("20261116-093000", "20261116-123000"):
+        c = cadence(runs, stamp, 5)
+        assert c.rebalance_now, stamp
+        assert c.book == "20261115-180000" and c.held == "20261109-094013"
+    late = cadence(runs, "20261117-093000", 5)
+    assert not late.rebalance_now and late.held == "20261115-180000"
+    # a Saturday run counts the same way
+    sat = [runs[0], ("20261114-101500", "2026-11-13"), ("20261116-093000", "2026-11-13")]
+    assert cadence(sat, "20261116-093000", 5).book == "20261114-101500"
+    # a stamp that is not a date keeps the old same-day rule (and never crashes)
+    odd = [("a", "2026-11-06"), ("b", "2026-11-13"), ("c", "2026-11-13")]
+    assert not cadence(odd, "c", 5).rebalance_now

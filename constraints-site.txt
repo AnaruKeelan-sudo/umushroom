@@ -1,0 +1,17 @@
+# v4.28: the numerical libraries of the Website workflow, pinned to the versions
+# the live model runs on (GitHub run 42816389145, 2026-11-10, Python 3.13) and
+# on which the v4.28 head-to-heads were reproduced. With these the pipeline
+# gives the same orders as on the earlier NumPy 2.5.3 / pandas 3.0.6 /
+# pyarrow 25.0.1 it was developed on (checked on the 2026-11-09 close).
+# Used only by .github/workflows/website.yml (`pip install -c`); CI keeps
+# testing the unpinned latest on Python 3.10-3.14. To upgrade: change a pin,
+# run the Website workflow by hand and compare the orders.
+# yfinance is deliberately NOT pinned: when Yahoo changes its API the fix is a
+# new yfinance release (1.7.0 and 1.8.0 return identical prices).
+numpy==2.5.4
+pandas==3.1.1
+scikit-learn==1.9.1
+scipy==1.18.1
+pyarrow==26.0.1
+joblib==1.6.0
+threadpoolctl==3.8.0

@@ -226,3 +226,37 @@ def test_model_type_is_plumbed_into_every_fold(synthetic_prices):
     assert len(run_purged_walk_forward(synthetic_prices, model_type="gbm", **kw).folds) > 0
     with pytest.raises(ValueError):
         run_purged_walk_forward(synthetic_prices, model_type="lstm", **kw)
+
+
+def test_phase_models_train_on_every_day_and_never_past_the_purge(synthetic_prices):
+    """v4.28 NO-LOOKAHEAD: with phase models a fold trains on ~5x the rows
+    (every day instead of every 5th), yet its latest training label is still
+    known before the purge gap -- exactly as with one model."""
+    kw = {"test_window_days": 20, "purge_days": 5, "embargo_days": 5, "rebalance_days": 5,
+          "forward_return_days": 5, "top_n": 3, "min_train_days": 300, "model_alpha": 1.0,
+          "random_seed": 42}
+    one = run_purged_walk_forward(synthetic_prices, **kw)
+    five = run_purged_walk_forward(synthetic_prices, train_phases=5, **kw)
+    idx = synthetic_prices.index
+    assert [f.test_start_date for f in five.folds] == [f.test_start_date for f in one.folds]
+    for a, b in zip(one.folds, five.folds):
+        assert 4.5 * a.n_train_samples < b.n_train_samples <= 5 * a.n_train_samples + 40
+        last_feature = idx.get_loc(b.train_last_feature_date)
+        test_start = idx.get_loc(b.test_start_date)
+        # the label of the latest training date ends 5 days later: before the
+        # purge gap, i.e. at least purge_days before the first test day
+        assert last_feature + 5 <= test_start - 5
+        assert b.train_last_feature_date >= a.train_last_feature_date   # and uses later days
+    assert not five.period_returns.equals(one.period_returns)
+
+
+def test_train_offset_changes_the_training_sample_only(synthetic_prices):
+    kw = {"test_window_days": 20, "purge_days": 5, "embargo_days": 5, "rebalance_days": 5,
+          "forward_return_days": 5, "top_n": 3, "min_train_days": 300, "model_alpha": 1.0,
+          "random_seed": 42}
+    base = run_purged_walk_forward(synthetic_prices, **kw)
+    assert run_purged_walk_forward(synthetic_prices, train_offset=0, **kw
+                                   ).period_returns.equals(base.period_returns)
+    shifted = run_purged_walk_forward(synthetic_prices, train_offset=2, **kw)
+    assert list(shifted.period_returns.index) == list(base.period_returns.index)
+    assert not shifted.period_ic.equals(base.period_ic)

@@ -430,8 +430,13 @@ def build_training_set(
     last_label_idx: int | None = None,
     dollar_volume: pd.DataFrame | None = None,
     feature_set: str = DEFAULT_FEATURE_SET,
+    offset: int = 0,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """(features, target) pairs at every `step`-th date.
+
+    `offset` (v4.28, 0 <= offset < step) starts the sample that many trading
+    days later: the `step` possible offsets are the equally valid "phases" of
+    one history, which the phase-model head-to-head compares.
 
     X and y are indexed by (date, ticker) so downstream CV can split on
     DATES (never splitting one date's cross-section across folds).
@@ -442,8 +447,10 @@ def build_training_set(
     label (which needs prices forward_return_days later) is fully known
     by a given cut-off.
     """
+    if not 0 <= offset < step:
+        raise ValueError(f"offset must be in [0, step), got {offset} with step {step}")
     n = len(data)
-    start_idx = max(min_history_days, MIN_BARS_REQUIRED) - 1
+    start_idx = max(min_history_days, MIN_BARS_REQUIRED) - 1 + offset
     end_idx = n - forward_return_days            # exclusive
     if last_label_idx is not None:
         end_idx = min(end_idx, last_label_idx + 1)

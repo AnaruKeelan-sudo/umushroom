@@ -298,13 +298,27 @@ config.yaml       # Your contest's parameters — edit this, not the code
   the configuration, then run the backtest; require t >= 3 if you iterated.
 - The learners are deliberately shallow for the data size (gradient
   boosting for stocks, ridge for ETFs, each adopted by a head-to-head) --
-  see `model.py`'s docstring. Their picks are deterministic but sensitive to
-  small changes in the training set (v4.23): a one-month shift of the data,
-  or seven more stocks, reshuffles several of the ten picks.
+  see `model.py`'s docstring. The ten picks are the top of a ranking whose
+  top is crowded: with one model, a price revision of one part in a billion
+  changed three or four of them. Five phase models (v4.28, below) make that
+  one or two, not zero -- the tenth and the eleventh name are always close.
 - **The live record is the final judge.** The Tracker tab scores every
   forecast once its horizon has passed and sets it against the walk-forward
-  (v4.25). In the first scored weeks (7 Oct - 2 Nov 2026) the stock model's
-  live rank correlation was negative every time.
+  (v4.25). In the first scored weeks (9 Oct - 2 Nov 2026) the stock model's
+  live rank correlation was negative in 11 of 12 cross-sections. v4.28
+  traced it (CHANGELOG): the backtest, made to score those weeks, is wrong by
+  the same amount, because twelve-month momentum -- the model's main input --
+  had one of its worst four-week runs since 2017. No setting changes that;
+  history says such runs do not carry over into the next week.
+- **A holding without a fresh price on the rebalance day** is kept (HOLD)
+  while the new book is sized in full, so that week's buys cost one position
+  more than the sells raise: leave the smallest buy until the held name has
+  a price again.
+- **The walk-forward stops short of today.** A test fold needs 21 more days of
+  data, and folds are separated by purge and embargo gaps, so the newest three
+  to six weeks are never in the out-of-sample record on the Graphs and Checks
+  tabs (in November 2026 it ended on 2 October). Read the live record for
+  those weeks.
 
 
 Every instrument in the tables has a **Buy / sell** link to its page on UMushroom (v4.24),
@@ -329,6 +343,31 @@ so an order can be entered straight from the Stocks, ETFs, When to sell and Trac
   happened, picks against the universe) and sets the live weeks against the
   walk-forward's own spread, including what the backtest did after a losing
   streak.
+
+## One model per phase of the week (v4.28)
+
+The stock model used to be fitted on every 5th trading day: one sample per
+rebalance period, and one of five equally valid ways of cutting the same
+history. Which one is an accident of where the history starts -- and the
+picks depended on it. A one-day shift changed six of the ten picks of
+9 November; a price revision of one part in a billion (Yahoo re-adjusts old
+prices for dividends every day) changed three or four; the cloud's own
+eight-year backtest alpha read +21%, +19% and +14% a year on three
+consecutive runs of the same code.
+
+`train_phases: 5` fits five models, one per phase, each exactly the old model
+on its own sample, and averages their scores. Every trading day is used, and
+8-9 of 10 picks survive the same revisions. Judged by a rule written before
+the results (CHANGELOG 4.28.0), the ensemble beat every one of the five
+single models on rank correlation and on contest-window active return:
+
+```
+python -m umushroom.cli --config config.yaml --compare-train-phases equity
+```
+
+It makes the ranking more accurate and far steadier. It does not make a bad
+month for momentum a good one: on the weeks of 12 October - 2 November 2026
+the ensemble was the wrong way round as well.
 
 ## Nothing on the path to the orders is random (v4.23)
 
@@ -389,11 +428,15 @@ To change the password, delete `site/team_password.txt` and restart (or set
 
 ## Website without your laptop (GitHub)
 
-GitHub runs the model every weekday at 08:40 and 11:40 UTC in its cloud and
-publishes the website, locked with a team password. The first slot that finds
-the previous day's closes publishes; a run on stale data exits "not ready"
-and the site keeps the last good run (v4.21). Teammates just open the
-link. Every page is encrypted, so the picks stay private even though GitHub
+GitHub runs the model every weekday at 08:40, 11:40, 14:40, 17:40 and 20:40
+UTC in its cloud (it starts scheduled runs up to an hour late) and publishes
+the website, locked with a team password. The first slot that finds the previous
+day's closes **for every sleeve** publishes; a run on stale data exits "not
+ready" and the site keeps the last good run (v4.21; v4.28: also when more than
+half of a sleeve -- in practice the ETFs, which Yahoo publishes later than
+the stocks, some days not before the evening -- has no close for that day
+yet; once a slot has succeeded the later ones change nothing). Teammates just
+open the link. Every page is encrypted, so the picks stay private even though GitHub
 Pages sites are public.
 
 **Private or public repo?** Pages from a *private* repo needs GitHub Pro --
@@ -443,6 +486,18 @@ password cannot read the old one: the build stops with "Cannot decrypt the
 saved state". To start afresh with the new password, delete the
 `umushroom-state-*` caches (Actions -> Caches; this drops the run history and
 the weekly record), or set the old password back.
+
+If the workflow goes red with **"The run history could not be saved"**
+(v4.28), the site was published but this run was not stored (the archive is
+read back before it is saved, and a bad one is never kept): open the build
+job's "Encrypt the state to save" step, fix what it says, and run the
+workflow again the same day -- on a rebalance day the stored run is the book
+the When-to-sell tab compares against.
+
+The cloud installs NumPy, pandas, scikit-learn, SciPy and pyarrow at the
+versions in `constraints-site.txt` (v4.28), so a library release cannot change
+the orders in the middle of a contest. To upgrade, change a pin there, run
+the workflow by hand and compare the orders.
 
 
 ## Sector cap (optional)

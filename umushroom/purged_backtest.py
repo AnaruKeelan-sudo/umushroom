@@ -262,8 +262,18 @@ def run_purged_walk_forward(
     max_pick_correlation: float | None = None,
     weight_fn: WeightFn | None = None,
     max_weight_multiple: float = 2.0,
+    train_phases: int = 1,
+    train_offset: int = 0,
 ) -> PurgedWalkForwardResult:
     """Walk-forward evaluation.
+
+    v4.28: `train_phases` > 1 trains every fold as that many models, one per
+    phase of the training dates, averaged (model.py `phases`); the training
+    set then holds EVERY trading day whose label is known before the purge
+    gap instead of every `rebalance_days`-th one. Same cut-off, same purge:
+    nothing a fold is trained on is later than with 1. `train_offset` (only
+    with train_phases 1) trains on the sample shifted by that many days --
+    one of the single phases the head-to-head measures the ensemble against.
 
     v4.20: `model_type` (ridge | mlp | gbm, model.py), `max_pick_correlation`
     (near-duplicate guard, selection.py) and `weight_fn` (the weighting
@@ -342,7 +352,8 @@ def run_purged_walk_forward(
             X_train, y_train = build_training_set(
                 data,
                 forward_return_days=forward_return_days,
-                step=rebalance_days,
+                step=1 if train_phases > 1 else rebalance_days,
+                offset=0 if train_phases > 1 else train_offset,
                 min_history_days=MIN_BARS_REQUIRED,
                 target=target,
                 groups=groups,
@@ -360,7 +371,7 @@ def run_purged_walk_forward(
         model = RankingModel(alpha=model_alpha, random_seed=random_seed,
                              model_type=model_type,
                              purge_dates=math.ceil(forward_return_days / rebalance_days),
-                             gbm_bins=gbm_bins)
+                             gbm_bins=gbm_bins, phases=train_phases)
         model.fit(X_train, y_train)
 
         fold_id += 1

@@ -794,6 +794,31 @@ model_type: "gbm"
 #   -> fixed wins the rule (highest contest-window active t) AND removes the
 #   seed dependence. "subsample" = the pre-4.23 behaviour.
 gbm_bins: "fixed"
+# v4.28 (2026-11-11): the stock model as FIVE phase models, averaged. One model
+# was fitted on every 5th trading day -- one of five equally valid samples of
+# the same history -- and the ten picks depended on which: a one-day shift of
+# the sample changed 6 of them, and a price revision of one part in a BILLION
+# (Yahoo re-adjusts old prices every day) changed 3-4. So the cloud and a
+# laptop disagreed on the picks for the same close (6 of 10 shared on 9 Nov),
+# and the cloud's own 8-year walk-forward alpha read +21%/yr (t 4.15), +19%
+# and +14% (t 2.96) on three consecutive runs of the same code. With 5, each model takes every
+# 5th day from its own start, every trading day is used, and 8-9 of 10 picks
+# survive the same revisions. Same learner, same hyper-parameters; nothing tuned.
+#   python -m umushroom.cli --config config.yaml --compare-train-phases equity
+#   (30-day folds, 2016-10-03 .. 2026-11-09; rule declared before the results:
+#    adopt only if IC t >= 2, contest-window active t >= 2, IC >= the MEAN of the
+#    five single-phase ICs and contest-window active t >= their MEDIAN)
+#   phase 0 (the old model)  IC +0.0393 (t +5.81)  6-week active +1.64% (t +3.30)  win 67%  alpha +14.8%/yr  VaR95/wk 3.27%
+#   phase 1                  IC +0.0418 (t +6.25)  6-week active +1.79% (t +3.33)  win 75%  alpha +17.9%/yr  VaR95/wk 2.88%
+#   phase 2                  IC +0.0407 (t +6.23)  6-week active +1.54% (t +2.69)  win 59%  alpha +14.0%/yr  VaR95/wk 3.72%
+#   phase 3                  IC +0.0386 (t +5.78)  6-week active +2.06% (t +2.87)  win 71%  alpha +18.2%/yr  VaR95/wk 3.32%
+#   phase 4                  IC +0.0395 (t +6.04)  6-week active +2.76% (t +4.25)  win 78%  alpha +25.2%/yr  VaR95/wk 3.81%
+#   ensemble5                IC +0.0433 (t +6.09)  6-week active +3.02% (t +5.14)  win 80%  alpha +29.6%/yr  VaR95/wk 3.08%
+#   -> ADOPTED: above every single phase on IC and on contest-window active t.
+# It is NOT a cure for October 2026: on the weeks of 12 Oct - 2 Nov the ensemble
+# is the wrong way round too (IC -0.14 against -0.16), because what failed was
+# 12-month momentum itself (see CHANGELOG 4.28.0). 1 = the pre-4.28 behaviour.
+train_phases: 5
 # Weighting of the stock sleeve: equal | hrp | factor (the walk-forward scores
 # the same scheme, capped at 2x equal weight like live orders).
 #   python -m umushroom.cli --config config.yaml --compare-weighting equity:equal,hrp,factor
@@ -848,6 +873,17 @@ history_start: "2016-10-01"
 # Every Tue-Fri GitHub run of 20-27 Oct 2026 built signals on the close two
 # days back because Yahoo publishes European closes after 07:00 UTC.
 require_fresh_data: true
+# v4.28: ... and refuse when more than this share of ANY sleeve's instruments
+# has no close for the latest day. The check above only asks whether the
+# latest ROW is recent, and a row exists once half the stocks have traded:
+# every Tue-Fri GitHub run of 3-10 Nov 2026 passed it while Yahoo had not yet
+# published the ETFs' closes, so 10-12 of the 11-13 ETFs were sized (and the
+# whole ETF universe scored) on the close of the day before, unannounced.
+# A share, not zero: one market's holiday leaves its listings without a close
+# (at most 48% of the stocks -- London -- or 36% of the ETFs; a day on which
+# most of continental Europe is shut and London trades, such as 1 May, leaves
+# 63% of the ETFs without one, and that day's run waits). 1.0 = check off.
+max_stale_fraction: 0.5
 # v4.21: `selection: auto` switches between the model's picks and the core
 # basket only after the rule has said the same thing on this many
 # consecutive runs (it flipped the ETF sleeve on 4 of 6 live days).

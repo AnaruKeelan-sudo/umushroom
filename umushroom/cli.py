@@ -34,6 +34,7 @@ from umushroom.config import (
     sleeve_horizon,
     sleeve_model_type,
     sleeve_pick_correlation,
+    sleeve_train_phases,
 )
 from umushroom.exceptions import (
     DataError,
@@ -161,6 +162,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "equity:fixed,subsample (seed-independent bins vs. scikit-learn's seeded "
              "subsample). Same rule as --compare-model.")
     parser.add_argument(
+        "--compare-train-phases", metavar="SLEEVE", default=None,
+        help="v4.28: head-to-head of the phase-model ensemble for one sleeve, e.g. "
+             "equity: one model per phase of the rebalance cycle, averaged, against "
+             "each single-phase model on identical data. Rule: adopted only if it "
+             "shows skill, passes the contest-window bar, and costs neither IC nor "
+             "contest-window active t against the single-phase models.")
+    parser.add_argument(
         "--compare-baseline", action="store_true",
         help="Also run the v4.3 equity setup on the same data and print a "
              "head-to-head table (one pre-declared comparison).",
@@ -233,6 +241,9 @@ def main(argv: list[str] | None = None) -> int:
             max_missing_fraction=cfg.max_missing_fraction,
             require_fresh=cfg.require_fresh_data,
             repair=cfg.repair_price_errors,
+            # v4.28: fresh means every sleeve has the latest day's closes
+            fresh_groups={s.name: list(s.tickers) for s in cfg.all_sleeves},
+            max_stale_fraction=cfg.max_stale_fraction,
         )
         prices = market.prices
         print(f"\nData: {prices.shape[1]} instruments, {len(prices)} trading days "
@@ -527,15 +538,23 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
     print(f"Model: {model_type}; weighting: {weighting}; near-duplicate guard: "
           + (f"max correlation {pick_corr:.2f}" if pick_corr else "off"))
     wf = _walk_forward_kwargs(cfg, sleeve, groups, dvol, cap_groups, cap_n, weight_fn)
+    # v4.28: with phase models the training set holds EVERY trading day (each
+    # model takes every `phases`-th one), not one sample per rebalance period
+    phases = sleeve_train_phases(cfg, sleeve)
+    train_step = 1 if phases > 1 else cfg.rebalance_days
+    if phases > 1:
+        print(f"Phase models: {phases}, one per phase of the {cfg.rebalance_days}-day "
+              f"rebalance cycle, predictions averaged (every trading day is used)")
     X, y = features_mod.build_training_set(
-        prices, forward_return_days=horizon, step=cfg.rebalance_days,
+        prices, forward_return_days=horizon, step=train_step,
         min_history_days=cfg.min_history_days, target=cfg.target, groups=groups,
         dollar_volume=dvol, feature_set=sleeve.feature_set)
     purge_dates = math.ceil(horizon / cfg.rebalance_days)
     model = RankingModel(alpha=cfg.model_alpha, random_seed=cfg.random_seed,
                          model_type=model_type, purge_dates=purge_dates,
-                         gbm_bins=cfg.gbm_bins)
-    cv_stats = model.cross_validate(X, y, purge_dates=purge_dates)
+                         gbm_bins=cfg.gbm_bins, phases=phases)
+    # the CV purge is counted in training DATES, which are now `train_step` apart
+    cv_stats = model.cross_validate(X, y, purge_dates=math.ceil(horizon / train_step))
     model.fit(X, y)
     print(f"\n--- Feature importance ({model.importance_label}) ---")
     print(model.feature_importance().to_string())
@@ -561,7 +580,7 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
                         universe_missing=sleeve.universe_missing,
                         contest_window_days=cfg.contest_window_days,
                         model_type=model_type, weighting=weighting,
-                        max_pick_correlation=pick_corr)
+                        max_pick_correlation=pick_corr, train_phases=phases)
     if collect is not None:
         collect[sleeve.name] = info
     pwf: PurgedWalkForwardResult | None = None
@@ -592,7 +611,8 @@ def _run_sleeve(cfg: StrategyConfig, args: argparse.Namespace, sleeve: SleeveCon
         for flag, fn in (("compare_model", compare_models),
                          ("compare_weighting", compare_weightings),
                          ("compare_dedup", compare_dedup),
-                         ("compare_gbm_bins", compare_gbm_bins)):
+                         ("compare_gbm_bins", compare_gbm_bins),
+                         ("compare_train_phases", compare_train_phases)):
             spec = getattr(args, flag, None)
             if spec:
                 name, _, items = str(spec).partition(":")
@@ -843,6 +863,7 @@ def _walk_forward_kwargs(cfg: StrategyConfig, sleeve: SleeveConfig,
         "gbm_bins": cfg.gbm_bins,
         "max_pick_correlation": sleeve_pick_correlation(cfg, sleeve),
         "weight_fn": weight_fn,
+        "train_phases": sleeve_train_phases(cfg, sleeve),
     }
 
 
@@ -1261,6 +1282,97 @@ def compare_gbm_bins(cfg: StrategyConfig, sleeve: SleeveConfig, prices: pd.DataF
     if best:
         print(f"To adopt it, set gbm_bins: {best} in config.yaml.")
     return best
+
+
+def phases_verdict(rows: dict[str, dict[str, float]], ensemble: str
+                   ) -> tuple[bool, str]:
+    """The phase-ensemble rule (pure, unit-tested); `rows` holds the ensemble
+    and every single-phase model. Declared on 2026-11-10 before the first
+    result was read. The ensemble is a robustness fix -- the picks stop
+    depending on which phase of the history was sampled -- so, like fixed GBM
+    bins, it is adopted unless it costs skill. ALL of:
+      1. its walk-forward IC t >= 2                      (reliable skill)
+      2. its contest-window active t >= WINDOW_T_THRESHOLD   (the live bar)
+      3. its mean IC >= the MEAN of the single-phase mean ICs
+      4. its contest-window active t >= the MEDIAN of the single-phase ones
+    Returns (adopt, reason)."""
+    singles = [m for n, m in rows.items() if n != ensemble]
+    ens = rows.get(ensemble)
+    if ens is None or not singles:
+        return False, "the ensemble or the single-phase models produced no result"
+    if not all(np.isfinite(m["ic"]) and np.isfinite(m["w_t"]) for m in [ens, *singles]):
+        return False, "a variant has no contest-window statistics; keep the current setting"
+    mean_ic = float(np.mean([m["ic"] for m in singles]))
+    median_t = float(np.median([m["w_t"] for m in singles]))
+    fails = []
+    if not (np.isfinite(ens["ic_t"]) and ens["ic_t"] >= 2.0):
+        fails.append(f"IC t {ens['ic_t']:+.2f} < 2")
+    if ens["w_t"] < WINDOW_T_THRESHOLD:
+        fails.append(f"contest-window active t {ens['w_t']:+.2f} < "
+                     f"{WINDOW_T_THRESHOLD:.0f}")
+    if ens["ic"] < mean_ic:
+        fails.append(f"IC {ens['ic']:+.4f} below the single-phase mean {mean_ic:+.4f}")
+    if ens["w_t"] < median_t:
+        fails.append(f"contest-window active t {ens['w_t']:+.2f} below the "
+                     f"single-phase median {median_t:+.2f}")
+    if fails:
+        return False, "KEEP one model -- " + "; ".join(fails)
+    return True, (f"ADOPT {ensemble}: IC {ens['ic']:+.4f} (single phases average "
+                  f"{mean_ic:+.4f}), IC t {ens['ic_t']:+.2f}, contest-window active t "
+                  f"{ens['w_t']:+.2f} (single-phase median {median_t:+.2f})")
+
+
+def compare_train_phases(cfg: StrategyConfig, sleeve: SleeveConfig, prices: pd.DataFrame,
+                         wf: dict[str, Any], groups: dict[str, str] | None,
+                         items: list[str]) -> str | None:
+    """`--compare-train-phases SLEEVE` (v4.28): one model per phase of the
+    rebalance cycle, averaged, against EVERY single-phase model (phase 0 is
+    the pre-4.28 model) on identical data and the contest-window fold grid.
+    The single phases are the yardstick because any one of them is what
+    "one model" delivers -- which one is an accident of where the history
+    starts. Rule: phases_verdict."""
+    k = cfg.rebalance_days
+    if k < 2:
+        print("\nPhase comparison skipped: rebalance_days is 1 (there is one phase).")
+        return None
+    ensemble = f"ensemble{k}"
+    variants: dict[str, dict[str, Any]] = {
+        f"phase {p}": {"train_phases": 1, "train_offset": p} for p in range(k)}
+    variants[ensemble] = {"train_phases": k, "train_offset": 0}
+    periods = window_periods_for(cfg.contest_window_days, cfg.rebalance_days)
+    test_days = _window_test_days(cfg)
+    print(f"\n=== Phase models: head-to-head on identical data (sleeve {sleeve.name}) ===")
+    print(f"Rule (decided BEFORE the results): adopt {ensemble} only if its IC t >= 2, its "
+          f"contest-window active t >= {WINDOW_T_THRESHOLD:.0f}, its IC is at least the "
+          f"MEAN of the {k} single-phase ICs and its contest-window active t at least "
+          f"their MEDIAN.")
+    print(f"(test folds of {test_days} days so each holds one contest window; phase 0 is "
+          f"the single model used before v4.28)")
+    rows: dict[str, dict[str, float]] = {}
+    for name, overrides in variants.items():
+        try:
+            r = run_purged_walk_forward(
+                prices, **{**wf, "test_window_days": test_days, **overrides})
+        except (InsufficientHistoryError, ValueError) as e:
+            print(f"  {name}: skipped ({e})")
+            continue
+        rows[name] = _variant_stats(cfg, r, periods)
+    print(f"{'variant':<16}{'IC':>8}{'IC t':>7}{'active/wk':>11}{'act t':>7}"
+          f"{'win(6w)':>9}{'active/6w':>11}{'6w t':>7}{'Sharpe':>8}{'alpha/yr':>10}"
+          f"{'alpha t':>8}{'VaR95/wk':>10}")
+    for name, m in rows.items():
+        print(f"{name:<16}{m['ic']:>+8.4f}{m['ic_t']:>+7.2f}{m['active']:>+11.3%}"
+              f"{m['active_t']:>+7.2f}{m['win']:>9.0%}{m['w_active']:>+11.2%}"
+              f"{m['w_t']:>+7.2f}{m['sharpe']:>8.2f}{m['alpha']:>+10.2%}"
+              f"{m['alpha_t']:>+8.2f}{m['var']:>10.2%}")
+    adopt, reason = phases_verdict(rows, ensemble)
+    print(f"\nVERDICT: {reason}.")
+    current = sleeve_train_phases(cfg, sleeve)
+    if adopt and current != k:
+        where = ("at the top level" if sleeve.name == EQUITY_SLEEVE
+                 else f"under sleeves.{sleeve.name}")
+        print(f"To adopt it, set train_phases: {k} {where} in config.yaml.")
+    return ensemble if adopt else None
 
 
 def compare_weightings(cfg: StrategyConfig, sleeve: SleeveConfig, prices: pd.DataFrame,

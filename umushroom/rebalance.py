@@ -98,6 +98,16 @@ def next_rebalance(as_of: str | date, rebalance_days: int = DEFAULT_REBALANCE_DA
     return np.busday_offset(np.datetime64(start), rebalance_days).astype(date)
 
 
+def _on_or_before_trade_day(stamp: str, as_of: str) -> bool:
+    """Was the run `stamp` (YYYYMMDD-hhmmss) made no later than the trade day
+    of the close it was built on? False for a stamp that is not a date."""
+    try:
+        made = date(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:8]))
+    except ValueError:
+        return False
+    return made <= trade_day(as_of)
+
+
 @dataclass(frozen=True)
 class Cadence:
     held: str | None          # the run whose orders you hold (None = nothing yet)
@@ -131,7 +141,14 @@ def cadence(runs: Iterable[tuple[str, str]], latest: str,
     # rebalance. Before, it said "nothing to do until the next period" and the
     # Sell tab lost its trade list for anyone who looked after midday. A run on
     # a later day holds, even on the same close (the pre-4.21 stale reruns).
-    repeat = table[first] == table[latest] and first[:8] == latest[:8]
+    # v4.28: "the same day" was too narrow. A run at the WEEKEND (say after
+    # setting ACCOUNT_VALUE, as the site asks before a rebalance) opens the
+    # period on Friday's close; Monday's scheduled runs, on that same close,
+    # then read "nothing to do until the next period" on the very day the team
+    # trades. Any run on the first run's close counts as the rebalance up to
+    # and including that close's trade day -- the period's first trading day.
+    repeat = table[first] == table[latest] and (
+        first[:8] == latest[:8] or _on_or_before_trade_day(latest, table[latest]))
     if first != latest and not repeat:
         return Cadence(first, False, start, nxt)
     earlier = [k for k in idx.values() if k < p]

@@ -1,5 +1,162 @@
 # Changelog
 
+## 4.28.0 (2026-11-11) -- why the live picks lagged; five phase models; "fresh" means every sleeve; a state save that cannot brick the site
+An end-to-end investigation of "the model is not working" (live rank
+correlation negative in 11 of 12 scored cross-sections, picks 1.4% a period
+behind the universe), then the defects it turned up.
+
+WHAT WAS WRONG WITH THE RESULTS -- and what was not
+- Not a bug in the scoring path. Three independent checks agree:
+  1. A point-in-time replay of the live pipeline through its real entry
+     point, with the data cut off after each day, for all 136 trading days
+     from 1 May to 9 Nov 2026: its IC tracks the published live record at a
+     correlation of 0.95 (mean -0.100 against -0.116 on the 12 scored dates),
+     so stale or partial data at run time explains almost none of it.
+  2. The walk-forward, re-run with its fold grid shifted so that the test
+     windows cover the contest weeks out of sample: IC -0.27, -0.17, -0.13,
+     -0.05 for the signals of 12, 19, 26 Oct and 2 Nov (live: -0.32, -0.16,
+     -0.12, -0.09). On every date both have, replay and walk-forward
+     correlate at 0.97 with equal means: the backtest and the live procedure
+     are the same thing. No look-ahead, no train/serve difference, and the
+     live record is measured correctly (score of day D against D -> D+5).
+  3. Factor attribution on the model's own inputs: over the four contest
+     weeks 12-1 momentum had a weekly IC of -0.155 and residual momentum
+     -0.173 (long run +0.03; lower in only 2.6% and 1.5% of all four-week
+     stretches since 2017), with short-term reversal at -0.057 (long run
+     +0.03) at the same time. The model buys twelve-month winners that have
+     just dipped; from 2 Oct the winners kept being sold. September 2026 had
+     been its best month since May (weekly IC +0.10, positive every week).
+- It is not a reason to switch the model off or turn it round. Weekly factor
+  IC has no memory (autocorrelation between -0.07 and +0.03), and after a
+  four-period stretch with a mean IC below -0.03 the walk-forward's NEXT
+  period averaged +0.058 against +0.036 for all periods (30 cases). A rule
+  that stopped trading after bad weeks would have cost money.
+- The shipped walk-forward never scored these weeks: its last test fold ends
+  on 2 Oct (a fold needs 21 more days), so the Graphs and Checks tabs kept
+  showing a record that stops a week before the contest. The Tracker's live
+  record is where they appear. Unchanged in this release; stated here.
+- What nobody can deliver: an edge of IC 0.04 is a few tenths of a percent a
+  week on ten stocks whose weekly spread is several percent. One or two
+  remaining rebalances are close to a coin toss whatever the model.
+
+WHAT WAS BROKEN
+- THE PICKS DEPENDED ON AN ACCIDENT (`train_phases`, model.py `phases`). The
+  model was fitted on every 5th trading day -- one of five equally valid
+  samples of the same history. A one-day shift of that sample changed 6 of
+  the 10 live picks of 9 Nov (rank correlation of the scores 0.86); a price
+  revision of one part in a billion, far less than Yahoo's daily dividend
+  re-adjustment of old prices, changed 3 to 4. Hence the cloud and a laptop
+  shared 6 of 10 picks for the same close (same code, same library versions),
+  one day's picks shared 4.8 of 10 names with the next day's, and the cloud's
+  own 8-year walk-forward alpha, on the same folds and an unchanged
+  benchmark, read +21.3%/yr (t 4.15), +18.5% and +14.3% (t 2.96) on three
+  consecutive runs of the same code (6, 9, 10 Nov), after +7.1% (t 1.45) and
+  +12.8% on 4 and 5 Nov. Now five models, one per phase, each exactly the old model on
+  its own sample, predictions averaged: every trading day is used, and 8 to 9
+  of 10 picks survive the same revisions (rank correlation 0.993).
+  `--compare-train-phases equity`, rule declared before the results (adopt
+  only if IC t >= 2, contest-window active t >= 2, IC >= the mean of the five
+  single-phase ICs, contest-window active t >= their median):
+  the five single phases   IC +0.0386..+0.0418   6-week active t +2.69..+4.25   win 59-78%   VaR95/wk 2.88-3.81%
+  ensemble5                IC +0.0433 (t +6.09)  6-week active +3.02% (t +5.14)  win 80%      VaR95/wk 3.08%
+  -> ADOPTED (`train_phases: 5`; code default 1 = the old behaviour; the ETF
+  sleeve keeps one model). It is one more comparison on the same eight years,
+  but an average of the same learner, not a new signal, and it beats every
+  one of its own members. On the contest weeks it is the wrong way round too
+  (IC -0.14 against -0.16; picks -0.95% a week against -1.41%).
+- THE ETF SLEEVE RAN ON YESTERDAY'S CLOSES (`max_stale_fraction`). The
+  freshness check asked only whether the latest ROW was recent, and a row
+  exists once half the stocks have traded. At ~09:30 UTC Yahoo has the
+  stocks' closes of the day before but not the ETFs': on 3, 4, 5, 6 and 10
+  Nov, 10 to 12 of the 11-13 ETFs were sized on the close of the day before
+  (4% off for one of them on 10 Nov), the whole ETF universe was scored on
+  day-old prices, and
+  the 11:40 slot reused that download. Mondays were unaffected (Friday's
+  closes are complete), so the weekly book was not. A run where more than
+  half of any sleeve has no close for the latest day is now "not ready"
+  (exit 3), its download is not cached, and a later slot fetches again. When
+  Yahoo has the ETFs varies (in by 12:35 UTC on 10 Nov, still missing at
+  16:35 on 8 Oct), so there are now five slots, 08:40 to 20:40 UTC; after
+  the first success the later ones reuse its download and change nothing.
+  The whole run waits, rather than publishing the stocks without the ETFs: a
+  book without one of its sleeves would make the NEXT period's trade list
+  treat that sleeve as not held. Code default 1.0 = off. Such a
+  morning is a wait, not a failure, so the site now says "The prices were not
+  complete yet at ... the next scheduled run tries again" instead of "The
+  latest run failed", and History lists the run as "not ready".
+- YESTERDAY'S DOWNLOAD COULD PASS AS TODAY'S (data._cache_is_fresh). A
+  download made while markets are open holds a part-day bar dated that day.
+  The same day it is dropped as incomplete; reused after midnight, inside the
+  12-hour cache age, it counted as a completed close -- signals and order
+  prices on a mid-session snapshot, every market that had not yet opened
+  carried forward. Found when an offline run at 00:14 reused the 13:57
+  download of the day before (as_of one day ahead, 293 instruments stale);
+  the later slots would have put a "Run now" after midnight in that window.
+  The cache is now good only for the London day it was fetched on.
+- ONE BAD SAVE WOULD HAVE STOPPED THE SITE (v4.27's encrypted state, before
+  its first release). The archive was piped without `pipefail` and never
+  read back, so a truncated save would have been stored and every later
+  build would have stopped at "Cannot decrypt"; and with the secret missing
+  the state would have been saved under an EMPTY password. Packing now
+  refuses a password under 12 characters, verifies that the archive reads
+  back, saves nothing otherwise, never blocks the site from publishing, and
+  turns the workflow red ("The run history could not be saved"). The eleven
+  branches were simulated with the workflow's own shell steps.
+- THE SELL TAB ON THE DAY IT MATTERS. An independent review of this release
+  walked the calendar to 23 Nov with the real functions and found three
+  older faults, each in the window of the last rebalance:
+  1. A run made by hand at the WEEKEND (say after setting ACCOUNT_VALUE, as
+     the site asks) opened the period on Friday's close -- and Monday's
+     scheduled runs, on the same close but another day, then read "Holding
+     period in progress ... nothing to do" with no trade list, on the day the
+     team trades. A run on the first run's close now counts as the rebalance
+     up to and including that close's trade day (rebalance.cadence); a run a
+     day late on the same close still holds.
+  2. On the due day, before the new period's run has succeeded (it failed, or
+     is waiting for Yahoo), the box read "0 trading days to go ... no sells".
+     It now says "A rebalance is due today -- its trade list is not ready
+     yet ... do not trade from this page yet".
+  3. On a same-day repeat run the list is the first run's, but the note above
+     it quoted the LATEST run's sizing ("sized on the account value 90,000"
+     over a list sized on 100,000, after the variable was set mid-morning).
+     The note is now the list's own, and names the later run and the factor
+     to scale by.
+  Known and not changed: a holding with no fresh price on the rebalance run
+  is kept (HOLD) on top of a fully sized new book, so that list's buys cost
+  one position more than its sells raise.
+- THE WORKFLOW COULD LOSE THE BOOK. (a) A RE-RUN of a workflow run has the
+  same run_id, Actions caches are immutable, and the save step only warns
+  when its key exists: "Re-run all jobs" after a failed Monday run would
+  have published the book and not saved it, and the next run would have
+  taken its own orders for the book the team holds. The attempt is now part
+  of the cache key. (b) A state.enc missing because the cache SERVICE failed
+  was taken for a first run: the pre-4.27 cache (or nothing) would then be
+  saved as the newest state, for good. The cache list is now asked first;
+  if a saved state exists, the build stops with "run the workflow again".
+  (c) A run that outlasted static_site's 3-hour wait was left running while
+  the build died before writing a page. It is now stopped, recorded as
+  failed, and the last good site is published (`--run-timeout`, 30 minutes
+  inside the job's own limit).
+- THE CLOUD'S LIBRARIES ARE PINNED (`constraints-site.txt`): NumPy, pandas,
+  scikit-learn, SciPy, pyarrow, joblib, threadpoolctl at the versions of the
+  run of 10 Nov, on which the pipeline was checked to give the same orders as
+  on the versions it was developed on. yfinance stays unpinned (1.7.0 and
+  1.8.0 return identical prices; a Yahoo API change needs its next release).
+- COST: a run fits five models wherever it fitted one, so it takes about
+  three times as long (the walk-forwards dominate), and `--validate` about
+  five times: a manual workflow run with the validation suite gets a
+  360-minute limit, scheduled runs keep 150 so a hung run frees the next slot.
+- 38 new tests: the ensemble equals the mean of the five single-phase models
+  to 1e-12 and takes every k-th date; a fold with phase models never trains
+  past the purge gap; the verdict rule; the head-to-head and a live run
+  through the CLI; a sleeve without the latest closes is refused, not cached,
+  and exits 3 end to end; one market's holiday is not; yesterday's download
+  is fetched again; a weekend run still shows Monday its list, the due-day
+  box and the sizing note say what is true; a run past its limit is stopped
+  and the site still published; and the workflow's own shell steps -- pack,
+  unpack, the missing-state check -- are run in every branch
+  (tests/test_workflow.py: on CI, with the runner's bash, tar and openssl).
+
 ## 4.27.0 (2026-11-05) -- orders sized on the account value, an encrypted Actions cache, an age warning, the whole weekly record
 Found in the 5 Nov review; every change below has a test that fails on 4.26.0.
 - ORDER SIZING (`account_value`, env `UMUSHROOM_ACCOUNT_VALUE`, in the cloud

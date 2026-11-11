@@ -557,3 +557,108 @@ def test_sell_tab_says_what_the_orders_were_sized_on():
                           "base_currency": "GBP"})
     assert "fixed starting balance of 100,000 GBP" in note and "ACCOUNT_VALUE" in note
     assert _capital_note({}) == ""                  # reports written before 4.27
+
+
+def test_due_box_says_the_list_is_not_ready_when_a_rebalance_is_due():
+    """v4.28: on the day a rebalance is due, with no run of the new period yet
+    (the morning run failed, or is waiting for Yahoo), the box read "0 trading
+    days to go ... no sells"."""
+    from umushroom.rebalance import Cadence
+    from umushroom.web import _due_box
+    held = Cadence("20261109-094013", False, date(2026, 11, 9), date(2026, 11, 16))
+    assert "1 trading day to go" in _due_box(held, 5, date(2026, 11, 13))        # Friday
+    monday = _due_box(held, 5, date(2026, 11, 16))
+    assert "A rebalance is due today" in monday and "not ready yet" in monday
+    assert "Do not trade from this page yet" in monday
+    assert "trading days to go" not in monday and "no sells" not in monday
+    assert "A rebalance is due since Mon 16 Nov 2026" in _due_box(held, 5, date(2026, 11, 17))
+
+
+def test_capital_note_names_a_later_run_sized_on_something_else():
+    from umushroom.web import _capital_note
+    first = {"capital": 100000, "capital_source": "starting_balance", "base_currency": "GBP"}
+    later = {"capital": 90000, "capital_source": "account_value", "base_currency": "GBP"}
+    note = _capital_note(first, later=later)
+    assert "fixed starting balance of 100,000 GBP" in note
+    assert "A later run today was sized on 90,000 GBP, this list on 100,000 GBP" in note
+    assert "multiply the share counts below by 0.900" in note
+    assert "A later run" not in _capital_note(first, later=first)
+    assert "A later run" not in _capital_note(first, later={})          # pre-4.27 report
+    assert _capital_note({}, later=later) == ""
+
+
+def _sized_fake(as_of: str, capital: float, source: str):
+    """Like _fake, with what the orders were sized on in the report's meta."""
+    def make(report: Path, orders: Path) -> list[str]:
+        frame = pd.DataFrame({"sleeve": ["equity"], "shares": [100],
+                              "allocated_value": [1000.0], "local_price": [10.0],
+                              "listing_currency": ["GBP"], "name": ["Alpha Co"]},
+                             index=["AAA.L"])
+        page = render_html(build_payload(
+            {"as_of": as_of, "base_currency": "GBP", "version": "t", "capital": capital,
+             "capital_source": source}, [], frame))
+        src = report.parent / f"_src_{as_of}_{int(capital)}.html"
+        src.write_text(page)
+        code = (f"import shutil;shutil.copy({str(src)!r},{str(report)!r});"
+                f"open({str(orders)!r},'w').write('ticker,shares\\nAAA,1\\n')")
+        return [sys.executable, "-c", code]
+    return make
+
+
+def test_sell_page_sizing_note_is_about_the_list_it_shows(tmp_path):
+    """v4.28: on a same-day repeat run the trade list is the FIRST run's, but the
+    note above it quoted the LATEST run's sizing -- "sized on the account value
+    90,000" over a list sized on 100,000, after ACCOUNT_VALUE was set mid-morning."""
+    import time
+
+    from umushroom.web import Site, sell_body
+    runner = Runner(tmp_path / "site", _fake(as_of="2026-10-02"))
+    runner.start()
+    runner.wait()
+    stamps = []
+    for capital, source in ((100000, "starting_balance"), (90000, "account_value")):
+        time.sleep(1.1)
+        runner.command = _sized_fake("2026-10-09", capital, source)
+        runner.start()
+        runner.wait()
+        stamps.append(runner.latest_report())
+    first, second = stamps
+    site = Site(runner, _yahoo())
+    body = sell_body(site, second, site.payload(second), None, today=date(2026, 10, 12),
+                     picker=False)
+    assert "Sell / rebalance now" in body and "the first run of this period" in body
+    assert "fixed starting balance of 100,000 GBP" in body           # the list's own sizing
+    assert "A later run today was sized on 90,000 GBP, this list on 100,000 GBP" in body
+    assert "Orders are sized on the account value" not in body
+    # the first run itself: its own note, nothing about a later run
+    body = sell_body(site, first, site.payload(first), None, today=date(2026, 10, 12),
+                     picker=False)
+    assert "fixed starting balance of 100,000 GBP" in body and "A later run" not in body
+
+
+def test_sell_page_on_the_due_day_before_the_new_periods_run(tmp_path):
+    """v4.28: Monday morning, the period's first run not in yet -- the page is
+    rebuilt from the last run of the period that just ended."""
+    import time
+
+    from umushroom.web import Site, sell_body
+    runner = Runner(tmp_path / "site", _fake(as_of="2026-10-02"))     # book: Mon 5 Oct
+    runner.start()
+    runner.wait()
+    book = runner.latest_report()
+    time.sleep(1.1)
+    runner.command = _fake(as_of="2026-10-08")                        # a mid-period run
+    runner.start()
+    runner.wait()
+    latest = runner.latest_report()
+    site = Site(runner, _yahoo())
+    friday = sell_body(site, latest, site.payload(latest), None, today=date(2026, 10, 9),
+                       picker=False)
+    assert "Holding period in progress" in friday and "1 trading day to go" in friday
+    assert "Nothing to do until the next period starts" in friday
+    monday = sell_body(site, latest, site.payload(latest), None, today=date(2026, 10, 12),
+                       picker=False)
+    assert "A rebalance is due today" in monday and "Do not trade from this page yet" in monday
+    assert "the period that has just ended" in monday
+    assert "Nothing to do until the next period starts" not in monday
+    assert book != latest
